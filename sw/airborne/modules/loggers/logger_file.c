@@ -46,6 +46,7 @@
 #include "generated/modules.h"
 
 #include "modules/ctrl/ctrl_module_outerloop_demo.h"
+#include "firmwares/rotorcraft/stabilization/stabilization_indi.h"
 
 /** Set the default File logger path to the USB drive */
 #ifndef LOGGER_FILE_PATH
@@ -76,6 +77,9 @@ static void logger_file_write_header(FILE *file) {
   fprintf(file, "rate_p,rate_q,rate_r,");
   fprintf(file, "T_calculated,");
   fprintf(file, "roll_rate_cmd,pitch_rate_cmd,");
+  fprintf(file, "dcmd[0],dcmd[1],dcmd[2],");
+  fprintf(file, "qi,qx,qy,qz,");
+  fprintf(file, "rate_sp_measure.p,rate_sp_measure.q,rate_sp_measure.r,");
 #ifdef BOARD_BEBOP
   fprintf(file, "rpm_obs_1,rpm_obs_2,rpm_obs_3,rpm_obs_4,");
   fprintf(file, "rpm_ref_1,rpm_ref_2,rpm_ref_3,rpm_ref_4,");
@@ -114,6 +118,9 @@ static void logger_file_write_row(FILE *file) {
   fprintf(file, "%f,%f,%f,", rates->p, rates->q, rates->r);
   fprintf(file, "%f,", T);
   fprintf(file, "%f, %f,", roll_rate_calc, pitch_rate_calc);
+  fprintf(file, "%f, %f, %f,", dcmd[0], dcmd[1], dcmd[2]);
+  fprintf(file, "%f, %f, %f, %f,", q.qi,q.qx,q.qy,q.qz);
+  fprintf(file, "%f, %f, %f,", rate_sp_measure.p,rate_sp_measure.q,rate_sp_measure.r);
 #ifdef BOARD_BEBOP
   fprintf(file, "%d,%d,%d,%d,",actuators_bebop.rpm_obs[0],actuators_bebop.rpm_obs[1],actuators_bebop.rpm_obs[2],actuators_bebop.rpm_obs[3]);
   fprintf(file, "%d,%d,%d,%d,",actuators_bebop.rpm_ref[0],actuators_bebop.rpm_ref[1],actuators_bebop.rpm_ref[2],actuators_bebop.rpm_ref[3]);

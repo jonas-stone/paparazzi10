@@ -46,5 +46,7 @@ extern float accel_ref[3];
 extern float T;
 extern float roll_rate_calc;
 extern float pitch_rate_calc;
+extern float dcmd[3];
+extern struct FloatQuat q;
 
 #endif /* CTRL_MODULE_OUTERLOOP_DEMO_H_ */

@@ -46,6 +46,12 @@
 
 #include <stdio.h>
 
+
+#include "math/pprz_algebra_float.h"
+// #include "sw/airborne/modules/imu/imu.h"
+#include "modules/core/abi.h"
+#include "/home/t/paparazzi/sw/simulator/nps/nps_sensors.h"
+
 // Access estimated thrust from stabilization_indi.c file. This is estimated thrust in the z direction
 extern float thrust_estimate;
 
@@ -57,12 +63,12 @@ float mass = MOL_DRONE_WEIGHT;
 
 // Gains and limits
 static float vel_limit = 15.0;
-static float acc_limit = 2.5;
+static float acc_limit = 3.5;
 static float thrust_limit = 0.1;
-static float vel_gain = 0.6;
-static float acc_gain = 1.2;
-static float roll_rate_gain = 50.0; //35
-static float pitch_rate_gain = 50.0; //35
+static float vel_gain = 0.8;
+static float acc_gain = 0.8;
+static float roll_rate_gain = 15.0;
+static float pitch_rate_gain = 15.0; 
 
 
 // Globally defined parameters (able to access these with logging)
@@ -72,6 +78,8 @@ float accel_ref[3];
 float T;
 float roll_rate_calc;
 float pitch_rate_calc;
+float dcmd[3];
+struct FloatQuat q;
 
 
 struct ctrl_module_demo_struct {
@@ -122,10 +130,8 @@ void guidance_module_run(bool in_flight)
 
   // Desired position
   pos_ref[0] = 3 * sinf(counter/420.0);
-  // pos_ref[0] = 0.0;
   pos_ref[1] = 0.0;
   pos_ref[2] = -4.0;
-  // pos_ref[2] = -15.0 + sinf(counter/420.0);
 
   // Current positions
   struct NedCoor_f *pos_actual = stateGetPositionNed_f();
@@ -184,6 +190,38 @@ void guidance_module_run(bool in_flight)
   accel_a[1] = accel_actual->y;
   accel_a[2] = accel_actual->z;
 
+  
+  // float accel_a[3] = {0.0, 0.0, 0.0}; // Current accelerations in the NED frame
+
+  // // IMU has accelerations in the body frame. These must be converted to the NED frame 
+  // struct imu_accel_t *imu_acc = imu_get_accel(ABI_BROADCAST, true);
+
+  // float accel_body[3] = {0.0, 0.0, 0.0};
+  // nps_sensors_run_step(counter/500);
+
+  // if(imu_acc != NULL) {
+  //   accel_body[0] = imu_acc->scaled.x;
+  //   accel_body[1] = imu_acc->scaled.y;
+  //   accel_body[2] = imu_acc->scaled.z;
+  // }
+
+  // struct FloatRMat *rot = stateGetNedToBodyRMat_f(); 
+
+  // // Transpose NED to Body rotation matrix in order to get Body to NED rotation matrix
+  // float body_to_ned[3][3];
+  // for (int i = 0; i < 3; i++)
+  //     for (int j = 0; j < 3; j++)
+  //         body_to_ned[i][j] = rot->m[j*3 + i]; 
+
+  // // Get accleration in the NED frame
+  // for (int i = 0; i < 3; i++) {
+  //     accel_a[i] = 0;
+  //     for (int j = 0; j < 3; j++) {
+  //         accel_a[i] += body_to_ned[i][j] * accel_body[j];
+  //     }
+  // }
+  // RunOnceEvery(100,printf("%f,%f,%f\n", accel_body[0],accel_body[1],accel_body[2]));
+
   // d_accel_ref
   static float d_accel_ref[3];
   d_accel_ref[0] = accel_ref[0] - accel_a[0];
@@ -206,16 +244,16 @@ void guidance_module_run(bool in_flight)
   struct ThrustSetpoint th = th_sp_from_incr_f(rates_guidance[2], THRUST_AXIS_Z);
 
   // execute attitude stabilization:
-  stabilization_rate_run(in_flight, &sp, &th, stabilization.cmd);
+  stabilization_indi_rate_run(in_flight, &sp, &th, stabilization.cmd);
 
 }
 
 float* guidance_function(float d_accel_ref[3])
 {
   // Get thrust
-  // float T = mass*9.81; //Hard-coding as a constant needed for a hover to counteract gravity for now, probably have to change.
+  float T = mass*9.81; //Hard-coding as a constant needed for a hover to counteract gravity for now, probably have to change.
   // T = -thrust_estimate;  
-  T = -ACCEL_FLOAT_OF_BFP(stateGetAccelBody_i()->z)*mass;
+  // T = -ACCEL_FLOAT_OF_BFP(stateGetAccelBody_i()->z)*mass;
   if (T < thrust_limit) {
     T = thrust_limit;
   }
@@ -225,36 +263,47 @@ float* guidance_function(float d_accel_ref[3])
 
   // PPRZ ALGEBRA MATRICES
   // Calculate d_accel_ref_b via "matrix" calculation: rot * d_accel_ref_b 
-  float d_accel_ref_b[3];
-  for (int i = 0; i < 3; i++) {
-    d_accel_ref_b[i] = 0;
-    for (int j = 0; j < 3; j++) {
-      d_accel_ref_b[i] += rot->m[i * 3 + j] * d_accel_ref[j];  
-    }
-  }
+  // float d_accel_ref_b[3];
+
+  struct FloatVect3 d_accel_ref_b;
+  struct FloatVect3 d_accel_ref_v = {d_accel_ref[0], d_accel_ref[1], d_accel_ref[2]};
+
+  float_rmat_vmult(&d_accel_ref_b, rot, &d_accel_ref_v);
+
+  // for (int i = 0; i < 3; i++) {
+  //   d_accel_ref_b[i] = 0;
+  //   for (int j = 0; j < 3; j++) {
+  //     d_accel_ref_b[i] += rot->m[i * 3 + j] * d_accel_ref[j];  
+  //   }
+  // }
 
 
   // Inverse of the control effectiveness matrix. The inverse is directly computed here.
   float B_inverse[3][3] = {{0, 1/T, 0}, {1/T, 0, 0}, {0, 0, 1}};
 
   // Calculate dcmd via "matrix" calculation: dcmd = B_inverse * d_accel_ref_b * mass;
-  float dcmd[3]; //MYB PUT LIMIT (45DEG)
+  // float dcmd[3]; //MYB PUT LIMIT (45DEG)
 
-  for (int i = 0; i < 3; i++) {
-    dcmd[i] = 0;
-    for (int j = 0; j < 3; j++) {
-      dcmd[i] += B_inverse[i][j] * d_accel_ref_b[j];
-    }
-    dcmd[i] *= mass;
-  }
+  dcmd[0] = 1/T * d_accel_ref_b.y * mass;
+  dcmd[1] = 1/T * d_accel_ref_b.x * mass;
+  dcmd[2] = 1 * d_accel_ref_b.z * mass;
+
+  // for (int i = 0; i < 3; i++) {
+  //   dcmd[i] = 0;
+  //   for (int j = 0; j < 3; j++) {
+  //     dcmd[i] += B_inverse[i][j] * d_accel_ref_b[j];
+  //   }
+  //   dcmd[i] *= mass;
+  // }
 
   // Quaternion
-  struct FloatQuat q; //quat output
+  // struct FloatQuat q; //quat output
   struct FloatEulers e;
   e.psi = 0.0;        
   e.theta = dcmd[1]; 
   e.phi = dcmd[0]; 
   float_quat_of_eulers(&q, &e); //This function employs ZYX, as in MATLab
+
 
   // Make array to return
   static float array[3];
@@ -267,5 +316,4 @@ float* guidance_function(float d_accel_ref[3])
 
 
 // DOWNLINK_SEND_PLOP(DefaultChannel, DefaultDevice,  &roll_v_ref, &pitch_v_ref, &yaw_v_ref, &T_cmd, &T_cmd, &T_cmd);
-// RunOnceEvery(100,printf("%f, %f, %f\n", array[0], array[1], array[2]);)
-  
+// RunOnceEvery(100,printf("%f, %f, %f\n", array[0], array[1], array[2]));

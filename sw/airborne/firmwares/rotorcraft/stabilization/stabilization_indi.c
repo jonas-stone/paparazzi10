@@ -47,6 +47,8 @@
 // Own variables
 float thrust_estimate;
 
+struct FloatRates rate_sp_measure;
+
 // Factor that the estimated G matrix is allowed to deviate from initial one
 #define INDI_ALLOWED_G_FACTOR 2.0
 
@@ -626,6 +628,10 @@ void stabilization_indi_rate_run(bool in_flight, struct StabilizationSetpoint *s
   angular_accel_ref.q = (rate_sp.q - rates_filt.q) * indi_gains.rate.q;
   angular_accel_ref.r = (rate_sp.r - rates_filt.r) * indi_gains.rate.r;
 
+  rate_sp_measure.p = angular_accel_ref.p;
+  rate_sp_measure.q = angular_accel_ref.q;
+  rate_sp_measure.r = angular_accel_ref.r;
+
   // compute virtual thrust
   struct FloatVect3 v_thrust = { 0.f, 0.f, 0.f };
   if (thrust->type == THRUST_INCR_SP) {
@@ -645,32 +651,6 @@ void stabilization_indi_rate_run(bool in_flight, struct StabilizationSetpoint *s
 
     // For accessing the thrust_filt value in outerloop 
     thrust_estimate = thrust_filt.z;
-
-    //     //---------------------SELF-DONE LOGGING-------------------
-    // const char *path = "/home/t/paparazzi/output_inner.txt";
-    // // Try to open the file in "read" mode to check if it already exists
-    // FILE *check = fopen(path, "r");
-    // bool file_exists = (check != NULL);
-    // if (check) fclose(check);
-
-    // // Open the file in "append" mode so we don't overwrite existing data
-    // FILE *file = fopen(path, "a");
-    // if (file == NULL) {
-    //     perror("Error opening file");
-    // }
-
-    // // Write header only if the file did not exist before
-    // if (!file_exists) {
-    //     fprintf(file, "counter, thrust_filt.z, thrust_filt.x\n");
-    // }
-
-    // // Write the current data values to the file
-    // fprintf(file, "%d,%f,%f\n", counter, thrust_filt.z, thrust_filt.x);
-
-    // // Close the file
-    // fclose(file);
-    // //-----------------END SELF-MADE LOGGING---------------
-    // counter += 1;
 
     // Add the current estimated thrust to the increment
     VECT3_ADD(v_thrust, thrust_filt);
