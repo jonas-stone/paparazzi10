@@ -31,7 +31,6 @@
 #include "firmwares/rotorcraft/stabilization.h"
 #include "firmwares/rotorcraft/stabilization/stabilization_attitude.h"
 #include "firmwares/rotorcraft/stabilization/stabilization_attitude_rc_setpoint.h"
-#include "modules/radio_control/radio_control.h"
 #include "autopilot.h"
 
 #include "modules/imu/imu.h"
@@ -48,9 +47,8 @@
 
 
 #include "math/pprz_algebra_float.h"
-// #include "sw/airborne/modules/imu/imu.h"
 #include "modules/core/abi.h"
-#include "/home/t/paparazzi/sw/simulator/nps/nps_sensors.h"
+#include "../../../../simulator/nps/nps_sensors.h"
 
 // Access estimated thrust from stabilization_indi.c file. This is estimated thrust in the z direction
 extern float thrust_estimate;
@@ -122,7 +120,7 @@ float* guidance_function(float d_accel_ref[3]);
 
 void guidance_module_run(bool in_flight)
 {
-  stabilization_attitude_read_rc_setpoint_eulers(&ctrl.rc_sp, autopilot_in_flight(), false, false, &radio_control);
+  // stabilization_attitude_read_rc_setpoint_eulers(&ctrl.rc_sp, autopilot_in_flight(), false, false, &radio_control);
 
   // DESIRED TRAJECTORY
   static int counter = 0;
@@ -237,12 +235,18 @@ void guidance_module_run(bool in_flight)
   ctrl.cmd.q = rates_guidance[1];
   ctrl.cmd.r = 0.0;
 
+  // ctrl.cmd.p = 0.0;
+  // ctrl.cmd.q = 3 * sinf(counter/420.0);
+  // ctrl.cmd.r = 0.0;
+
   roll_rate_calc = ctrl.cmd.p;
   pitch_rate_calc = ctrl.cmd.q;
 
   struct StabilizationSetpoint sp = stab_sp_from_rates_f(&(ctrl.cmd));
   struct ThrustSetpoint th = th_sp_from_incr_f(rates_guidance[2], THRUST_AXIS_Z);
 
+  // RunOnceEvery(100,printf("%f\n", array[0], array[1], array[2]));
+  
   // execute attitude stabilization:
   stabilization_indi_rate_run(in_flight, &sp, &th, stabilization.cmd);
 
