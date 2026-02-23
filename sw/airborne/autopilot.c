@@ -86,6 +86,7 @@ static void send_dl_value(struct transport_tx *trans, struct link_device *dev)
 
 static void send_minimal_com(struct transport_tx *trans, struct link_device *dev)
 {
+  uint8_t dummy;
   float lat = DegOfRad(stateGetPositionLla_f()->lat);
   float lon = DegOfRad(stateGetPositionLla_f()->lon);
   float hmsl = stateGetPositionUtm_f()->alt;
@@ -101,7 +102,8 @@ static void send_minimal_com(struct transport_tx *trans, struct link_device *dev
   pprz_msg_send_MINIMAL_COM(trans, dev, AC_ID,
                             &lat, &lon, &hmsl, &gspeed, &course, &climb,
                             &electrical.vsupply, &throttle, &autopilot.mode,
-                            &nav_block, &gps_fix, &autopilot.flight_time);
+                            // &nav_block, &gps_fix, &autopilot.flight_time);
+                            &dummy,  &gps_fix, &autopilot.flight_time);
 }
 
 void autopilot_init(void)

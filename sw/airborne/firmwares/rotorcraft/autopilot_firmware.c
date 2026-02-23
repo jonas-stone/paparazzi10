@@ -113,6 +113,7 @@ bool WEAK autopilot_in_flight_end_detection(bool motors_on UNUSED) {
 
 static void send_status(struct transport_tx *trans, struct link_device *dev)
 {
+  uint8_t dummy_mode = 0;
   uint32_t imu_nb_err = 0;
 #if USE_MOTOR_MIXING
   uint8_t _motor_nb_err = motor_mixing.nb_saturation + motor_mixing.nb_failure * 10;
@@ -131,7 +132,8 @@ static void send_status(struct transport_tx *trans, struct link_device *dev)
                                   &imu_nb_err, &_motor_nb_err,
                                   &radio_control.status, &radio_control.frame_rate,
                                   &fix, &autopilot.mode, &in_flight, &motors_on,
-                                  &autopilot.arming_status, &guidance_h.mode, &guidance_v.mode,
+                                  // &autopilot.arming_status, &guidance_h.mode, &guidance_v.mode,
+                                  &autopilot.arming_status, &dummy_mode, &dummy_mode,
                                   &time_sec, &electrical.vsupply, &electrical.vboard);
 }
 
@@ -150,8 +152,10 @@ static void send_energy(struct transport_tx *trans, struct link_device *dev)
 
 static void send_fp(struct transport_tx *trans, struct link_device *dev)
 {
-  int32_t carrot_up = -guidance_v.z_sp;
-  int32_t carrot_heading = ANGLE_BFP_OF_REAL(guidance_h.sp.heading);
+  // int32_t carrot_up = -guidance_v.z_sp;
+  // int32_t carrot_heading = ANGLE_BFP_OF_REAL(guidance_h.sp.heading);
+  int32_t dummy = 0;
+
   int32_t thrust = (int32_t)autopilot.throttle;
   struct EnuCoor_i *pos = stateGetPositionEnu_i();
 #if GUIDANCE_INDI_HYBRID
@@ -172,10 +176,10 @@ static void send_fp(struct transport_tx *trans, struct link_device *dev)
                               &att.phi,
                               &att.theta,
                               &att.psi,
-                              &guidance_h.sp.pos.y,
-                              &guidance_h.sp.pos.x,
-                              &carrot_up,
-                              &carrot_heading,
+                              &dummy, // &guidance_h.sp.pos.y,
+                              &dummy, // &guidance_h.sp.pos.x,
+                              &dummy, // &carrot_up,
+                              &dummy, // &carrot_heading,
                               &thrust,
                               &autopilot.flight_time);
 }
