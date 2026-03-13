@@ -165,7 +165,23 @@ def is_ground(Y, U, V):
                 else:
                     return 0
 
-vectorized_is_ground = np.vectorize(is_ground)
+
+def is_ground_sim(Y, U, V):
+    if U <= 96.50:
+        if Y <= 102.50:
+            return 255
+        else:
+            return 0
+    else:
+        if U <= 97.50:
+            if V <= 126.00:
+                return 255
+            else:
+                return 0
+        else:
+            return 0
+
+vectorized_is_ground = np.vectorize(is_ground) #is_ground or is_ground_sim
 
 
 def detect_green_ground_hardcoded(image_bgr, threshold, median_ksize=3):
@@ -226,7 +242,9 @@ if __name__ == "__main__":
 
     cv2.destroyAllWindows()
 
-    folder_path = "DEVELOPMENT/downloads from drone/20260306-095826"
+    #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
+    folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
+    #folder_path = "DEVELOPMENT/downloads from drone/sim_images/"
     all_image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
     start_idx = random.randint(0, len(all_image_paths) - 1)
     image_paths = all_image_paths[start_idx:] + all_image_paths[:start_idx]

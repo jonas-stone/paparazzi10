@@ -68,7 +68,9 @@ def main():
     global current_yuv_image, current_display_image, X_vec, y_vec
     
     # Update this to point to your Bebop images
-    folder_path = "TEAM-10-PROTOTYPING/downloads from drone/20260306-095826/*.jpg"
+    #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/*.jpg"
+    #folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/*.jpg"
+    folder_path = "DEVELOPMENT/downloads from drone/sim_images/*.jpg"
     images = glob.glob(folder_path, recursive=True)
 
     if not images:
