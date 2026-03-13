@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import median_filter
 import random
 from glob import glob
-import joblib # Added to load the ML model
 
 def find_ground_boundary(mask_rotated, min_ground_pixels=5, max_gap=10, smooth_kernel=5):
     image_height = mask_rotated.shape[1]
@@ -121,45 +120,6 @@ def update_and_detect(boundary_row, h, ground_baseline, min_width=20):
     return obstacle_regions, ground_baseline
 
 
-# def is_ground(Y, U, V):
-#     if U <= 116.50:
-#         if V <= 149.50:
-#             if Y <= 81.50:
-#                 return 0
-#             else:
-#                 if U <= 96.50:
-#                     return 0
-#                 else:
-#                     return 255
-#         else:
-#             if Y <= 113.50:
-#                 if Y <= 101.50:
-#                     return 0
-#                 else:
-#                     return 255
-#             else:
-#                 return 0
-#     else:
-#         if U <= 122.50:
-#             if Y <= 87.00:
-#                 if V <= 119.50:
-#                     return 0
-#                 else:
-#                     return 0
-#             else:
-#                 if V <= 143.50:
-#                     return 255
-#                 else:
-#                     return 0
-#         else:
-#             if U <= 145.50:
-#                 return 0
-#             else:
-#                 if U <= 148.50:
-#                     return 255
-#                 else:
-#                     return 0
-
 def is_ground(Y, U, V):
     if U <= 115.50:
         if V <= 145.00:
@@ -205,60 +165,68 @@ def is_ground(Y, U, V):
                 else:
                     return 0
 
-
-
 vectorized_is_ground = np.vectorize(is_ground)
 
-def detect_green_ground_ml(image_bgr, threshold, median_ksize=3):
-    """
-    Applies the hardcoded Python decision tree logic to the image.
-    """
-    # Convert BGR to YUV
+
+def detect_green_ground_hardcoded(image_bgr, threshold, median_ksize=3):
     image_yuv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YUV)
-    
-    # Split the image into its 3 separate color channels
     Y_channel, U_channel, V_channel = cv2.split(image_yuv)
     
-    # Pass the entire channels into our vectorized logic tree at once
     mask = vectorized_is_ground(Y_channel, U_channel, V_channel)
-    
-    # Convert back to an 8-bit unsigned integer array for OpenCV
     mask = mask.astype(np.uint8)
 
-    # Simple median blur to reduce speckles
     if median_ksize is not None and median_ksize >= 3 and median_ksize % 2 == 1:
         mask = cv2.medianBlur(mask, median_ksize)
 
-    # Pixel stats
     green_pixel_count = cv2.countNonZero(mask)
     total_pixels = image_bgr.shape[0] * image_bgr.shape[1]
     green_fraction = green_pixel_count / total_pixels if total_pixels > 0 else 0.0
 
     status = "GROUND FOUND" if green_fraction > threshold else "NO GROUND"
-
-    # Visualization
     result = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
 
     return mask, result, green_fraction, status
 
 
+def get_obstacle_info(image_bgr,
+                      ground_baseline,
+                      oa_color_count_frac=0.05,
+                      median_ksize=5,
+                      min_width=20):
+    mask, _, green_frac, status = detect_green_ground_hardcoded(image_bgr,
+                                                                threshold=oa_color_count_frac,
+                                                                median_ksize=median_ksize)
+    H, W = image_bgr.shape[:2]
+
+    obstacles = []
+    debug = {"status": status, "green_frac": green_frac}
+
+    if status == "GROUND FOUND":
+        mask_flipped = mask[:, ::-1]  
+        boundary_rows = find_ground_boundary(mask_rotated=mask_flipped)
+        obstacle_regions, new_ground_baseline = update_and_detect(
+            boundary_rows, W, ground_baseline, min_width=min_width)
+        
+        obstacles = []
+        for (s, e, w) in obstacle_regions:
+            left = W - 1 - e
+            width = w
+            obstacles.append((int(left), int(width)))
+        debug.update({"boundary_rows": boundary_rows, "obstacle_regions_raw": obstacle_regions})
+    else:
+        new_ground_baseline = ground_baseline  
+
+    return obstacles, new_ground_baseline, debug
+
+
 if __name__ == "__main__":
 
-    # python files
     import solidity_detection as sdd
     import colored_blob_separator as cds
 
     cv2.destroyAllWindows()
 
-    # Load the trained model here (so it only loads once)
-    try:
-        model = joblib.load('yuv_decision_tree.joblib')
-        print("Successfully loaded ML model.")
-    except FileNotFoundError:
-        print("Error: 'yuv_decision_tree.joblib' not found. Please run the training script first.")
-        exit()
-
-    folder_path = "TEAM-10-PROTOTYPING/downloads from drone/20260306-095826"
+    folder_path = "DEVELOPMENT/downloads from drone/20260306-095826"
     all_image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
     start_idx = random.randint(0, len(all_image_paths) - 1)
     image_paths = all_image_paths[start_idx:] + all_image_paths[:start_idx]
@@ -284,8 +252,8 @@ if __name__ == "__main__":
         
         image_display = image_bgr.copy()
 
-        # Call the new ML-based detection function instead of the simple one
-        mask, result, actual_frac, status = detect_green_ground_ml(
+        # Calls the hardcoded function
+        mask, result, actual_frac, status = detect_green_ground_hardcoded(
             image_bgr,
             oa_color_count_frac,
             median_ksize=5
