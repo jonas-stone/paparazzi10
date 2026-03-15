@@ -46,7 +46,7 @@ Image_Height = 48 # pixelsrkill cause
 Partitions = 7 # might be slighly an ovewe can get aaway with 5 but seemed more fun
 Neurons_Number = 32 # to be played around with
 Epochs = 500 # to be played around with
-Learning_Rate = 0.001 # step size thing like in fmincon
+Learning_Rate = 0.001 # step size thing like in fmincon v
 
 
 input_size = Image_Width * Image_Height
