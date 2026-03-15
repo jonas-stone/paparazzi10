@@ -685,4 +685,11 @@
 #endif
 
 
+/*
+ * IDs of Team 10 modules (function 42 inside abi_messages.h)
+ */
+#ifndef TEAM10_GROUND_DETECTION_ID
+#define TEAM10_GROUND_DETECTION_ID 1
+
+
 #endif /* ABI_SENDER_IDS_H */

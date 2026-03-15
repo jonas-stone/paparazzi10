@@ -56,7 +56,7 @@
     <file name="team10_ground_detection.h"/>
   </header>
 
-  <init fun="color_object_detector_init()"/>
+  <init fun="ground_detection_init()"/>
   <periodic fun="color_object_detector_periodic()" freq="10"/>
   <makefile target="ap|nps">
     <file name="team10_ground_detection.c"/>

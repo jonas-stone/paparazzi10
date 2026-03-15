@@ -25,6 +25,11 @@
 #include <time.h>
 #include <stdio.h>
 
+// Team 10 inclusions
+#include "modules/orange_avoider/team10_autopilot_control.h"
+#include "modules/computer_vision/team10_get_obstacle_info.h"
+
+// flight plan inclusions
 #include "generated/flight_plan.h"
 
 #define ORANGE_AVOIDER_VERBOSE TRUE
@@ -59,6 +64,10 @@ int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that 
 float heading_increment = 5.f;          // heading angle increment [deg]
 float maxDistance = 2.25;               // max waypoint displacement [m]
 
+// define script-level variables
+struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
+uint8_t obstacle_count;
+
 const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
 
 /*
@@ -68,29 +77,51 @@ const int16_t max_trajectory_confidence = 5; // number of consecutive negative o
  * in different threads. The ABI event is triggered every time new data is sent out, and as such the function
  * defined in this file does not need to be explicitly called, only bound in the init function
  */
-#ifndef ORANGE_AVOIDER_VISUAL_DETECTION_ID
-#define ORANGE_AVOIDER_VISUAL_DETECTION_ID ABI_BROADCAST
+#ifndef TEAM10_GROUND_DETECTION_ID
+#define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
 #endif
+
+// ABI event declaration (used to bind to callback function)
+static abi_event ground_detection_ev;
 static abi_event color_detection_ev;
-static void color_detection_cb(uint8_t __attribute__((unused)) sender_id,
-                               int16_t __attribute__((unused)) pixel_x, int16_t __attribute__((unused)) pixel_y,
-                               int16_t __attribute__((unused)) pixel_width, int16_t __attribute__((unused)) pixel_height,
-                               int32_t quality, int16_t __attribute__((unused)) extra)
+
+// // ABI callback function for ORANGE AVOIDER
+// static void color_detection_cb(uint8_t __attribute__((unused)) sender_id,
+//                                int16_t __attribute__((unused)) pixel_x, int16_t __attribute__((unused)) pixel_y,
+//                                int16_t __attribute__((unused)) pixel_width, int16_t __attribute__((unused)) pixel_height,
+//                                int32_t quality, int16_t __attribute__((unused)) extra)
+// {
+//   color_count = quality;
+// }
+
+static void ground_detection_callback(uint8_t __attribute__((unused)) sender_id,
+                                      struct obstacle_region_t * incoming_obstacles,
+                                      uint8_t incoming_obstacle_count)
 {
-  color_count = quality;
+  obstacle_count  = incoming_obstacle_count;
+  obstacles       = incoming_obstacles;
 }
 
+// /*
+//  * Initialisation function, setting the colour filter, random seed and heading_increment
+//  */
+// void orange_avoider_init(void)
+// {
+//   // Initialise random values
+//   srand(time(NULL));
+//   chooseRandomIncrementAvoidance();
+
+//   // bind our colorfilter callbacks to receive the color filter outputs
+//   AbiBindMsgVISUAL_DETECTION(TEAM10_GROUND_DETECTION_ID, &color_detection_ev, color_detection_cb);
+// }
+
 /*
- * Initialisation function, setting the colour filter, random seed and heading_increment
+ * Initialisation function, random seed and heading_increment
  */
-void orange_avoider_init(void)
-{
-  // Initialise random values
+void ground_detection_init(void) {
   srand(time(NULL));
   chooseRandomIncrementAvoidance();
-
-  // bind our colorfilter callbacks to receive the color filter outputs
-  AbiBindMsgVISUAL_DETECTION(ORANGE_AVOIDER_VISUAL_DETECTION_ID, &color_detection_ev, color_detection_cb);
+  AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, &ground_detection_ev, ground_detection_callback)
 }
 
 /*
@@ -103,17 +134,8 @@ void orange_avoider_periodic(void)
     return;
   }
 
-  // compute current color thresholds
-  int32_t color_count_threshold = oa_color_count_frac * front_camera.output_size.w * front_camera.output_size.h;
-
-  VERBOSE_PRINT("Color_count: %d  threshold: %d state: %d \n", color_count, color_count_threshold, navigation_state);
-
-  // update our safe confidence using color threshold
-  if(color_count < color_count_threshold){
-    obstacle_free_confidence++;
-  } else {
-    obstacle_free_confidence -= 2;  // be more cautious with positive obstacle detections
-  }
+  // update our safe confidence
+  do_something();
 
   // bound obstacle_free_confidence
   Bound(obstacle_free_confidence, 0, max_trajectory_confidence);

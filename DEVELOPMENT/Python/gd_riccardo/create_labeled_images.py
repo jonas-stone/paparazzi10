@@ -4,6 +4,7 @@ import colored_blob_separator as cds
 import green_ground_detection as ggd
 import ransac_fit as rsf
 import obstacle_detection_ground as obs
+import get_obstacle_info_Imp as imp
 
 # libraries
 import matplotlib.pyplot as plt
@@ -14,14 +15,10 @@ import os
 
 cv2.destroyAllWindows()
 
-folder_path = "TEAM-10-PROTOTYPING/downloads from drone/20260306-095826"
-image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))[50:]
+folder_path = "DEVELOPMENT/downloads from drone/20260313-100130"
+image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
 
-# same HSV bounds as before
-lower_green = np.array([10, 50, 40])
-upper_green = np.array([35, 255, 200])
-
-oa_color_count_frac = 0.07
+oa_color_count_frac = 0.05
 
 i = 0
 for image_path in image_paths:
@@ -41,13 +38,9 @@ for image_path in image_paths:
     image_bgr = cv2.resize(image_bgr, (0,0), fx=factor, fy=factor)
 
     # Use the simple detector with a 3x3 median blur (fast, mild)
-    mask, result, actual_frac, status = ggd.detect_green_ground_simple(
-        image_bgr,
-        lower_green,
-        upper_green,
-        oa_color_count_frac,
-        median_ksize=5
-    )
+    mask, result, green_frac, status = imp.detect_green_ground_ml(image_bgr,
+                                                         threshold=oa_color_count_frac,
+                                                         median_ksize=5)
 
     # set detected pixels to white.
     result[result > 0] = 255
@@ -60,23 +53,18 @@ for image_path in image_paths:
     result[..., 1] = mask
     result[..., 2] = mask
 
-    print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%})")
+    print(f"{os.path.basename(image_path)} -> {status} ({green_frac:.2%})")
 
     # Rotate images 90° CCW and stack vertically
     image_rotated       = cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
     result_rotated      = cv2.rotate(result, cv2.ROTATE_90_COUNTERCLOCKWISE)
     combined_view       = np.vstack((image_rotated, result_rotated))
 
-    black_and_white_path = f"black_and_white_images/{image_path}.png"
-    colored_path         = f"colored_images/{image_path}.png"
-
-    with open("colored_images/hello.txt", "w") as file:
-        file.write("hi")
+    black_and_white_path = f"training_b&w_13_march\\{image_path}.png"
+    colored_path         = f"training_color_13_march\\{image_path}.png"
 
     result = cv2.imwrite(black_and_white_path, result_rotated)
     result = cv2.imwrite(colored_path, image_rotated)
-
-
     
     # 1. Create a named window first
     # cv2.WINDOW_NORMAL allows the window to be resized
@@ -87,7 +75,4 @@ for image_path in image_paths:
 
     # 3. Show the image using that specific window name
     cv2.imshow("Resized Window", combined_view)
-    
-    key = cv2.waitKey(100)  # short delay; press 'q' to quit
-    if key == ord('q'):
-        break
+
