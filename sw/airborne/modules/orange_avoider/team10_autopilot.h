@@ -13,15 +13,9 @@
 #ifndef TEAM10_AUTOPILOT_H
 #define TEAM10_AUTOPILOT_H
 
-// settings
-extern float oa_color_count_frac;
-
-// functions (ORANGE AVOIDER)
-extern void orange_avoider_init(void);
-extern void orange_avoider_periodic(void);
-
 // functions (TEAM 10 GROUND DETECTION)
-extern void ground_detection_init(void)
+extern void ground_detection_init(void);
+extern void ground_detection_periodic(void);
 
 #endif
 

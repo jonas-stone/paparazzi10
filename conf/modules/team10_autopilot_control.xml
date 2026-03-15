@@ -24,12 +24,13 @@ so you have to define which filter to use with the ORANGE_AVOIDER_VISUAL_DETECTI
   <dep>
     <depends>team10_cv_detect_ground</depends>
   </dep>
+  
   <header>
-    <file name="orange_avoider.h"/>
+    <file name="team10_autopilot.h"/>
   </header>
-  <init fun="orange_avoider_init()"/>
-  <periodic fun="orange_avoider_periodic()" freq="4"/>
+  <init fun="ground_detection_init()"/>
+  <periodic fun="ground_detection_periodic()" freq="10"/>
   <makefile target="ap|nps">
-    <file name="orange_avoider.c"/>
+    <file name="team10_autopilot.c"/>
   </makefile>
 </module>

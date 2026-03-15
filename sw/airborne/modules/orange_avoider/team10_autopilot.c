@@ -24,6 +24,7 @@
 #include "modules/core/abi.h"
 #include <time.h>
 #include <stdio.h>
+#include <string.h>
 
 // Team 10 inclusions
 #include "modules/orange_avoider/team10_autopilot_control.h"
@@ -54,19 +55,19 @@ enum navigation_state_t {
   OUT_OF_BOUNDS
 };
 
-// define settings
-float oa_color_count_frac = 0.18f;
-
 // define and initialise global variables
 enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
-int32_t color_count = 0;                // orange color count from color filter for obstacle detection
 int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
 float heading_increment = 5.f;          // heading angle increment [deg]
 float maxDistance = 2.25;               // max waypoint displacement [m]
 
 // define script-level variables
-struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
-uint8_t obstacle_count;
+struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
+uint8_t   obstacle_count        = 0;
+uint16_t  total_obstacle_width  = 0;
+
+// define threshold settings
+const float obstacle_width_threshold = 0.2;
 
 const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
 
@@ -83,37 +84,22 @@ const int16_t max_trajectory_confidence = 5; // number of consecutive negative o
 
 // ABI event declaration (used to bind to callback function)
 static abi_event ground_detection_ev;
-static abi_event color_detection_ev;
 
-// // ABI callback function for ORANGE AVOIDER
-// static void color_detection_cb(uint8_t __attribute__((unused)) sender_id,
-//                                int16_t __attribute__((unused)) pixel_x, int16_t __attribute__((unused)) pixel_y,
-//                                int16_t __attribute__((unused)) pixel_width, int16_t __attribute__((unused)) pixel_height,
-//                                int32_t quality, int16_t __attribute__((unused)) extra)
-// {
-//   color_count = quality;
-// }
-
+// ABI video callback function, gets the data from the computer vision code
 static void ground_detection_callback(uint8_t __attribute__((unused)) sender_id,
-                                      struct obstacle_region_t * incoming_obstacles,
-                                      uint8_t incoming_obstacle_count)
+                                      struct obstacle_region_t       *incoming_obstacles,
+                                      uint8_t                         incoming_obstacle_count)
 {
-  obstacle_count  = incoming_obstacle_count;
-  obstacles       = incoming_obstacles;
+  // store incoming variables inside this scope
+  obstacle_count = incoming_obstacle_count;
+  memcpy(obstacles, incoming_obstacles, obstacle_count * sizeof(struct obstacle_region_t));
+
+  // compute total obstacle width from incoming image
+  total_obstacle_width = 0;
+  for (uint8_t i = 0; i < obstacle_count; i++) {
+    total_obstacle_width += obstacles[i].width;
+  }
 }
-
-// /*
-//  * Initialisation function, setting the colour filter, random seed and heading_increment
-//  */
-// void orange_avoider_init(void)
-// {
-//   // Initialise random values
-//   srand(time(NULL));
-//   chooseRandomIncrementAvoidance();
-
-//   // bind our colorfilter callbacks to receive the color filter outputs
-//   AbiBindMsgVISUAL_DETECTION(TEAM10_GROUND_DETECTION_ID, &color_detection_ev, color_detection_cb);
-// }
 
 /*
  * Initialisation function, random seed and heading_increment
@@ -127,15 +113,19 @@ void ground_detection_init(void) {
 /*
  * Function that checks it is safe to move forwards, and then moves a waypoint forward or changes the heading
  */
-void orange_avoider_periodic(void)
+void ground_detection_periodic(void)
 {
   // only evaluate our state machine if we are flying
   if(!autopilot_in_flight()){
     return;
   }
 
-  // update our safe confidence
-  do_something();
+  // update our confidence level
+  if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
+    obstacle_free_confidence++;
+  } else {
+    obstacle_free_confidence -= 2;
+  }
 
   // bound obstacle_free_confidence
   Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
