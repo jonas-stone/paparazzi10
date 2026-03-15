@@ -25,29 +25,26 @@
  * if you are over the defined object or not
  */
 
-// Own header
-#include "modules/computer_vision/cv_detect_color_object.h"
+// Dependencies
+#include "modules/computer_vision/lib/vision/image.h"
 #include "modules/computer_vision/cv.h"
 #include "modules/core/abi.h"
 #include "std.h"
 
+// Own header
 #include "modules/computer_vision/team10_ground_detection.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
 
+// Libraries
 #include <stdio.h>
 #include <stdbool.h>
 #include <math.h>
 #include "pthread.h"
 
-#define PRINT(string,...) fprintf(stderr, "[object_detector->%s()] " string,__FUNCTION__ , ##__VA_ARGS__)
-#if OBJECT_DETECTOR_VERBOSE
-#define VERBOSE_PRINT PRINT
-#else
-#define VERBOSE_PRINT(...)
-#endif
-
+// declare mutex variable
 static pthread_mutex_t mutex;
 
+// leave this unchanged (i'm scared)
 #ifndef COLOR_OBJECT_DETECTOR_FPS1
 #define COLOR_OBJECT_DETECTOR_FPS1 0 ///< Default FPS (zero means run at camera fps)
 #endif
@@ -55,179 +52,89 @@ static pthread_mutex_t mutex;
 #define COLOR_OBJECT_DETECTOR_FPS2 0 ///< Default FPS (zero means run at camera fps)
 #endif
 
-// MAX. number of obstacles to report (must match the size of the output array in get_obstacle_info)
-#define OBSTACLE_ALPHA          0.6f
-#define OBSTACLE_THRESHOLD      50.0f
-#define NO_GROUND_BASELINE      220.0f
-#define MAX_OBSTACLE_REGIONS    7     /* max regions we can return    */
-#define MAX_IMAGE_WIDTH         520   /* adjust to your camera width  */
+// define persistent variables (across frames)
+static float  ground_baseline[MAX_IMAGE_WIDTH];
+static int    baseline_inited = 0;
+static bool   obstacles_updated = false;
+static int    global_obstacle_count = 0;
 
-// Filter Settings
-uint8_t cod_lum_min1 = 0;
-uint8_t cod_lum_max1 = 0;
-uint8_t cod_cb_min1 = 0;
-uint8_t cod_cb_max1 = 0;
-uint8_t cod_cr_min1 = 0;
-uint8_t cod_cr_max1 = 0;
+// define global variable
+struct obstacle_region_t global_obstacles[MAX_OBSTACLE_REGIONS];
 
-uint8_t cod_lum_min2 = 0;
-uint8_t cod_lum_max2 = 0;
-uint8_t cod_cb_min2 = 0;
-uint8_t cod_cb_max2 = 0;
-uint8_t cod_cr_min2 = 0;
-uint8_t cod_cr_max2 = 0;
-
-bool cod_draw1 = false;
-bool cod_draw2 = false;
-
-// define global variables
-struct obstacle_t {
-    int left;   ///< leftmost column in original (unflipped) image coordinates
-    int width;  ///< width in columns
-};
-
-struct ground_debug_t {
-    int     ground_found;   ///< 1 = "GROUND FOUND", 0 = "NO GROUND"
-    float   green_frac;     ///< fraction of pixels classified as ground
-    /* boundary_rows and obstacle_regions_raw are owned by the caller --
-       pass the same arrays you supply to get_obstacle_info()            */
-};
-
-// Global variables
-struct obstacle_t     global_obstacles[MAX_OBSTACLE_REGIONS];
-int                   boundary_rows[MAX_IMAGE_WIDTH];
-struct ground_debug_t debug;
-
-
-/*
- * object_detector
- * @param img - input image to process
- * @param filter - which detection filter to process
- * @return img
- */
-int get_obstacle_info(struct image_t           *input,
-                      float                    *ground_baseline,
-                      int                      *baseline_inited,
-                      float                     oa_color_count_frac,
-                      int                       median_ksize,
-                      int                       min_width,
-                      int                      *boundary_rows_out,
-                      struct ground_debug_t    *debug_out)
+// heavy function that runs as video callback
+static struct image_t *detect_obstacles_from_ground(struct image_t *img, uint8_t camera_id __attribute__((unused)))
 {
-    int W = input->w;
-    int H = input->h;
+    int                      boundary_rows[MAX_IMAGE_WIDTH];
 
-    /* ---- Step 1: ground mask ---- */
-    struct image_t mask;
-    image_create(&mask, W, H, IMAGE_GRAYSCALE);
-
-    float green_frac  = 0.0f;
-    int   apply_median = (median_ksize >= 3 && median_ksize % 2 == 1);
-    int   ground_found = detect_green_ground_ml(input, &mask,
-                                                oa_color_count_frac,
-                                                apply_median,
-                                                &green_frac);
-
-    if (debug_out != NULL) {
-        debug_out->ground_found = ground_found;
-        debug_out->green_frac   = green_frac;
-    }
-
-    if (!ground_found) {
-        /* no ground: leave baseline unchanged, return zero obstacles */
-        image_free(&mask);
-        return 0;
-    }
-
-    /* ---- Step 2: flip mask horizontally (mask[:, ::-1]) ---- */
-    struct image_t mask_flipped;
-    image_create(&mask_flipped, W, H, IMAGE_GRAYSCALE);
-    flip_horizontal(&mask, &mask_flipped);
-    image_free(&mask); /* no longer needed */
-
-    /* ---- Step 3: find ground boundary ---- */
-    find_ground_boundary(&mask_flipped,
-                         boundary_rows_out,
-                         /* min_ground_pixels= */ 5,
-                         /* max_gap=           */ 10,
-                         /* smooth_kernel=     */ 5);
-    image_free(&mask_flipped);
-
-    /* ---- Step 4: update baseline and detect obstacle regions ---- */
-    struct obstacle_region_t raw_regions[MAX_OBSTACLE_REGIONS];
-    int n_regions = update_and_detect(
-                        (const uint16_t *)boundary_rows_out,
-                        W, H,
-                        ground_baseline,
-                        baseline_inited,
-                        min_width,
-                        raw_regions);
-
-    /* ---- Step 5: convert from flipped coords to image coords ----
-     *
-     * In the flipped mask a column index c corresponds to column
-     * (W - 1 - c) in the original image.  An obstacle region [s, e]
-     * in flipped coords therefore spans:
-     *
-     *   original right edge : W - 1 - s
-     *   original left  edge : W - 1 - e   ← this is "left" in left→right order
-     *   width               : e - s + 1   (unchanged)
-     */
-    
+    // lock mutex and modify global_obstacles
     pthread_mutex_lock(&mutex);
-    for (int i = 0; i < n_regions; i++) {
-        global_obstacles[i].left  = W - 1 - (int)raw_regions[i].end;
-        global_obstacles[i].width = (int)raw_regions[i].width;
+    int obstacle_count = get_obstacle_info(
+        img,
+        ground_baseline,
+        &baseline_inited,
+        0.05f,   /* oa_color_count_frac */
+        5,       /* median_ksize        */
+        20,      /* min_width           */
+        global_obstacles,
+        boundary_rows,   /* int[MAX_IMAGE_WIDTH], local to the callback */
+        NULL,            /* ground_found_out, or pass a local int if you need it */
+        NULL             /* green_frac_out,   or pass a local float if you need it */
+    );
+
+    global_obstacle_count = obstacle_count;
+    obstacles_updated = true;
+
+    for (int i = 0; i < obstacle_count; i++) {
+        printf("Obstacle %d: left=%d width=%d\n",
+               i, global_obstacles[i].start, global_obstacles[i].width);
     }
     pthread_mutex_unlock(&mutex);
 
-    return n_regions;
+    return img;
 }
 
+// Remember to change function name in XML file
 void color_object_detector_init(void)
 {
-
-  memset(global_obstacles, 0, MAX_OBSTACLE_REGIONS*sizeof(struct color_object_t));
+  memset(global_obstacles, 0, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
   pthread_mutex_init(&mutex, NULL);
-
-  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1, get_obstacle_info, COLOR_OBJECT_DETECTOR_FPS1, 0);
-
+  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1, detect_obstacles_from_ground, COLOR_OBJECT_DETECTOR_FPS1, 0);
 }
 
+// Remember to change function name in XML file
+// void ground_detection_periodic(void)
+// {
+//   struct obstacle_region_t  local_obstacles[MAX_OBSTACLE_REGIONS];
+//   int                       obstacle_count;
 
+//   pthread_mutex_lock(&mutex);
+
+//   // if nothing new, don't even copy the global variable into local
+//   if (!obstacles_updated) {
+//         pthread_mutex_unlock(&mutex);
+//         return; 
+//   }
+
+//   // create a local copy of global variables
+//   obstacle_count = global_obstacle_count;
+//   memcpy(local_obstacles, global_obstacles, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
+
+//   // reset updated state
+//   obstacles_updated = false;
+//   pthread_mutex_unlock(&mutex);
+
+//   // remember to create a new ABI function to support your message type (var/include/abi_messages.h)
+//   AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, obstacle_count, local_obstacles);
+  
+// }
+
+/* 
+ * FOR NOW -> USE THE ORANGE_AVOIDER FUNCTIONS 
+ *
+ * THIS FUNCTION ACTUALLY GETS MESSAGED BACK TO TEAM10_AUTOPILOT_CONTROL.C
+ */
 void color_object_detector_periodic(void)
 {
-  static struct color_object_t local_filters[2];
-  pthread_mutex_lock(&mutex);
-  memcpy(local_filters, global_filters, 2*sizeof(struct color_object_t));
-  pthread_mutex_unlock(&mutex);
+    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, 0, 0, 0, 0, 0, 0);
 
-  if(local_filters[0].updated){
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, local_filters[0].x_c, local_filters[0].y_c,
-        0, 0, local_filters[0].color_count, 0);
-    local_filters[0].updated = false;
-  }
-  if(local_filters[1].updated){
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION2_ID, local_filters[1].x_c, local_filters[1].y_c,
-        0, 0, local_filters[1].color_count, 1);
-    local_filters[1].updated = false;
-  }
-}
-
-/* --- called each frame --- */
-void vision_periodic(void)
-{
-  // create a local immutable copy of global_obstacles
-  static struct obstacle_t local_obstacles;
-  pthread_mutex_lock(&mutex);
-  memcpy(local_obstacles, global_obstacles, MAX_OBSTACLE_REGIONS*sizeof(struct obstacle_t));
-  pthread_mutex_unlock(&mutex);
-
-  // send local_obstacles over to autopilot code
-  AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION2_ID, local_obstacles, 1);
-
-  for (int i = 0; i < n; i++) {
-    printf("Obstacle %d: left=%d width=%d\n",
-          i, obstacles[i].left, obstacles[i].width);
-  }
 }

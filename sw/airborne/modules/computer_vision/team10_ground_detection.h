@@ -25,32 +25,18 @@
  * if you are over the defined color_object or not
  */
 
-#ifndef COLOR_OBJECT_DETECTOR_CV_H
-#define COLOR_OBJECT_DETECTOR_CV_H
+#ifndef TEAM10_GROUND_DETECTION_H
+#define TEAM10_GROUND_DETECTION_H
 
 #include <stdint.h>
 #include <stdbool.h>
 
-// Module settings
-extern uint8_t cod_lum_min1;
-extern uint8_t cod_lum_max1;
-extern uint8_t cod_cb_min1;
-extern uint8_t cod_cb_max1;
-extern uint8_t cod_cr_min1;
-extern uint8_t cod_cr_max1;
-
-extern uint8_t cod_lum_min2;
-extern uint8_t cod_lum_max2;
-extern uint8_t cod_cb_min2;
-extern uint8_t cod_cb_max2;
-extern uint8_t cod_cr_min2;
-extern uint8_t cod_cr_max2;
-
-extern bool cod_draw1;
-extern bool cod_draw2;
-
 // Module functions
-extern void color_object_detector_init(void);
+// extern void ground_detection_init(void);
+// extern void ground_detection_periodic(void);
+
+// for now, still use the orange avoider functions
 extern void color_object_detector_periodic(void);
+extern void color_object_detector_init(void);
 
 #endif /* COLOR_OBJECT_DETECTOR_CV_H */

@@ -27,7 +27,7 @@
     <define name="COLOR_OBJECT_DETECTOR_DRAW2" value="FALSE|TRUE" description="Whether or not to draw on image"/>
   </doc>
 
-  <settings>
+  <!-- <settings>
     <dl_settings>
       <dl_settings name="ColorObjectDetector">
          <dl_setting var="cod_lum_min1" min="0" step="1" max="255" shortname="y_min1"/>
@@ -46,20 +46,21 @@
          <dl_setting var="cod_draw2"  min="0" step="1" max="1" values="False|True" shortname="draw 2" />
       </dl_settings>
     </dl_settings>
-  </settings>
+  </settings> -->
 
   <dep>
     <depends>video_thread</depends>
   </dep>
 
   <header>
-    <file name="cv_detect_color_object.h"/>
+    <file name="team10_ground_detection.h"/>
   </header>
 
   <init fun="color_object_detector_init()"/>
-  <periodic fun="color_object_detector_periodic()" freq="50"/>
+  <periodic fun="color_object_detector_periodic()" freq="10"/>
   <makefile target="ap|nps">
-    <file name="cv_detect_color_object.c"/>
+    <file name="team10_ground_detection.c"/>
+    <file name="team10_get_obstacle_info.c"/>
   </makefile>
 </module>
 
