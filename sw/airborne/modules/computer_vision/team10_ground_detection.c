@@ -52,11 +52,15 @@ static pthread_mutex_t mutex;
 #define COLOR_OBJECT_DETECTOR_FPS2 0 ///< Default FPS (zero means run at camera fps)
 #endif
 
+// ======================================================================================================
+// NOTE: the variables MAX_IMAGE_WIDTH, MAX_OBSTACLE_REGIONS, etc. are defined inside get_obstacle_info.h
+// ======================================================================================================
+
 // define persistent variables (across frames)
-static float  ground_baseline[MAX_IMAGE_WIDTH];
-static int    baseline_inited = 0;
-static bool   obstacles_updated = false;
-static int    global_obstacle_count = 0;
+static float    ground_baseline[MAX_IMAGE_WIDTH];
+static int      baseline_inited       = 0;
+static bool     obstacles_updated     = false;
+static uint8_t  global_obstacle_count = 0;
 
 // define global variable
 struct obstacle_region_t global_obstacles[MAX_OBSTACLE_REGIONS];
@@ -65,25 +69,28 @@ struct obstacle_region_t global_obstacles[MAX_OBSTACLE_REGIONS];
 static struct image_t *detect_obstacles_from_ground(struct image_t *img, uint8_t camera_id __attribute__((unused)))
 {
     int                      boundary_rows[MAX_IMAGE_WIDTH];
+    struct obstacle_region_t local_obstacles[MAX_OBSTACLE_REGIONS];
+
+    uint8_t obstacle_count = get_obstacle_info(
+            img,
+            ground_baseline,
+            &baseline_inited,
+            0.05f,   /* oa_color_count_frac */
+            5,       /* median_ksize        */
+            20,      /* min_width           */
+            local_obstacles,
+            boundary_rows,   /* int[MAX_IMAGE_WIDTH], local to the callback */
+            NULL,            /* ground_found_out, or pass a local int if you need it */
+            NULL             /* green_frac_out,   or pass a local float if you need it */
+    );
 
     // lock mutex and modify global_obstacles
     pthread_mutex_lock(&mutex);
-    int obstacle_count = get_obstacle_info(
-        img,
-        ground_baseline,
-        &baseline_inited,
-        0.05f,   /* oa_color_count_frac */
-        5,       /* median_ksize        */
-        20,      /* min_width           */
-        global_obstacles,
-        boundary_rows,   /* int[MAX_IMAGE_WIDTH], local to the callback */
-        NULL,            /* ground_found_out, or pass a local int if you need it */
-        NULL             /* green_frac_out,   or pass a local float if you need it */
-    );
-
+    memcpy(global_obstacles, local_obstacles, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
     global_obstacle_count = obstacle_count;
     obstacles_updated = true;
-
+    
+    // print info about current obstacles
     for (int i = 0; i < obstacle_count; i++) {
         printf("Obstacle %d: left=%d width=%d\n",
                i, global_obstacles[i].start, global_obstacles[i].width);
@@ -94,7 +101,7 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img, uint8_t
 }
 
 // Remember to change function name in XML file
-void color_object_detector_init(void)
+void ground_detection_init(void)
 {
   memset(global_obstacles, 0, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
   pthread_mutex_init(&mutex, NULL);
@@ -102,31 +109,32 @@ void color_object_detector_init(void)
 }
 
 // Remember to change function name in XML file
-// void ground_detection_periodic(void)
-// {
-//   struct obstacle_region_t  local_obstacles[MAX_OBSTACLE_REGIONS];
-//   int                       obstacle_count;
+void ground_detection_periodic(void)
+{
+  struct obstacle_region_t  local_obstacles[MAX_OBSTACLE_REGIONS];
+  uint8_t                   obstacle_count;
 
-//   pthread_mutex_lock(&mutex);
+  pthread_mutex_lock(&mutex);
 
-//   // if nothing new, don't even copy the global variable into local
-//   if (!obstacles_updated) {
-//         pthread_mutex_unlock(&mutex);
-//         return; 
-//   }
+  // if nothing new, don't even copy the global variable into local
+  if (!obstacles_updated) {
+        pthread_mutex_unlock(&mutex);
+        return;
+  }
 
-//   // create a local copy of global variables
-//   obstacle_count = global_obstacle_count;
-//   memcpy(local_obstacles, global_obstacles, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
+  // create a local copy of global variables
+  obstacle_count = global_obstacle_count;
+  memcpy(local_obstacles, global_obstacles, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
 
-//   // reset updated state
-//   obstacles_updated = false;
-//   pthread_mutex_unlock(&mutex);
+  // reset updated state
+  obstacles_updated = false;
+  pthread_mutex_unlock(&mutex);
 
-//   // remember to create a new ABI function to support your message type (var/include/abi_messages.h)
-//   AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, obstacle_count, local_obstacles);
+  // ABI function:      42
+  // ABI message ID:    1
+  AbiSendMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, local_obstacles, obstacle_count);
   
-// }
+}
 
 /* 
  * FOR NOW -> USE THE ORANGE_AVOIDER FUNCTIONS 

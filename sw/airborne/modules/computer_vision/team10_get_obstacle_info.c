@@ -1,7 +1,13 @@
 /*
- * HELPER_FUNCTIONS.c
+ * team10_get_obstacle_info.c
  *
  * Ground detection and obstacle finding pipeline.
+ * 
+ * NOTE: ALL THESE FUNCTIONS WORK WITH A ROTATED IMAGE
+ * (ground is on the left) ON PURPOSE.
+ * 
+ * If you want to work with a right-side up image, 
+ * then you need to rotate it first.
  */
 
 #include "modules/computer_vision/team10_get_obstacle_info.h"
@@ -409,19 +415,19 @@ void find_ground_boundary(const struct image_t *mask_flipped,
 /* SECTION 7 – get_obstacle_regions (public)                           */
 /* ================================================================== */
 
-int get_obstacle_regions(const uint16_t           *obstacle_cols,
-                         int                       n_cols,
-                         int                       min_width,
-                         int                       max_col_gap,
-                         struct obstacle_region_t *regions_out)
+uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
+                            int                       n_cols,
+                            int                       min_width,
+                            int                       max_col_gap,
+                            struct obstacle_region_t *regions_out)
 {
     if (n_cols == 0) {
         return 0;
     }
 
-    int      n_regions = 0;
-    uint16_t start     = obstacle_cols[0];
-    uint16_t end       = obstacle_cols[0];
+    uint8_t     n_regions = 0;
+    uint16_t    start     = obstacle_cols[0];
+    uint16_t    end       = obstacle_cols[0];
 
     for (int i = 1; i < n_cols; i++) {
         uint16_t col = obstacle_cols[i];
@@ -461,13 +467,13 @@ int get_obstacle_regions(const uint16_t           *obstacle_cols,
  * boundary_row is now int* throughout — fixes the int / uint16_t type
  * mismatch that existed in the original get_obstacle_info call site.
  */
-int update_and_detect(const int  *boundary_row,
-                      int         width,
-                      int         h,
-                      float      *ground_baseline,
-                      int        *baseline_inited,
-                      int         min_width,
-                      struct obstacle_region_t *regions_out)
+uint8_t update_and_detect(const int  *boundary_row,
+                        int         width,
+                        int         h,
+                        float      *ground_baseline,
+                        int        *baseline_inited,
+                        int         min_width,
+                        struct obstacle_region_t *regions_out)
 {
     /* First call: initialise baseline, skip detection */
     if (!(*baseline_inited)) {
@@ -502,8 +508,8 @@ int update_and_detect(const int  *boundary_row,
     }
 
     /* Detect obstacle regions */
-    int n_regions = get_obstacle_regions(obstacle_cols, n_obstacle_cols,
-                                         min_width, 5, regions_out);
+    uint8_t n_regions = get_obstacle_regions(obstacle_cols, n_obstacle_cols,
+                                            min_width, 5, regions_out);
 
     /* EMA update for non-obstacle columns */
     for (int x = 0; x < width; x++) {
@@ -548,16 +554,16 @@ static void flip_horizontal(const struct image_t *src, struct image_t *dst)
 /* SECTION 10 – get_obstacle_info (public)                             */
 /* ================================================================== */
 
-int get_obstacle_info(struct image_t           *input,
-                      float                    *ground_baseline,
-                      int                      *baseline_inited,
-                      float                     oa_color_count_frac,
-                      int                       median_ksize,
-                      int                       min_width,
-                      struct obstacle_region_t *obstacles_out,
-                      int                      *boundary_rows_out,
-                      int                      *ground_found_out,
-                      float                    *green_frac_out)
+uint8_t get_obstacle_info(struct image_t           *input,
+                        float                    *ground_baseline,
+                        int                      *baseline_inited,
+                        float                     oa_color_count_frac,
+                        int                       median_ksize,
+                        int                       min_width,
+                        struct obstacle_region_t *obstacles_out,
+                        int                      *boundary_rows_out,
+                        int                      *ground_found_out,
+                        float                    *green_frac_out)
 {
     int W = input->w;
     int H = input->h;
@@ -601,12 +607,12 @@ int get_obstacle_info(struct image_t           *input,
      * regions are still in flipped coordinates here.
      */
     struct obstacle_region_t raw_regions[MAX_OBSTACLE_REGIONS];
-    int n_regions = update_and_detect(boundary_rows_out,
-                                      W, H,
-                                      ground_baseline,
-                                      baseline_inited,
-                                      min_width,
-                                      raw_regions);
+    uint8_t n_regions = update_and_detect(boundary_rows_out,
+                                        W, H,
+                                        ground_baseline,
+                                        baseline_inited,
+                                        min_width,
+                                        raw_regions);
 
     /*
      * Step 5 – convert from flipped to original image coordinates.
