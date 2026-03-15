@@ -15,11 +15,18 @@ import os
 
 cv2.destroyAllWindows()
 
-folder_path = "DEVELOPMENT/downloads from drone/20260313-100130"
+# folder_path = "../../../downloads from drone/20260313-100130"
+# image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
+folder_path = r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260313-100130"
 image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
 
 oa_color_count_frac = 0.05
 
+# Creating the initial folders in case they do not exist
+os.makedirs("../../training_images/training_b&w_13_march", exist_ok=True)
+os.makedirs("../../training_images/training_color_13_march", exist_ok=True)
+print(f"Looking in: {os.path.abspath(folder_path)}")
+print(f"Found {len(image_paths)} images")
 i = 0
 for image_path in image_paths:
 
@@ -60,11 +67,16 @@ for image_path in image_paths:
     result_rotated      = cv2.rotate(result, cv2.ROTATE_90_COUNTERCLOCKWISE)
     combined_view       = np.vstack((image_rotated, result_rotated))
 
-    black_and_white_path = f"training_b&w_13_march\\{image_path}.png"
-    colored_path         = f"training_color_13_march\\{image_path}.png"
+    filename = os.path.splitext(os.path.basename(image_path))[0]
+    black_and_white_path = f"../../training_images/training_b&w_13_march\\{filename}.png"
+    colored_path = f"../../training_images/training_color_13_march\\{filename}.png"
+    # black_and_white_path = f"training_b&w_13_march\\{image_path}.png"
+    # colored_path         = f"training_color_13_march\\{image_path}.png"
 
-    result = cv2.imwrite(black_and_white_path, result_rotated)
-    result = cv2.imwrite(colored_path, image_rotated)
+    # result = cv2.imwrite(black_and_white_path, result_rotated)
+    # result = cv2.imwrite(colored_path, image_rotated)
+    ok_bw = cv2.imwrite(black_and_white_path, result_rotated)
+    ok_color = cv2.imwrite(colored_path, image_rotated)
     
     # 1. Create a named window first
     # cv2.WINDOW_NORMAL allows the window to be resized
@@ -75,4 +87,5 @@ for image_path in image_paths:
 
     # 3. Show the image using that specific window name
     cv2.imshow("Resized Window", combined_view)
+    cv2.waitKey(1)
 
