@@ -19,21 +19,21 @@
  * Boston, MA 02111-1307, USA.
  */
 
-/**
+/*
  * @file modules/computer_vision/cv_detect_object.h
  * Assumes the object consists of a continuous color and checks
  * if you are over the defined object or not
  */
+
+// Own header
+#include "modules/computer_vision/team10_ground_detection.h"
+#include "modules/computer_vision/team10_get_obstacle_info.h"
 
 // Dependencies
 #include "modules/computer_vision/lib/vision/image.h"
 #include "modules/computer_vision/cv.h"
 #include "modules/core/abi.h"
 #include "std.h"
-
-// Own header
-#include "modules/computer_vision/team10_ground_detection.h"
-#include "modules/computer_vision/team10_get_obstacle_info.h"
 
 // Libraries
 #include <stdio.h>
@@ -136,13 +136,13 @@ void ground_detection_periodic(void)
   
 }
 
-/* 
- * FOR NOW -> USE THE ORANGE_AVOIDER FUNCTIONS 
- *
- * THIS FUNCTION ACTUALLY GETS MESSAGED BACK TO TEAM10_AUTOPILOT_CONTROL.C
- */
-void color_object_detector_periodic(void)
-{
-    AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, 0, 0, 0, 0, 0, 0);
+// /* 
+//  * FOR NOW -> USE THE ORANGE_AVOIDER FUNCTIONS 
+//  *
+//  * THIS FUNCTION ACTUALLY GETS MESSAGED BACK TO TEAM10_AUTOPILOT_CONTROL.C
+//  */
+// void color_object_detector_periodic(void)
+// {
+//     AbiSendMsgVISUAL_DETECTION(COLOR_OBJECT_DETECTION1_ID, 0, 0, 0, 0, 0, 0);
 
-}
+// }

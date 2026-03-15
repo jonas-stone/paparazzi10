@@ -98,11 +98,11 @@ void find_ground_boundary(const struct image_t *mask_flipped,
  * @param regions_out    Caller-supplied array, size MAX_OBSTACLE_REGIONS
  * @return               Number of regions written
  */
-int get_obstacle_regions(const uint16_t           *obstacle_cols,
-                         int                       n_cols,
-                         int                       min_width,
-                         int                       max_col_gap,
-                         struct obstacle_region_t *regions_out);
+uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
+                            int                       n_cols,
+                            int                       min_width,
+                            int                       max_col_gap,
+                            struct obstacle_region_t *regions_out);
 
 /**
  * update_and_detect
@@ -119,13 +119,13 @@ int get_obstacle_regions(const uint16_t           *obstacle_cols,
  * @param regions_out     Caller-supplied array, size MAX_OBSTACLE_REGIONS
  * @return                Number of obstacle regions (0 on first call)
  */
-int update_and_detect(const int  *boundary_row,
-                      int         width,
-                      int         h,
-                      float      *ground_baseline,
-                      int        *baseline_inited,
-                      int         min_width,
-                      struct obstacle_region_t *regions_out);
+uint8_t update_and_detect(const int  *boundary_row,
+                        int         width,
+                        int         h,
+                        float      *ground_baseline,
+                        int        *baseline_inited,
+                        int         min_width,
+                        struct obstacle_region_t *regions_out);
 
 /**
  * get_obstacle_info
@@ -146,15 +146,15 @@ int update_and_detect(const int  *boundary_row,
  * @param green_frac_out      OUTPUT: ground pixel fraction (may be NULL)
  * @return                    Number of obstacles found (0 when no ground)
  */
-int get_obstacle_info(struct image_t           *input,
-                      float                    *ground_baseline,
-                      int                      *baseline_inited,
-                      float                     oa_color_count_frac,
-                      int                       median_ksize,
-                      int                       min_width,
-                      struct obstacle_region_t *obstacles_out,
-                      int                      *boundary_rows_out,
-                      int                      *ground_found_out,
-                      float                    *green_frac_out);
+uint8_t get_obstacle_info(struct image_t           *input,
+                        float                    *ground_baseline,
+                        int                      *baseline_inited,
+                        float                     oa_color_count_frac,
+                        int                       median_ksize,
+                        int                       min_width,
+                        struct obstacle_region_t *obstacles_out,
+                        int                      *boundary_rows_out,
+                        int                      *ground_found_out,
+                        float                    *green_frac_out);
 
 #endif /* HELPER_FUNCTIONS_H */

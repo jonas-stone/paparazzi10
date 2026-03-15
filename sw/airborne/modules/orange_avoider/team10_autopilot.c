@@ -17,6 +17,11 @@
  * so you have to define which filter to use with the ORANGE_AVOIDER_VISUAL_DETECTION_ID setting.
  */
 
+ // Team 10 inclusions
+#include "modules/orange_avoider/team10_autopilot.h"
+#include "modules/computer_vision/team10_get_obstacle_info.h"
+
+// Other inclusions
 #include "modules/orange_avoider/orange_avoider.h"
 #include "firmwares/rotorcraft/navigation.h"
 #include "generated/airframe.h"
@@ -25,10 +30,6 @@
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
-
-// Team 10 inclusions
-#include "modules/orange_avoider/team10_autopilot_control.h"
-#include "modules/computer_vision/team10_get_obstacle_info.h"
 
 // flight plan inclusions
 #include "generated/flight_plan.h"
@@ -66,8 +67,8 @@ struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
 uint8_t   obstacle_count        = 0;
 uint16_t  total_obstacle_width  = 0;
 
-// define threshold settings
-const float obstacle_width_threshold = 0.2;
+// define threshold settings -> lower, drone is more scared
+float obstacle_width_threshold = 0.2f;
 
 const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
 
@@ -104,21 +105,27 @@ static void ground_detection_callback(uint8_t __attribute__((unused)) sender_id,
 /*
  * Initialisation function, random seed and heading_increment
  */
-void ground_detection_init(void) {
+void ground_obstacle_avoidance_init(void) {
   srand(time(NULL));
   chooseRandomIncrementAvoidance();
-  AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, &ground_detection_ev, ground_detection_callback)
+  AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, &ground_detection_ev, ground_detection_callback);
 }
 
 /*
  * Function that checks it is safe to move forwards, and then moves a waypoint forward or changes the heading
  */
-void ground_detection_periodic(void)
+void ground_obstacle_avoidance_periodic(void)
 {
   // only evaluate our state machine if we are flying
   if(!autopilot_in_flight()){
     return;
   }
+
+  // print stuff to terminal
+  printf("total obstacle width: %d\nthreshold (fraction): %.2f\nthreshold (total):    %.2f\n",
+       total_obstacle_width,
+       obstacle_width_threshold,
+       obstacle_width_threshold * MAX_IMAGE_WIDTH);
 
   // update our confidence level
   if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {

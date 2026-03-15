@@ -33,10 +33,6 @@
 
 // Module functions
 extern void ground_detection_init(void);
-// extern void ground_detection_periodic(void);
-
-// for now, still use the orange avoider functions
-extern void color_object_detector_periodic(void);
-// extern void color_object_detector_init(void);
+extern void ground_detection_periodic(void);
 
 #endif /* COLOR_OBJECT_DETECTOR_CV_H */
