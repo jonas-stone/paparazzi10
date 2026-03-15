@@ -39,10 +39,11 @@ from PIL import Image
 import json
 
 # INPUTS ###############################################################################################################
-JSON_Path = r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_Team_10\TEAM-10-PROTOTYPING\Python\training_software\labeled_data_6_march_first_100_test_alex.json"
+# JSON_Path = r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_Team_10\TEAM-10-PROTOTYPING\Python\training_software\labeled_data_6_march_first_100_test_alex.json"
+JSON_Path = r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_Team_10\TEAM-10-PROTOTYPING\Python\training_software\labeled_data_6_march_494_pictures.json"
 Image_Width = 104 # pixels
-Image_Height = 48 # pixels
-Partitions = 7 # might be slighly an overkill cause we can get aaway with 5 but seemed more fun
+Image_Height = 48 # pixelsrkill cause
+Partitions = 7 # might be slighly an ovewe can get aaway with 5 but seemed more fun
 Neurons_Number = 32 # to be played around with
 Epochs = 500 # to be played around with
 Learning_Rate = 0.001 # step size thing like in fmincon
