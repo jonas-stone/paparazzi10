@@ -9,13 +9,14 @@
  * @param img      Pointer to an image_t struct to be populated.
  * @return         1 on success, 0 on failure.
  */
-int load_jpeg_to_yuv422(const char *filename, struct image_t *img);
 
+void wait_for_keypress(void);
+int load_jpeg_to_image_t(const char *filename, struct image_t *img);
 int numeric_sort(const struct dirent **a, const struct dirent **b);
 
 /**
  * Iterates through the sim directory and displays images.
  */
-void run_sim_viewer(const char *folder_path);
+void run_sim_viewer(struct image_t *img);
 
 #endif /* SIM_IMAGE_LOADER_H */
