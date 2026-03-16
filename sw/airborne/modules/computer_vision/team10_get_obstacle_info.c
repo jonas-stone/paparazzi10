@@ -166,6 +166,25 @@ int detect_green_ground_ml(struct image_t *input,
     /* Step 1 – classify every pixel into the mask */
     apply_ground_mask(input, mask_out);
 
+/*  
+    {
+        // MASK PRINTER
+        uint8_t *src  = (uint8_t *)input->buf;
+        uint8_t *mask = (uint8_t *)mask_out->buf;
+        for (int y = 0; y < input->h; y++) {
+            for (int x = 0; x < input->w; x += 2) {
+                uint8_t *p = &src[y * 2 * input->w + 2 * x];
+                uint8_t g0 = mask[y * input->w + x];
+                uint8_t g1 = mask[y * input->w + x + 1];
+                p[0] = 128;
+                p[2] = 128;
+                p[1] = g0 ? 255 : 0;
+                p[3] = g1 ? 255 : 0;
+            }
+        }
+    }
+*/
+
     /* Step 2 – optional 3×3 median blur
      *
      * image_switch() swaps only the struct metadata (buf pointer, sizes),
@@ -579,6 +598,23 @@ uint8_t get_obstacle_info(struct image_t           *input,
                                                 apply_median,
                                                 &green_frac);
 
+    {
+        // MASK PRINTER
+        uint8_t *src      = (uint8_t *)input->buf;
+        uint8_t *mask_buf = (uint8_t *)mask.buf;
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x += 2) {
+                uint8_t *p  = &src[y * 2 * W + 2 * x];
+                uint8_t  g0 = mask_buf[y * W + x];
+                uint8_t  g1 = mask_buf[y * W + x + 1];
+                p[0] = 128;
+                p[2] = 128;
+                p[1] = g0 ? 255 : 0;
+                p[3] = g1 ? 255 : 0;
+            }
+        }
+    }
+
     if (ground_found_out != NULL) { *ground_found_out = ground_found; }
     if (green_frac_out   != NULL) { *green_frac_out   = green_frac;   }
 
@@ -598,7 +634,7 @@ uint8_t get_obstacle_info(struct image_t           *input,
                          boundary_rows_out,
                          /* min_ground_pixels= */ 5,
                          /* max_gap=           */ 10,
-                         /* smooth_kernel=     */ 5);
+                         /* smooth_kernel=     */ 5); 
     image_free(&mask_flipped);
 
     /* Step 4 – update baseline and detect obstacle regions
