@@ -49,6 +49,13 @@ def get_scaled_params(scale_factor):
     )
 
 
+# ── Detection type flag ───────────────────────────────────────────────────────
+# Each row in the detections matrix: [left_x, width, det_type]
+#   det_type: 0 = obstacle, 1 = plant
+DET_OBSTACLE = 0
+DET_PLANT    = 1
+
+
 # ── core pipeline functions ───────────────────────────────────────────────────
 
 def find_ground_boundary(mask_rotated,
@@ -238,7 +245,7 @@ vectorized_is_ground     = np.vectorize(is_ground)
 vectorized_is_ground_sim = np.vectorize(is_ground_sim)
 
 
-# ── detection functions ───────────────────────────────────────────────────────
+# ── detection helper functions ────────────────────────────────────────────────
 
 def detect_green_ground_ml(image_bgr, threshold, median_ksize=5):
     image_yuv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YUV)
@@ -261,13 +268,8 @@ def detect_green_ground_ml(image_bgr, threshold, median_ksize=5):
 
 def detect_all_green_lax(image_bgr, scale_factor=1.0, blur_ksize=5):
     """
-    Lax YUV green filter. scale_factor is applied ON TOP of whatever
-    resolution image_bgr already is — so plant blob merging is controlled
-    independently of the main pipeline scale.
+    Lax YUV green filter at a (further) downscaled resolution.
     Returns: (small_mask, full_res_mask, downscaled_bgr)
-      - small_mask:     mask at (W*scale_factor, H*scale_factor)
-      - full_res_mask:  small_mask upscaled back to (W, H)
-      - downscaled_bgr: the image at plant scale (for reference/debug)
     """
     H, W = image_bgr.shape[:2]
 
@@ -297,13 +299,14 @@ def detect_all_green_lax(image_bgr, scale_factor=1.0, blur_ksize=5):
 
     return green_mask_small, mask_full, downscaled
 
+
 def detect_plant_regions(plant_mask, min_width=10, min_pixels_per_col=2, max_col_gap=3):
     plant_mask_flipped = plant_mask[:, ::-1]   # match obstacle pipeline convention
     n_rows = plant_mask_flipped.shape[0]
     active_rows = []
 
     for row_idx in range(n_rows):
-        row = plant_mask_flipped[row_idx, :]   # scan rows, not columns
+        row = plant_mask_flipped[row_idx, :]
         green_pos = np.where(row > 0)[0]
         if green_pos.size == 0:
             continue
@@ -315,9 +318,11 @@ def detect_plant_regions(plant_mask, min_width=10, min_pixels_per_col=2, max_col
     return get_obstacle_regions(active_rows, min_width=min_width, max_col_gap=max_col_gap)
 
 
+# ── unified detection function ────────────────────────────────────────────────
 
 def get_obstacle_info(image_bgr,
                       ground_baseline,
+                      # obstacle params
                       oa_color_count_frac=0.05,
                       median_ksize=5,
                       min_width=20,
@@ -326,19 +331,39 @@ def get_obstacle_info(image_bgr,
                       max_gap=10,
                       smooth_kernel=5,
                       obstacle_threshold=50,
-                      no_ground_baseline=220):
+                      no_ground_baseline=220,
+                      # plant params
+                      plant_scale_factor=0.15,
+                      plant_blur_ksize=3,
+                      plant_min_width=30,
+                      plant_min_pixels_per_col=2,
+                      plant_max_col_gap=5):
+    """
+    Unified obstacle + plant detection.
+
+    Returns
+    -------
+    detections : np.ndarray, shape (N, 3), dtype int32
+        Each row is [left_x, width, det_type].
+        det_type: 0 = obstacle, 1 = plant.
+        Empty detections → shape (0, 3).
+    new_ground_baseline : np.ndarray or None
+    debug : dict
+        Intermediate data for visualisation.
+    """
     mask, _, green_frac, status = detect_green_ground_ml(
         image_bgr, threshold=oa_color_count_frac, median_ksize=median_ksize)
 
-    H, W      = image_bgr.shape[:2]
-    obstacles = []
-    debug     = {"status": status, "green_frac": green_frac}
+    H, W  = image_bgr.shape[:2]
+    rows  = []     # accumulate [left_x, width, det_type] rows
+    debug = {"status": status, "green_frac": green_frac}
 
+    # ── obstacle detection ─────────────────────────────────────────────────
     if status == "GROUND FOUND":
-        mask = cds.isolate_ground_blob(binary_img=mask)
-        mask = cds.fill_holes(mask)
+        clean_mask = cds.isolate_ground_blob(binary_img=mask)
+        clean_mask = cds.fill_holes(clean_mask)
 
-        mask_flipped  = mask[:, ::-1]
+        mask_flipped  = clean_mask[:, ::-1]
         boundary_rows = find_ground_boundary(
             mask_rotated      = mask_flipped,
             min_ground_pixels = min_ground_pixels,
@@ -357,17 +382,55 @@ def get_obstacle_info(image_bgr,
 
         for (s, e, w) in obstacle_regions:
             left = W - 1 - e
-            obstacles.append((int(left), int(w)))
+            rows.append([int(left), int(w), DET_OBSTACLE])
 
         debug.update({
             "boundary_rows"       : boundary_rows,
             "obstacle_regions_raw": obstacle_regions,
-            "clean_mask"          : mask,
+            "clean_mask"          : clean_mask,
         })
     else:
         new_ground_baseline = ground_baseline
+        clean_mask = np.zeros((H, W), dtype=np.uint8)
+        debug["boundary_rows"]        = np.full(W, W)
+        debug["obstacle_regions_raw"] = []
+        debug["clean_mask"]           = clean_mask
 
-    return obstacles, new_ground_baseline, debug
+    # ── plant detection ────────────────────────────────────────────────────
+    all_green_small, _, _ = detect_all_green_lax(
+        image_bgr,
+        scale_factor = plant_scale_factor,
+        blur_ksize   = plant_blur_ksize,
+    )
+
+    plant_H, plant_W = all_green_small.shape[:2]
+    clean_mask_small = cv2.resize(
+        clean_mask, (plant_W, plant_H), interpolation=cv2.INTER_NEAREST)
+
+    plant_mask_small = cv2.subtract(all_green_small, clean_mask_small)
+    plant_mask = cv2.resize(
+        plant_mask_small, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    plant_regions = detect_plant_regions(
+        plant_mask,
+        min_width         = plant_min_width,
+        min_pixels_per_col = plant_min_pixels_per_col,
+        max_col_gap       = plant_max_col_gap,
+    )
+
+    for (s, e, w) in plant_regions:
+        rows.append([int(s), int(w), DET_PLANT])
+
+    debug["plant_mask"]           = plant_mask
+    debug["plant_regions_raw"]    = plant_regions
+
+    # ── build output matrix ────────────────────────────────────────────────
+    if rows:
+        detections = np.array(rows, dtype=np.int32)   # shape (N, 3)
+    else:
+        detections = np.empty((0, 3), dtype=np.int32)
+
+    return detections, new_ground_baseline, debug
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -378,38 +441,28 @@ if __name__ == "__main__":
 
     cv2.destroyAllWindows()
 
-    folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
+    #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
+    folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
+    #folder_path = "DEVELOPMENT/downloads from drone/sim_images/"
     all_image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
     start_idx   = random.randint(0, len(all_image_paths) - 1)
     image_paths = all_image_paths[start_idx:] + all_image_paths[:start_idx]
 
     oa_color_count_frac = 0.05
 
-    # ── scale factors ──────────────────────────────────────────────────────────
-    # SCALE_FACTOR:       downscale of the raw image before the obstacle pipeline.
-    #                     All pipeline pixel thresholds scale with this value.
-    #                     1.0 = full resolution, 0.5 = half resolution, etc.
-    #
-    # PLANT_SCALE_FACTOR: additional downscale applied ON TOP of SCALE_FACTOR,
-    #                     only for the lax green / plant detection.
-    #                     Lower = more leaf merging into blobs.
-    #                     Does NOT affect obstacle detection at all.
+    # ── scale factors ──────────────────────────────────────────────────────
     SCALE_FACTOR       = 0.8
-    PLANT_SCALE_FACTOR = 0.15   # relative to the already-downscaled image
+    PLANT_SCALE_FACTOR = 0.15*0.8   # relative to the already-downscaled image
 
-    # Pipeline params scale with main image resolution only
     p = get_scaled_params(SCALE_FACTOR)
-
-    # Plant blur kernel scales with the combined resolution
-    plant_blur_ksize = scale_odd(5, SCALE_FACTOR * PLANT_SCALE_FACTOR)
+    plant_blur_ksize = scale_odd(5, PLANT_SCALE_FACTOR)
 
     print(f"Main scale:  {SCALE_FACTOR}  →  pipeline params: {p}")
-    print(f"Plant scale: {SCALE_FACTOR} × {PLANT_SCALE_FACTOR} = "
-          f"{SCALE_FACTOR * PLANT_SCALE_FACTOR:.2f}  →  plant blur_ksize: {plant_blur_ksize}")
+    print(f"Plant scale: {PLANT_SCALE_FACTOR} = "
+          f"{PLANT_SCALE_FACTOR:.2f}  →  plant blur_ksize: {plant_blur_ksize}")
 
     # state
-    ground_baseline  = None
-    obstacle_regions = []
+    ground_baseline = None
 
     if len(image_paths) == 0:
         print("No images found in the specified path.")
@@ -433,57 +486,53 @@ if __name__ == "__main__":
             print(f"Skipping: {image_path}")
             continue
 
-        # ── downscale to main resolution ───────────────────────────────────────
+        # ── downscale to main resolution ───────────────────────────────────
         image_bgr     = cv2.resize(raw, (target_W, target_H), interpolation=cv2.INTER_AREA)
         image_display = image_bgr.copy()
 
-        # ── strict ground mask (obstacle pipeline) ─────────────────────────────
-        initial_mask, _, actual_frac, status = detect_green_ground_ml(
-            image_bgr, oa_color_count_frac, median_ksize=p['median_ksize'])
-
-        clean_mask = cds.isolate_ground_blob(binary_img=initial_mask.copy())
-        clean_mask = cds.fill_holes(clean_mask)
-
-        # ── lax green mask (plant detection, further downscaled independently) ──
-        # PLANT_SCALE_FACTOR is applied on top of the already-downscaled image_bgr
-        all_green_small, _, _ = detect_all_green_lax(
-            image_bgr,
-            scale_factor = PLANT_SCALE_FACTOR,
-            blur_ksize   = plant_blur_ksize,
-        )
-
-        # Resize clean_mask down to plant scale for subtraction
-        plant_H, plant_W = all_green_small.shape[:2]
-        clean_mask_small = cv2.resize(
-            clean_mask, (plant_W, plant_H), interpolation=cv2.INTER_NEAREST)
-
-        plant_mask_small = cv2.subtract(all_green_small, clean_mask_small)
-
-        # Upscale plant mask back to main image size — display panels must match
-        plant_mask = cv2.resize(
-            plant_mask_small, (target_W, target_H), interpolation=cv2.INTER_NEAREST)
-
-        # ── obstacle detection ─────────────────────────────────────────────────
-        obstacle_list, ground_baseline, debug = get_obstacle_info(
+        # ── single unified call ────────────────────────────────────────────
+        detections, ground_baseline, debug = get_obstacle_info(
             image_bgr,
             ground_baseline,
-            oa_color_count_frac = oa_color_count_frac,
-            median_ksize        = p['median_ksize'],
-            min_width           = p['min_width'],
-            max_col_gap         = p['max_col_gap'],
-            min_ground_pixels   = p['min_ground_pixels'],
-            max_gap             = p['max_gap'],
-            smooth_kernel       = p['smooth_kernel'],
-            obstacle_threshold  = p['obstacle_threshold'],
-            no_ground_baseline  = p['no_ground_baseline'],
+            oa_color_count_frac    = oa_color_count_frac,
+            median_ksize           = p['median_ksize'],
+            min_width              = p['min_width'],
+            max_col_gap            = p['max_col_gap'],
+            min_ground_pixels      = p['min_ground_pixels'],
+            max_gap                = p['max_gap'],
+            smooth_kernel          = p['smooth_kernel'],
+            obstacle_threshold     = p['obstacle_threshold'],
+            no_ground_baseline     = p['no_ground_baseline'],
+            plant_scale_factor     = PLANT_SCALE_FACTOR,
+            plant_blur_ksize       = plant_blur_ksize,
+            plant_min_width        = 20,
+            plant_min_pixels_per_col = 2,
+            plant_max_col_gap      = 5,
         )
 
-        boundary_rows        = debug.get("boundary_rows",        boundary_rows)
-        obstacle_regions_raw = debug.get("obstacle_regions_raw", [])
+        # ── unpack debug info ──────────────────────────────────────────────
+        status               = debug["status"]
+        actual_frac          = debug["green_frac"]
+        boundary_rows        = debug["boundary_rows"]
+        obstacle_regions_raw = debug["obstacle_regions_raw"]
+        clean_mask           = debug["clean_mask"]
+        plant_mask           = debug["plant_mask"]
+        plant_regions_raw    = debug["plant_regions_raw"]
 
-        print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%})")
+        # ── split detections by type for display ───────────────────────────
+        if detections.shape[0] > 0:
+            obs_dets   = detections[detections[:, 2] == DET_OBSTACLE]
+            plant_dets = detections[detections[:, 2] == DET_PLANT]
+        else:
+            obs_dets   = np.empty((0, 3), dtype=np.int32)
+            plant_dets = np.empty((0, 3), dtype=np.int32)
 
-        # ── build display panels (all at target_W × target_H) ─────────────────
+        n_obs   = obs_dets.shape[0]
+        n_plant = plant_dets.shape[0]
+        print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%}) "
+              f"| obstacles: {n_obs}  plants: {n_plant}")
+
+        # ── build display panels ───────────────────────────────────────────
         result = np.zeros_like(image_bgr)
         result[..., 0] = clean_mask
         result[..., 1] = clean_mask
@@ -494,7 +543,6 @@ if __name__ == "__main__":
         edges = sdd.get_blob_edge(plant_mask)
         plant_result[edges > 0] = [0, 0, 255]
 
-        # All three panels are (target_W, target_H) → rotate + vstack is clean
         image_rot  = cv2.rotate(image_display, cv2.ROTATE_90_COUNTERCLOCKWISE)
         result_rot = cv2.rotate(result,        cv2.ROTATE_90_COUNTERCLOCKWISE)
         plant_rot  = cv2.rotate(plant_result,  cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -508,9 +556,10 @@ if __name__ == "__main__":
                     (0, 0, 255),
                     p['status_thickness'])
 
-        if status == "GROUND FOUND":
-            h_rot = image_rot.shape[0]
+        h_rot = image_rot.shape[0]
 
+        # ── draw obstacle boxes (red) ──────────────────────────────────────
+        if status == "GROUND FOUND":
             if ground_baseline is not None:
                 valid_r = np.where(ground_baseline < combined_view.shape[0])[0]
                 if len(valid_r) > 1:
@@ -519,14 +568,9 @@ if __name__ == "__main__":
                         dtype=np.int32)
                     cv2.polylines(combined_view, [pts], False, (255, 0, 0), 1)
 
-            FULL_HEIGHT_BOX = 0
             for (start_col, end_col, width) in obstacle_regions_raw:
-                if FULL_HEIGHT_BOX:
-                    y_top = 0
-                    y_bot = combined_view.shape[0] - h_rot
-                else:
-                    y_top = int(min(boundary_rows[start_col:end_col + 1]))
-                    y_bot = int(max(boundary_rows[start_col:end_col + 1])) + p['box_bottom_pad']
+                y_top = int(min(boundary_rows[start_col:end_col + 1]))
+                y_bot = int(max(boundary_rows[start_col:end_col + 1])) + p['box_bottom_pad']
 
                 cv2.rectangle(combined_view,
                               (start_col, y_top + h_rot),
@@ -550,22 +594,18 @@ if __name__ == "__main__":
                             (0, 0, 255),
                             p['label_thickness'])
 
-        h_rot = image_rot.shape[0]   # define outside the if block
-
-
-        plant_regions = detect_plant_regions(plant_mask, min_width=20, min_pixels_per_col=2, max_col_gap=5)
-        for (start_col, end_col, width) in plant_regions:
+        # ── draw plant boxes (green) ───────────────────────────────────────
+        for (start_col, end_col, width) in plant_regions_raw:
             cv2.rectangle(combined_view,
                           (start_col, 0),
                           (end_col,   h_rot - 1),
                           (0, 255, 0), p['box_thickness'])
-            cv2.putText(combined_view, f"w={width}",
+            cv2.putText(combined_view, f"p={width}",
                         (start_col, p['label_y_top']),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         p['label_font_scale'],
                         (0, 255, 0),
                         p['label_thickness'])
-
 
         cv2.imshow(WINDOW, combined_view)
 
