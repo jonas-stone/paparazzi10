@@ -1,15 +1,66 @@
-
 import cv2
 import numpy as np
 from scipy.ndimage import median_filter
+import os
+import random
+from glob import glob
+import colored_blob_separator as cds
 
-def find_ground_boundary(mask_rotated, min_ground_pixels=5, max_gap=10, smooth_kernel=5):
+
+# ── scale helpers ─────────────────────────────────────────────────────────────
+
+def scale_int(value, scale_factor):
+    """Scale a pixel-count value, minimum 1."""
+    return max(1, int(round(value * scale_factor)))
+
+def scale_odd(value, scale_factor):
+    """Scale a kernel size (must be odd, minimum 3)."""
+    n = max(3, int(round(value * scale_factor)))
+    return n if n % 2 == 1 else n + 1
+
+def get_scaled_params(scale_factor):
+    """
+    All pixel-space thresholds and display parameters in one place.
+    Calibrated at scale_factor=1.0 (full resolution).
+    """
+    return dict(
+        # ── pipeline ──────────────────────────────────────────────────────────
+        min_ground_pixels  = scale_int(5,   scale_factor),
+        max_gap            = scale_int(10,  scale_factor),
+        smooth_kernel      = scale_odd(5,   scale_factor),
+        min_width          = scale_int(20,  scale_factor),
+        max_col_gap        = scale_int(5,   scale_factor),
+        obstacle_threshold = scale_int(50,  scale_factor),
+        no_ground_baseline = scale_int(220, scale_factor),
+        median_ksize       = scale_odd(5,   scale_factor),
+        blur_ksize         = scale_odd(5,   scale_factor),
+
+        # ── display ───────────────────────────────────────────────────────────
+        box_bottom_pad     = scale_int(15,  scale_factor),
+        box_thickness      = max(1, scale_int(2,   scale_factor)),
+        status_font_scale  = max(0.3, scale_factor * 1.0),
+        status_thickness   = max(1, scale_int(2,   scale_factor)),
+        status_x           = scale_int(20,  scale_factor),
+        status_y           = scale_int(40,  scale_factor),
+        label_font_scale   = max(0.2, scale_factor * 0.4),
+        label_thickness    = max(1, scale_int(1,   scale_factor)),
+        label_y_offset     = scale_int(5,   scale_factor),
+        label_y_top        = scale_int(20,  scale_factor),
+    )
+
+
+# ── core pipeline functions ───────────────────────────────────────────────────
+
+def find_ground_boundary(mask_rotated,
+                         min_ground_pixels=5,
+                         max_gap=10,
+                         smooth_kernel=5):
     image_height = mask_rotated.shape[1]
     n_rows = mask_rotated.shape[0]
     boundary_rows = np.full(n_rows, image_height, dtype=int)
 
     for idx, row in enumerate(mask_rotated):
-        green_pos = np.where(row > 0)[0] 
+        green_pos = np.where(row > 0)[0]
 
         if green_pos.size == 0:
             continue
@@ -44,7 +95,7 @@ def find_ground_boundary(mask_rotated, min_ground_pixels=5, max_gap=10, smooth_k
             split_points = np.where(after_gaps > 0)[0]
             runs = np.split(after_gap, split_points + 1)
             if max(len(r) for r in runs) >= max_gap:
-                boundary_rows[idx] = gp[-1] 
+                boundary_rows[idx] = gp[-1]
                 continue
 
         boundary_rows[idx] = pending_boundary
@@ -63,51 +114,53 @@ def get_obstacle_regions(obstacle_cols, min_width=20, max_col_gap=5):
 
     regions = []
     start = obstacle_cols[0]
-    end = obstacle_cols[0]
+    end   = obstacle_cols[0]
 
     for col in obstacle_cols[1:]:
         if col - end <= max_col_gap:
-            end = col 
+            end = col
         else:
             regions.append((start, end, end - start + 1))
             start = col
-            end = col
+            end   = col
 
-    regions.append((start, end, end - start + 1)) 
+    regions.append((start, end, end - start + 1))
 
     return [(s, e, w) for s, e, w in regions if w >= min_width]
 
 
-def update_and_detect(boundary_row, h, ground_baseline, min_width=20):
+def update_and_detect(boundary_row, h, ground_baseline,
+                      min_width=20,
+                      obstacle_threshold=50,
+                      no_ground_baseline=220,
+                      max_col_gap=5):
     alpha = 0.6
-    obstacle_threshold = 50
-    NO_GROUND_BASELINE = 220
 
-    valid = boundary_row < h
+    valid     = boundary_row < h
     no_ground = boundary_row >= h
 
     if ground_baseline is None:
         baseline = boundary_row.astype(float).copy()
-        baseline[no_ground] = NO_GROUND_BASELINE 
+        baseline[no_ground] = no_ground_baseline
         return [], baseline
 
-    deviation = boundary_row - ground_baseline
+    deviation          = boundary_row - ground_baseline
     deviation_obstacle = valid & (deviation > obstacle_threshold)
-    no_ground_obstacle = no_ground
+    obstacle_mask      = deviation_obstacle | no_ground
 
-    obstacle_mask = deviation_obstacle | no_ground_obstacle
-    obstacle_cols = np.where(obstacle_mask)[0]
-
-    obstacle_regions = get_obstacle_regions(obstacle_cols, min_width=min_width)
+    obstacle_cols    = np.where(obstacle_mask)[0]
+    obstacle_regions = get_obstacle_regions(obstacle_cols,
+                                            min_width=min_width,
+                                            max_col_gap=max_col_gap)
 
     no_obstacle_mask = valid & ~deviation_obstacle
-    ground_baseline = ground_baseline.copy()
+    ground_baseline  = ground_baseline.copy()
     ground_baseline[no_obstacle_mask] = (
         (1 - alpha) * ground_baseline[no_obstacle_mask]
-        + alpha * boundary_row[no_obstacle_mask]
+        + alpha     * boundary_row[no_obstacle_mask]
     )
 
-    last_good = NO_GROUND_BASELINE
+    last_good = no_ground_baseline
     for i in range(len(ground_baseline)):
         if no_obstacle_mask[i]:
             last_good = ground_baseline[i]
@@ -117,44 +170,7 @@ def update_and_detect(boundary_row, h, ground_baseline, min_width=20):
     return obstacle_regions, ground_baseline
 
 
-# def is_ground(Y, U, V):
-#     if U <= 116.50:
-#         if V <= 149.50:
-#             if Y <= 81.50:
-#                 return 0
-#             else:
-#                 if U <= 96.50:
-#                     return 0
-#                 else:
-#                     return 255
-#         else:
-#             if Y <= 113.50:
-#                 if Y <= 101.50:
-#                     return 0
-#                 else:
-#                     return 255
-#             else:
-#                 return 0
-#     else:
-#         if U <= 122.50:
-#             if Y <= 87.00:
-#                 if V <= 119.50:
-#                     return 0
-#                 else:
-#                     return 0
-#             else:
-#                 if V <= 143.50:
-#                     return 255
-#                 else:
-#                     return 0
-#         else:
-#             if U <= 145.50:
-#                 return 0
-#             else:
-#                 if U <= 148.50:
-#                     return 255
-#                 else:
-#                     return 0
+# ── colour classifiers ────────────────────────────────────────────────────────
 
 def is_ground(Y, U, V):
     if U <= 115.50:
@@ -202,85 +218,359 @@ def is_ground(Y, U, V):
                     return 0
 
 
+def is_ground_sim(Y, U, V):
+    if U <= 96.50:
+        if Y <= 102.50:
+            return 255
+        else:
+            return 0
+    else:
+        if U <= 97.50:
+            if V <= 126.00:
+                return 255
+            else:
+                return 0
+        else:
+            return 0
 
-vectorized_is_ground = np.vectorize(is_ground)
 
-def detect_green_ground_ml(image_bgr, threshold, median_ksize=3):
-    """
-    Applies the hardcoded Python decision tree logic to the image.
-    """
-    # Convert BGR to YUV
+vectorized_is_ground     = np.vectorize(is_ground)
+vectorized_is_ground_sim = np.vectorize(is_ground_sim)
+
+
+# ── detection functions ───────────────────────────────────────────────────────
+
+def detect_green_ground_ml(image_bgr, threshold, median_ksize=5):
     image_yuv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YUV)
-    
-    # Split the image into its 3 separate color channels
     Y_channel, U_channel, V_channel = cv2.split(image_yuv)
-    
-    # Pass the entire channels into our vectorized logic tree at once
-    mask = vectorized_is_ground(Y_channel, U_channel, V_channel)
-    
-    # Convert back to an 8-bit unsigned integer array for OpenCV
-    mask = mask.astype(np.uint8)
 
-    # Simple median blur to reduce speckles
+    mask = vectorized_is_ground(Y_channel, U_channel, V_channel).astype(np.uint8)
+
     if median_ksize is not None and median_ksize >= 3 and median_ksize % 2 == 1:
         mask = cv2.medianBlur(mask, median_ksize)
 
-    # Pixel stats
     green_pixel_count = cv2.countNonZero(mask)
-    total_pixels = image_bgr.shape[0] * image_bgr.shape[1]
-    green_fraction = green_pixel_count / total_pixels if total_pixels > 0 else 0.0
+    total_pixels      = image_bgr.shape[0] * image_bgr.shape[1]
+    green_fraction    = green_pixel_count / total_pixels if total_pixels > 0 else 0.0
 
     status = "GROUND FOUND" if green_fraction > threshold else "NO GROUND"
-
-    # Visualization
     result = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
 
     return mask, result, green_fraction, status
 
-def get_obstacle_info(image_bgr,
-                                ground_baseline,
-                                oa_color_count_frac=0.05,
-                                median_ksize=5,
-                                min_width=20):
+
+def detect_all_green_lax(image_bgr, scale_factor=1.0, blur_ksize=5):
     """
-    Detect ground vs obstacle, compute obstacle start (left) and width.
-    Inputs:
-      - image_bgr: OpenCV BGR image (H x W x 3)
-      - ground_baseline: 1D numpy array or None (previous baseline)
-      - oa_color_count_frac, median_ksize, min_width: tuning params
-    Returns:
-      - obstacles: list of (start_col, width) tuples (columns counted left->right)
-      - new_ground_baseline: updated baseline (same format as input)
-      - debug: dict with mask, boundary_rows, status (optional)
-    Notes:
-      - This function does only image->obstacle conversion. Keep CIC (single responsibility).
+    Lax YUV green filter. scale_factor is applied ON TOP of whatever
+    resolution image_bgr already is — so plant blob merging is controlled
+    independently of the main pipeline scale.
+    Returns: (small_mask, full_res_mask, downscaled_bgr)
+      - small_mask:     mask at (W*scale_factor, H*scale_factor)
+      - full_res_mask:  small_mask upscaled back to (W, H)
+      - downscaled_bgr: the image at plant scale (for reference/debug)
     """
-    # 1) detect green ground mask (use your ML or decision-tree)
-    mask, _, green_frac, status = detect_green_ground_ml(image_bgr,
-                                                         threshold=oa_color_count_frac,
-                                                         median_ksize=median_ksize)
     H, W = image_bgr.shape[:2]
 
-    # If no ground found, keep baseline but mark no-ground columns
+    small_w    = max(1, int(W * scale_factor))
+    small_h    = max(1, int(H * scale_factor))
+    downscaled = cv2.resize(image_bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
+
+    yuv = cv2.cvtColor(downscaled, cv2.COLOR_BGR2YUV)
+    Y, U, V = cv2.split(yuv)
+
+    # YUV colour thresholds — colour-space values (0-255), do NOT scale
+    green_mask_small = (
+        (U >= 0)  & (U <= 116) &
+        (V >= 0)  & (V <= 141) &
+        (Y >= 29) & (Y <= 140)
+    ).astype(np.uint8) * 255
+
+    green_mask_small[:, :int(small_w / 3)] = 0
+
+    if blur_ksize >= 3:
+        green_mask_small = cv2.GaussianBlur(
+            green_mask_small, (blur_ksize, blur_ksize), 0)
+        _, green_mask_small = cv2.threshold(
+            green_mask_small, 127, 255, cv2.THRESH_BINARY)
+
+    mask_full = cv2.resize(green_mask_small, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    return green_mask_small, mask_full, downscaled
+
+def detect_plant_regions(plant_mask, min_width=10, min_pixels_per_col=2, max_col_gap=3):
+    plant_mask_flipped = plant_mask[:, ::-1]   # match obstacle pipeline convention
+    n_rows = plant_mask_flipped.shape[0]
+    active_rows = []
+
+    for row_idx in range(n_rows):
+        row = plant_mask_flipped[row_idx, :]   # scan rows, not columns
+        green_pos = np.where(row > 0)[0]
+        if green_pos.size == 0:
+            continue
+        diffs = np.diff(green_pos)
+        runs = np.split(green_pos, np.where(diffs > 1)[0] + 1)
+        if max(len(r) for r in runs) > min_pixels_per_col:
+            active_rows.append(row_idx)
+
+    return get_obstacle_regions(active_rows, min_width=min_width, max_col_gap=max_col_gap)
+
+
+
+def get_obstacle_info(image_bgr,
+                      ground_baseline,
+                      oa_color_count_frac=0.05,
+                      median_ksize=5,
+                      min_width=20,
+                      max_col_gap=5,
+                      min_ground_pixels=5,
+                      max_gap=10,
+                      smooth_kernel=5,
+                      obstacle_threshold=50,
+                      no_ground_baseline=220):
+    mask, _, green_frac, status = detect_green_ground_ml(
+        image_bgr, threshold=oa_color_count_frac, median_ksize=median_ksize)
+
+    H, W      = image_bgr.shape[:2]
     obstacles = []
-    debug = {"status": status, "green_frac": green_frac}
+    debug     = {"status": status, "green_frac": green_frac}
 
     if status == "GROUND FOUND":
-        # your pipeline flips/mirrors so columns correspond to left/right correctly
-        mask_flipped = mask[:, ::-1]  # keep same convention as your pipeline
-        boundary_rows = find_ground_boundary(mask_rotated=mask_flipped)
+        mask = cds.isolate_ground_blob(binary_img=mask)
+        mask = cds.fill_holes(mask)
+
+        mask_flipped  = mask[:, ::-1]
+        boundary_rows = find_ground_boundary(
+            mask_rotated      = mask_flipped,
+            min_ground_pixels = min_ground_pixels,
+            max_gap           = max_gap,
+            smooth_kernel     = smooth_kernel,
+        )
         obstacle_regions, new_ground_baseline = update_and_detect(
-            boundary_rows, W, ground_baseline, min_width=min_width)
-        # obstacle_regions are (start_col, end_col, width) in *rotated* coords (matching mask_flipped)
-        # convert to left->right image coordinates (undo flip)
-        obstacles = []
+            boundary_rows,
+            W,
+            ground_baseline,
+            min_width          = min_width,
+            obstacle_threshold = obstacle_threshold,
+            no_ground_baseline = no_ground_baseline,
+            max_col_gap        = max_col_gap,
+        )
+
         for (s, e, w) in obstacle_regions:
-            # after flipping columns idx c maps to (W-1 - c)
             left = W - 1 - e
-            width = w
-            obstacles.append((int(left), int(width)))
-        debug.update({"boundary_rows": boundary_rows, "obstacle_regions_raw": obstacle_regions})
+            obstacles.append((int(left), int(w)))
+
+        debug.update({
+            "boundary_rows"       : boundary_rows,
+            "obstacle_regions_raw": obstacle_regions,
+            "clean_mask"          : mask,
+        })
     else:
-        new_ground_baseline = ground_baseline  # unchanged
+        new_ground_baseline = ground_baseline
 
     return obstacles, new_ground_baseline, debug
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    import solidity_detection as sdd
+
+    cv2.destroyAllWindows()
+
+    folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
+    all_image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
+    start_idx   = random.randint(0, len(all_image_paths) - 1)
+    image_paths = all_image_paths[start_idx:] + all_image_paths[:start_idx]
+
+    oa_color_count_frac = 0.05
+
+    # ── scale factors ──────────────────────────────────────────────────────────
+    # SCALE_FACTOR:       downscale of the raw image before the obstacle pipeline.
+    #                     All pipeline pixel thresholds scale with this value.
+    #                     1.0 = full resolution, 0.5 = half resolution, etc.
+    #
+    # PLANT_SCALE_FACTOR: additional downscale applied ON TOP of SCALE_FACTOR,
+    #                     only for the lax green / plant detection.
+    #                     Lower = more leaf merging into blobs.
+    #                     Does NOT affect obstacle detection at all.
+    SCALE_FACTOR       = 0.8
+    PLANT_SCALE_FACTOR = 0.15   # relative to the already-downscaled image
+
+    # Pipeline params scale with main image resolution only
+    p = get_scaled_params(SCALE_FACTOR)
+
+    # Plant blur kernel scales with the combined resolution
+    plant_blur_ksize = scale_odd(5, SCALE_FACTOR * PLANT_SCALE_FACTOR)
+
+    print(f"Main scale:  {SCALE_FACTOR}  →  pipeline params: {p}")
+    print(f"Plant scale: {SCALE_FACTOR} × {PLANT_SCALE_FACTOR} = "
+          f"{SCALE_FACTOR * PLANT_SCALE_FACTOR:.2f}  →  plant blur_ksize: {plant_blur_ksize}")
+
+    # state
+    ground_baseline  = None
+    obstacle_regions = []
+
+    if len(image_paths) == 0:
+        print("No images found in the specified path.")
+        exit()
+
+    _probe         = cv2.imread(image_paths[0])
+    orig_H, orig_W = _probe.shape[:2]
+
+    target_W = max(1, int(orig_W * SCALE_FACTOR))
+    target_H = max(1, int(orig_H * SCALE_FACTOR))
+
+    boundary_rows = np.full(target_W, target_W)
+
+    WINDOW = 'Original (top) | Ground mask (mid) | Plants (bot)'
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW, target_W, target_H * 3)
+
+    for image_path in image_paths:
+        raw = cv2.imread(image_path)
+        if raw is None:
+            print(f"Skipping: {image_path}")
+            continue
+
+        # ── downscale to main resolution ───────────────────────────────────────
+        image_bgr     = cv2.resize(raw, (target_W, target_H), interpolation=cv2.INTER_AREA)
+        image_display = image_bgr.copy()
+
+        # ── strict ground mask (obstacle pipeline) ─────────────────────────────
+        initial_mask, _, actual_frac, status = detect_green_ground_ml(
+            image_bgr, oa_color_count_frac, median_ksize=p['median_ksize'])
+
+        clean_mask = cds.isolate_ground_blob(binary_img=initial_mask.copy())
+        clean_mask = cds.fill_holes(clean_mask)
+
+        # ── lax green mask (plant detection, further downscaled independently) ──
+        # PLANT_SCALE_FACTOR is applied on top of the already-downscaled image_bgr
+        all_green_small, _, _ = detect_all_green_lax(
+            image_bgr,
+            scale_factor = PLANT_SCALE_FACTOR,
+            blur_ksize   = plant_blur_ksize,
+        )
+
+        # Resize clean_mask down to plant scale for subtraction
+        plant_H, plant_W = all_green_small.shape[:2]
+        clean_mask_small = cv2.resize(
+            clean_mask, (plant_W, plant_H), interpolation=cv2.INTER_NEAREST)
+
+        plant_mask_small = cv2.subtract(all_green_small, clean_mask_small)
+
+        # Upscale plant mask back to main image size — display panels must match
+        plant_mask = cv2.resize(
+            plant_mask_small, (target_W, target_H), interpolation=cv2.INTER_NEAREST)
+
+        # ── obstacle detection ─────────────────────────────────────────────────
+        obstacle_list, ground_baseline, debug = get_obstacle_info(
+            image_bgr,
+            ground_baseline,
+            oa_color_count_frac = oa_color_count_frac,
+            median_ksize        = p['median_ksize'],
+            min_width           = p['min_width'],
+            max_col_gap         = p['max_col_gap'],
+            min_ground_pixels   = p['min_ground_pixels'],
+            max_gap             = p['max_gap'],
+            smooth_kernel       = p['smooth_kernel'],
+            obstacle_threshold  = p['obstacle_threshold'],
+            no_ground_baseline  = p['no_ground_baseline'],
+        )
+
+        boundary_rows        = debug.get("boundary_rows",        boundary_rows)
+        obstacle_regions_raw = debug.get("obstacle_regions_raw", [])
+
+        print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%})")
+
+        # ── build display panels (all at target_W × target_H) ─────────────────
+        result = np.zeros_like(image_bgr)
+        result[..., 0] = clean_mask
+        result[..., 1] = clean_mask
+        result[..., 2] = clean_mask
+
+        plant_result = np.zeros_like(image_display)
+        plant_result[plant_mask > 0] = [0, 255, 0]
+        edges = sdd.get_blob_edge(plant_mask)
+        plant_result[edges > 0] = [0, 0, 255]
+
+        # All three panels are (target_W, target_H) → rotate + vstack is clean
+        image_rot  = cv2.rotate(image_display, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        result_rot = cv2.rotate(result,        cv2.ROTATE_90_COUNTERCLOCKWISE)
+        plant_rot  = cv2.rotate(plant_result,  cv2.ROTATE_90_COUNTERCLOCKWISE)
+        combined_view = np.vstack((image_rot, result_rot, plant_rot))
+
+        cv2.putText(combined_view,
+                    f"{status} | {actual_frac:.2%}",
+                    (p['status_x'], p['status_y']),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    p['status_font_scale'],
+                    (0, 0, 255),
+                    p['status_thickness'])
+
+        if status == "GROUND FOUND":
+            h_rot = image_rot.shape[0]
+
+            if ground_baseline is not None:
+                valid_r = np.where(ground_baseline < combined_view.shape[0])[0]
+                if len(valid_r) > 1:
+                    pts = np.array(
+                        [[int(r), int(ground_baseline[r]) + h_rot] for r in valid_r],
+                        dtype=np.int32)
+                    cv2.polylines(combined_view, [pts], False, (255, 0, 0), 1)
+
+            FULL_HEIGHT_BOX = 0
+            for (start_col, end_col, width) in obstacle_regions_raw:
+                if FULL_HEIGHT_BOX:
+                    y_top = 0
+                    y_bot = combined_view.shape[0] - h_rot
+                else:
+                    y_top = int(min(boundary_rows[start_col:end_col + 1]))
+                    y_bot = int(max(boundary_rows[start_col:end_col + 1])) + p['box_bottom_pad']
+
+                cv2.rectangle(combined_view,
+                              (start_col, y_top + h_rot),
+                              (end_col,   y_bot + h_rot),
+                              (0, 0, 255), p['box_thickness'])
+                cv2.putText(combined_view, f"w={width}",
+                            (start_col, y_top + h_rot - p['label_y_offset']),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            p['label_font_scale'],
+                            (0, 0, 255),
+                            p['label_thickness'])
+
+                cv2.rectangle(combined_view,
+                              (start_col, 0),
+                              (end_col,   h_rot - 1),
+                              (0, 0, 255), p['box_thickness'])
+                cv2.putText(combined_view, f"w={width}",
+                            (start_col, p['label_y_top']),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            p['label_font_scale'],
+                            (0, 0, 255),
+                            p['label_thickness'])
+
+        h_rot = image_rot.shape[0]   # define outside the if block
+
+
+        plant_regions = detect_plant_regions(plant_mask, min_width=20, min_pixels_per_col=2, max_col_gap=5)
+        for (start_col, end_col, width) in plant_regions:
+            cv2.rectangle(combined_view,
+                          (start_col, 0),
+                          (end_col,   h_rot - 1),
+                          (0, 255, 0), p['box_thickness'])
+            cv2.putText(combined_view, f"w={width}",
+                        (start_col, p['label_y_top']),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        p['label_font_scale'],
+                        (0, 255, 0),
+                        p['label_thickness'])
+
+
+        cv2.imshow(WINDOW, combined_view)
+
+        key = cv2.waitKey(40)
+        if key == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
