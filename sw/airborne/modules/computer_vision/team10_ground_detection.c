@@ -75,7 +75,7 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img, uint8_t
             img,
             ground_baseline,
             &baseline_inited,
-            0.05f,   /* oa_color_count_frac */
+            0.001f,   /* oa_color_count_frac */
             5,       /* median_ksize        */
             20,      /* min_width           */
             local_obstacles,
