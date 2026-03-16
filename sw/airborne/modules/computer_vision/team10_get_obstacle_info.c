@@ -20,6 +20,7 @@
 /* ------------------------------------------------------------------ */
 
 static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V);
+static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V);
 static void apply_ground_mask(struct image_t *input, struct image_t *mask);
 static void median_blur_3x3(struct image_t *mask, struct image_t *blurred);
 static uint8_t median_of_9(uint8_t *v);
@@ -74,6 +75,25 @@ static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V)
     }
 }
 
+static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V) {
+    if (U <= 96.50f) {
+        if (Y <= 102.50f) {
+            return 255;
+        } else {
+            return 0;
+        }
+    } else {
+        if (U <= 97.50f) {
+            if (V <= 126.00f) {
+                return 255;
+            } else {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+}
 /* ================================================================== */
 /* SECTION 2 – Build grayscale mask from YUV422 image                  */
 /* ================================================================== */
@@ -97,8 +117,8 @@ static void apply_ground_mask(struct image_t *input, struct image_t *mask)
             uint8_t V  = src[2];
             uint8_t Y1 = src[3];
 
-            dest[0] = is_ground(Y0, U, V);
-            dest[1] = is_ground(Y1, U, V);
+            dest[0] = is_ground_sim(Y0, U, V); // is_ground
+            dest[1] = is_ground_sim(Y1, U, V);
 
             src  += 4;
             dest += 2;
