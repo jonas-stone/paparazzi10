@@ -14,6 +14,7 @@
 #define TEAM10_AUTOPILOT_H
 
 extern float obstacle_width_threshold;
+extern float maxDistance;
 
 // functions (TEAM 10 GROUND DETECTION)
 extern void ground_obstacle_avoidance_init(void);
