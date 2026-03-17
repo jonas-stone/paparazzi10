@@ -69,8 +69,22 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
+/* Uncomment ONE of these: */
+// #define GROUND_TREE_REAL
+#define GROUND_TREE_SIM
+
+/* --- DECISION TREE --- */
 uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
 {
+#ifdef GROUND_TREE_SIM
+    if (U <= 96) {
+        return (Y <= 102) ? 255 : 0;
+    } else if (U <= 97) {
+        return (V <= 126) ? 255 : 0;
+    } else {
+        return 0;
+    }
+#else
     if (U <= 115) {
         if (V <= 145) {
             if (Y <= 85) return 0;
@@ -87,6 +101,7 @@ uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
             return 0;
         }
     }
+#endif
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════

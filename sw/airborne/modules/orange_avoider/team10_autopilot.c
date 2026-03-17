@@ -122,8 +122,8 @@ void ground_obstacle_avoidance_periodic(void)
   }
 
   // print stuff to terminal
-  printf("total obstacle width: %d\nthreshold (fraction): %.2f\nthreshold (total):    %.2f\n",
-       total_obstacle_width,
+  printf("total obstacle width: %.2f\nthreshold (fraction): %.2f\nthreshold (total):    %.2f\n",
+       total_obstacle_width / (float)MAX_IMAGE_WIDTH,
        obstacle_width_threshold,
        obstacle_width_threshold * MAX_IMAGE_WIDTH);
 
