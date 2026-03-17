@@ -7,7 +7,8 @@
 
 /* Paparazzi Includes */
 #include "std.h"
-#include "modules/computer_vision/lib/vision/image.h"
+#include "lib/vision/image.h"
+#include "team10_plot_sim_images.h"
 
 // Global or static pointers to keep the window alive
 SDL_Window *window = NULL;
@@ -19,7 +20,7 @@ int numeric_sort(const struct dirent **a, const struct dirent **b) {
     return (atoi((*a)->d_name) - atoi((*b)->d_name));
 }
 
-void wait_for_keypress() {
+void wait_for_keypress(void) {
     SDL_Event event;
     int pressed = 0;
 
