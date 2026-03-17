@@ -1,14 +1,8 @@
 /*
- * team10_get_obstacle_info.h
+ * HELPER_FUNCTIONS.h
  *
  * Ground detection and obstacle finding pipeline.
  * Designed to be included by team10_ground_detection_copy.c.
- *
- * Changelog vs. previous version
- * --------------------------------
- * 1. update_and_detect: added max_col_gap parameter.
- * 2. get_obstacle_info: added min_ground_pixels, max_gap, smooth_kernel
- *    and max_col_gap parameters.
  */
 
 #ifndef TEAM10_GET_OBSTACLES_INFO_H
@@ -61,7 +55,6 @@ struct obstacle_region_t {
  * @param mask_out       Pre-created IMAGE_GRAYSCALE, same dimensions
  * @param threshold      Fraction in [0,1]; above this → ground found
  * @param apply_median   Non-zero → apply 3×3 median blur on the mask
- * @param use_sim        0 = real flight (is_ground), 1 = simulator (is_ground_sim)
  * @param green_fraction OUTPUT: fraction of pixels classified as ground
  * @return               1 = GROUND FOUND, 0 = NO GROUND
  */
@@ -69,7 +62,6 @@ int detect_green_ground_ml(struct image_t *input,
                            struct image_t *mask_out,
                            float           threshold,
                            int             apply_median,
-                           int             use_sim,
                            float          *green_fraction);
 
 /**
@@ -124,7 +116,6 @@ uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
  * @param ground_baseline Float array of length `width` (persistent state)
  * @param baseline_inited Flag; set to 0 before the very first call
  * @param min_width       Minimum obstacle region width to report
- * @param max_col_gap     Maximum column gap to bridge when grouping regions
  * @param regions_out     Caller-supplied array, size MAX_OBSTACLE_REGIONS
  * @return                Number of obstacle regions (0 on first call)
  */
@@ -134,7 +125,6 @@ uint8_t update_and_detect(const int  *boundary_row,
                         float      *ground_baseline,
                         int        *baseline_inited,
                         int         min_width,
-                        int         max_col_gap,
                         struct obstacle_region_t *regions_out);
 
 /**
@@ -142,8 +132,6 @@ uint8_t update_and_detect(const int  *boundary_row,
  *
  * Full pipeline: ground mask → boundary finding → obstacle detection.
  * Results are expressed in original (un-flipped) image coordinates.
- * Also overwrites the source YUV buffer with the ground mask so the
- * drone video stream shows what the classifier sees (debug view).
  *
  * @param input               Source IMAGE_YUV422
  * @param ground_baseline     Float array of length input->w (persistent)
@@ -151,11 +139,6 @@ uint8_t update_and_detect(const int  *boundary_row,
  * @param oa_color_count_frac Ground fraction threshold
  * @param median_ksize        Odd kernel for median blur (0/1 = skip)
  * @param min_width           Minimum obstacle region width (columns)
- * @param min_ground_pixels   Minimum ground pixels at the far edge per col
- * @param max_gap             Maximum gap allowed inside a ground run
- * @param smooth_kernel       Odd kernel size for 1-D boundary smoothing
- * @param max_col_gap         Maximum column gap when grouping obstacle cols
- * @param use_sim             0 = real flight (is_ground), 1 = simulator (is_ground_sim)
  * @param obstacles_out       Caller array of obstacle_region_t,
  *                            size MAX_OBSTACLE_REGIONS
  * @param boundary_rows_out   Caller int array of length input->w
@@ -169,14 +152,9 @@ uint8_t get_obstacle_info(struct image_t           *input,
                         float                     oa_color_count_frac,
                         int                       median_ksize,
                         int                       min_width,
-                        int                       min_ground_pixels,
-                        int                       max_gap,
-                        int                       smooth_kernel,
-                        int                       max_col_gap,
-                        int                       use_sim,
                         struct obstacle_region_t *obstacles_out,
                         int                      *boundary_rows_out,
                         int                      *ground_found_out,
                         float                    *green_frac_out);
 
-#endif /* TEAM10_GET_OBSTACLES_INFO_H */
+#endif /* HELPER_FUNCTIONS_H */

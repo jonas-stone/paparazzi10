@@ -2,30 +2,12 @@
  * team10_get_obstacle_info.c
  *
  * Ground detection and obstacle finding pipeline.
- *
+ * 
  * NOTE: ALL THESE FUNCTIONS WORK WITH A ROTATED IMAGE
  * (ground is on the left) ON PURPOSE.
- *
- * If you want to work with a right-side up image,
+ * 
+ * If you want to work with a right-side up image, 
  * then you need to rotate it first.
- *
- * Changelog vs. previous version
- * --------------------------------
- * 1. apply_ground_mask: was calling is_ground_sim() by mistake — fixed to
- *    call is_ground().
- * 2. is_ground: decision-tree updated to match the Python reference exactly
- *    (extra branches for U > 121.5 sub-cases; all evaluate to 0 so the
- *    functional result is unchanged, but the code now mirrors the source).
- * 3. update_and_detect: added max_col_gap parameter; previously the call to
- *    get_obstacle_regions() had the gap hardcoded to 5.
- * 4. get_obstacle_info: added min_ground_pixels, max_gap, smooth_kernel and
- *    max_col_gap parameters and passes them through to find_ground_boundary()
- *    and update_and_detect() (they were previously hardcoded).
- * 5. apply_ground_mask / detect_green_ground_ml / get_obstacle_info: added
- *    use_sim parameter — pass 0 for real flight (is_ground), 1 for simulator
- *    (is_ground_sim).
- * 6. get_obstacle_info: debug mask-printer restored (overwrites the source
- *    YUV buffer so the drone video stream shows the ground mask).
  */
 
 #include "modules/computer_vision/team10_get_obstacle_info.h"
@@ -39,7 +21,7 @@
 
 static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V);
 static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V);
-static void apply_ground_mask(struct image_t *input, struct image_t *mask, int use_sim);
+static void apply_ground_mask(struct image_t *input, struct image_t *mask);
 static void median_blur_3x3(struct image_t *mask, struct image_t *blurred);
 static uint8_t median_of_9(uint8_t *v);
 static void insertion_sort_9(uint8_t *v);
@@ -52,48 +34,11 @@ static void flip_horizontal(const struct image_t *src, struct image_t *dst);
 /* SECTION 1 – Per-pixel ground classifier (decision tree)             */
 /* ================================================================== */
 
-/*
- * FIX 2: Decision tree updated to match the Python reference exactly.
- *
- * Python source (is_ground):
- *   U <= 115.5
- *     V <= 145.0
- *       Y <= 85.5
- *         Y <= 78.5 → 0   (same result as Y > 78.5 → 0)
- *         else      → 0
- *       else (Y > 85.5)
- *         U <= 92.5 → 0
- *         else      → 255
- *     else (V > 145.0)
- *       V <= 152.5
- *         Y <= 177.0 → 255
- *         else       → 0
- *       else → 0
- *   else (U > 115.5)
- *     U <= 121.5
- *       V <= 137.5
- *         Y <= 87.5 → 0
- *         else      → 255
- *       else (V > 137.5)
- *         U <= 116.5 → 0
- *         else       → 0
- *     else (U > 121.5)
- *       U <= 122.5
- *         V <= 126.0 → 0
- *         else       → 0
- *       else
- *         Y <= 62.5 → 0
- *         else      → 0
- *
- * All branches for U > 121.5 evaluate to 0, matching the old simplified
- * `return 0;` — but the explicit tree is kept for traceability.
- */
 static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V)
 {
     if (U <= 115) {
         if (V <= 145) {
             if (Y <= 85) {
-                /* Y <= 78 → 0, else → 0 (both 0) */
                 return 0;
             } else {
                 if (U <= 92) {
@@ -122,31 +67,24 @@ static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V)
                     return 255;
                 }
             } else {
-                /* U <= 116 → 0, else → 0 (both 0) */
                 return 0;
             }
         } else {
-            /*
-             * U <= 122: V <= 126 → 0, else → 0
-             * U >  122: Y <= 62  → 0, else → 0
-             * All evaluate to 0.
-             */
             return 0;
         }
     }
 }
 
-static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V)
-{
-    if (U <= 96) {
-        if (Y <= 102) {
+static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V) {
+    if (U <= 96.50f) {
+        if (Y <= 102.50f) {
             return 255;
         } else {
             return 0;
         }
     } else {
-        if (U <= 97) {
-            if (V <= 126) {
+        if (U <= 97.50f) {
+            if (V <= 126.00f) {
                 return 255;
             } else {
                 return 0;
@@ -156,7 +94,6 @@ static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V)
         }
     }
 }
-
 /* ================================================================== */
 /* SECTION 2 – Build grayscale mask from YUV422 image                  */
 /* ================================================================== */
@@ -167,11 +104,8 @@ static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V)
  *   byte 1 : Y0 (pixel 0)
  *   byte 2 : V  (shared)
  *   byte 3 : Y1 (pixel 1)
- *
- * use_sim=0 → is_ground()     (real flight)
- * use_sim=1 → is_ground_sim() (simulator, colours differ)
  */
-static void apply_ground_mask(struct image_t *input, struct image_t *mask, int use_sim)
+static void apply_ground_mask(struct image_t *input, struct image_t *mask)
 {
     uint8_t *src  = (uint8_t *)input->buf;
     uint8_t *dest = (uint8_t *)mask->buf;
@@ -183,13 +117,8 @@ static void apply_ground_mask(struct image_t *input, struct image_t *mask, int u
             uint8_t V  = src[2];
             uint8_t Y1 = src[3];
 
-            if (use_sim) {
-                dest[0] = is_ground_sim(Y0, U, V);
-                dest[1] = is_ground_sim(Y1, U, V);
-            } else {
-                dest[0] = is_ground(Y0, U, V);
-                dest[1] = is_ground(Y1, U, V);
-            }
+            dest[0] = is_ground_sim(Y0, U, V); // is_ground
+            dest[1] = is_ground_sim(Y1, U, V);
 
             src  += 4;
             dest += 2;
@@ -252,11 +181,29 @@ int detect_green_ground_ml(struct image_t *input,
                            struct image_t *mask_out,
                            float           threshold,
                            int             apply_median,
-                           int             use_sim,
                            float          *green_fraction)
 {
     /* Step 1 – classify every pixel into the mask */
-    apply_ground_mask(input, mask_out, use_sim);
+    apply_ground_mask(input, mask_out);
+
+/*  
+    {
+        // MASK PRINTER
+        uint8_t *src  = (uint8_t *)input->buf;
+        uint8_t *mask = (uint8_t *)mask_out->buf;
+        for (int y = 0; y < input->h; y++) {
+            for (int x = 0; x < input->w; x += 2) {
+                uint8_t *p = &src[y * 2 * input->w + 2 * x];
+                uint8_t g0 = mask[y * input->w + x];
+                uint8_t g1 = mask[y * input->w + x + 1];
+                p[0] = 128;
+                p[2] = 128;
+                p[1] = g0 ? 255 : 0;
+                p[3] = g1 ? 255 : 0;
+            }
+        }
+    }
+*/
 
     /* Step 2 – optional 3×3 median blur
      *
@@ -556,8 +503,8 @@ uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
 /* ================================================================== */
 
 /*
- * FIX 3: Added max_col_gap parameter.  The previous version had the gap
- * hardcoded to 5 in the get_obstacle_regions() call below.
+ * boundary_row is now int* throughout — fixes the int / uint16_t type
+ * mismatch that existed in the original get_obstacle_info call site.
  */
 uint8_t update_and_detect(const int  *boundary_row,
                         int         width,
@@ -565,7 +512,6 @@ uint8_t update_and_detect(const int  *boundary_row,
                         float      *ground_baseline,
                         int        *baseline_inited,
                         int         min_width,
-                        int         max_col_gap,
                         struct obstacle_region_t *regions_out)
 {
     /* First call: initialise baseline, skip detection */
@@ -600,9 +546,9 @@ uint8_t update_and_detect(const int  *boundary_row,
         no_obstacle_mask[x] = (valid[x] && !deviation_obstacle[x]) ? 1 : 0;
     }
 
-    /* Detect obstacle regions — now uses the max_col_gap parameter */
+    /* Detect obstacle regions */
     uint8_t n_regions = get_obstacle_regions(obstacle_cols, n_obstacle_cols,
-                                            min_width, max_col_gap, regions_out);
+                                            min_width, 5, regions_out);
 
     /* EMA update for non-obstacle columns */
     for (int x = 0; x < width; x++) {
@@ -647,23 +593,12 @@ static void flip_horizontal(const struct image_t *src, struct image_t *dst)
 /* SECTION 10 – get_obstacle_info (public)                             */
 /* ================================================================== */
 
-/*
- * Added min_ground_pixels, max_gap, smooth_kernel, max_col_gap, use_sim
- * parameters so callers can tune the pipeline (matching the Python API).
- * Debug mask-printer is active: it overwrites the source YUV buffer so the
- * drone video stream displays the ground mask (white = ground, black = not).
- */
 uint8_t get_obstacle_info(struct image_t           *input,
                         float                    *ground_baseline,
                         int                      *baseline_inited,
                         float                     oa_color_count_frac,
                         int                       median_ksize,
                         int                       min_width,
-                        int                       min_ground_pixels,
-                        int                       max_gap,
-                        int                       smooth_kernel,
-                        int                       max_col_gap,
-                        int                       use_sim,
                         struct obstacle_region_t *obstacles_out,
                         int                      *boundary_rows_out,
                         int                      *ground_found_out,
@@ -681,12 +616,10 @@ uint8_t get_obstacle_info(struct image_t           *input,
     int   ground_found = detect_green_ground_ml(input, &mask,
                                                 oa_color_count_frac,
                                                 apply_median,
-                                                use_sim,
                                                 &green_frac);
 
-    /* Debug mask-printer: overwrites the source YUV buffer so the drone
-     * video stream shows the ground mask (white = ground, black = not). */
     {
+        // MASK PRINTER
         uint8_t *src      = (uint8_t *)input->buf;
         uint8_t *mask_buf = (uint8_t *)mask.buf;
         for (int y = 0; y < H; y++) {
@@ -719,14 +652,15 @@ uint8_t get_obstacle_info(struct image_t           *input,
     /* Step 3 – find ground boundary per column */
     find_ground_boundary(&mask_flipped,
                          boundary_rows_out,
-                         min_ground_pixels,
-                         max_gap,
-                         smooth_kernel);
+                         /* min_ground_pixels= */ 5,
+                         /* max_gap=           */ 10,
+                         /* smooth_kernel=     */ 5); 
     image_free(&mask_flipped);
 
-    /* Step 4 – update baseline and detect obstacle regions.
+    /* Step 4 – update baseline and detect obstacle regions
      *
-     * Regions are still in flipped coordinates here.
+     * update_and_detect now takes int* directly, no cast needed.
+     * regions are still in flipped coordinates here.
      */
     struct obstacle_region_t raw_regions[MAX_OBSTACLE_REGIONS];
     uint8_t n_regions = update_and_detect(boundary_rows_out,
@@ -734,7 +668,6 @@ uint8_t get_obstacle_info(struct image_t           *input,
                                         ground_baseline,
                                         baseline_inited,
                                         min_width,
-                                        max_col_gap,
                                         raw_regions);
 
     /*

@@ -71,31 +71,13 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img, uint8_t
     int                      boundary_rows[MAX_IMAGE_WIDTH];
     struct obstacle_region_t local_obstacles[MAX_OBSTACLE_REGIONS];
 
-    // uint8_t obstacle_count = get_obstacle_info(
-    //         img,
-    //         ground_baseline,
-    //         &baseline_inited,
-    //         0.001f,   /* oa_color_count_frac */
-    //         5,       /* median_ksize        */
-    //         20,      /* min_width           */
-    //         local_obstacles,
-    //         boundary_rows,   /* int[MAX_IMAGE_WIDTH], local to the callback */
-    //         NULL,            /* ground_found_out, or pass a local int if you need it */
-    //         NULL             /* green_frac_out,   or pass a local float if you need it */
-    // );
-
     uint8_t obstacle_count = get_obstacle_info(
             img,
             ground_baseline,
             &baseline_inited,
-            0.001f,          /* oa_color_count_frac */
-            5,               /* median_ksize        */
-            20,              /* min_width           */
-            5,               /* NEW: min_ground_pixels */
-            5,               /* NEW: max_gap           */
-            3,               /* NEW: smooth_kernel     */
-            5,               /* NEW: max_col_gap       */
-            1,               /* NEW: use_sim           */
+            0.001f,   /* oa_color_count_frac */
+            5,       /* median_ksize        */
+            20,      /* min_width           */
             local_obstacles,
             boundary_rows,   /* int[MAX_IMAGE_WIDTH], local to the callback */
             NULL,            /* ground_found_out, or pass a local int if you need it */
