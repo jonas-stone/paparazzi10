@@ -635,6 +635,81 @@ uint8_t get_obstacle_info(struct image_t           *input,
         }
     }
 
+    // ── DRAW GND% TEXT ────────────────────────────────────────────────────
+    static const uint8_t font3x5[20][5] = {
+        {0x7,0x5,0x5,0x5,0x7}, // 0
+        {0x2,0x2,0x2,0x2,0x2}, // 1
+        {0x7,0x1,0x7,0x4,0x7}, // 2
+        {0x7,0x1,0x7,0x1,0x7}, // 3
+        {0x5,0x5,0x7,0x1,0x1}, // 4
+        {0x7,0x4,0x7,0x1,0x7}, // 5
+        {0x7,0x4,0x7,0x5,0x7}, // 6
+        {0x7,0x1,0x1,0x1,0x1}, // 7
+        {0x7,0x5,0x7,0x5,0x7}, // 8
+        {0x7,0x5,0x7,0x1,0x7}, // 9
+        {0x7,0x4,0x6,0x5,0x7}, // G [10]
+        {0x5,0x7,0x7,0x5,0x5}, // N [11]
+        {0x6,0x5,0x5,0x5,0x6}, // D [12]
+        {0x7,0x5,0x5,0x5,0x7}, // O [13]
+        {0x6,0x5,0x6,0x5,0x6}, // B [14]
+        {0x7,0x4,0x7,0x1,0x7}, // S [15]
+        {0x5,0x5,0x2,0x5,0x5}, // % [16]
+        {0x0,0x0,0x0,0x0,0x0}, // space [17]
+        {0x0,0x0,0x7,0x0,0x0}, // - [18]
+        {0x0,0x2,0x0,0x2,0x0}, // : [19]
+    };
+
+    #define DRAW_CHAR(cx, cy, ci) \
+    do { \
+        for (int _r = 0; _r < 5; _r++) { \
+            uint8_t _bits = font3x5[(ci)][_r]; \
+            for (int _c = 0; _c < 3; _c++) { \
+                if (_bits & (0x4 >> _c)) { \
+                    int _px = (cx) + _c; \
+                    int _py = (cy) + _r; \
+                    if (_px < W && _py < H) { \
+                        uint8_t *_p = &((uint8_t *)input->buf)[_py * 2 * W + (_px & ~1) * 2]; \
+                        _p[1 + (_px & 1) * 2] = 255; \
+                    } \
+                } \
+            } \
+        } \
+    } while(0)
+
+    #define DRAW_NUM(cx, cy, num) \
+    do { \
+        int _n = (num); \
+        if (_n >= 100) { DRAW_CHAR((cx), (cy), _n / 100);      (cx) += 4; } \
+        if (_n >= 10)  { DRAW_CHAR((cx), (cy), (_n / 10) % 10); (cx) += 4; } \
+        DRAW_CHAR((cx), (cy), _n % 10); (cx) += 4; \
+    } while(0)
+
+    // Blacken top 10 rows as background for text
+    {
+        uint8_t *src = (uint8_t *)input->buf;
+        for (int y = 0; y < 10; y++) {
+            for (int x = 0; x < W; x += 2) {
+                uint8_t *p = &src[y * 2 * W + 2 * x];
+                p[0] = 128; p[1] = 0; p[2] = 128; p[3] = 0;
+            }
+        }
+    }
+
+    // Draw "GND:XX%"
+    {
+        int cx = 2, cy = 2;
+        int pct = (int)(green_frac * 100.0f);
+        DRAW_CHAR(cx, cy, 10); cx += 4;  // G
+        DRAW_CHAR(cx, cy, 11); cx += 4;  // N
+        DRAW_CHAR(cx, cy, 12); cx += 4;  // D
+        DRAW_CHAR(cx, cy, 19); cx += 4;  // :
+        DRAW_NUM(cx, cy, pct);
+        DRAW_CHAR(cx, cy, 16); cx += 4;  // %
+    }
+    // ── END GND TEXT ───────────────────────────────────────────────────────
+
+    
+
     if (ground_found_out != NULL) { *ground_found_out = ground_found; }
     if (green_frac_out   != NULL) { *green_frac_out   = green_frac;   }
 
@@ -684,6 +759,29 @@ uint8_t get_obstacle_info(struct image_t           *input,
         obstacles_out[i].end   = (uint16_t)(W - 1 - (int)raw_regions[i].start);
         obstacles_out[i].width = raw_regions[i].width;
     }
+
+    // ── DRAW OBS WIDTHS TEXT ──────────────────────────────────────────────
+    {
+        int cx = 60, cy = 2;
+        DRAW_CHAR(cx, cy, 13); cx += 4;  // O
+        DRAW_CHAR(cx, cy, 14); cx += 4;  // B
+        DRAW_CHAR(cx, cy, 15); cx += 4;  // S
+        DRAW_CHAR(cx, cy, 19); cx += 4;  // :
+
+        if (n_regions == 0) {
+            DRAW_CHAR(cx, cy, 18);            // -
+        } else {
+            for (int i = 0; i < n_regions; i++) {
+                DRAW_NUM(cx, cy, obstacles_out[i].width);
+                cx += 6;
+            }
+        }
+    }
+
+    #undef DRAW_CHAR
+    #undef DRAW_NUM
+    // ── END BLOCK OBS WIDTH TEXT ───────────────────────────────────────────────────────
+
 
     return n_regions;
 }
