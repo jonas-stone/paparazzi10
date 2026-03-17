@@ -439,20 +439,33 @@ if __name__ == "__main__":
 
     import solidity_detection as sdd
 
+    # ── run mode ─────────────────────────────────────────────
+    MODE = 2
+    # 1 = interactive navigation
+    # 2 = single image
+
+    SINGLE_IMAGE_PATH = "DEVELOPMENT/downloads from drone/20260306-095826/1352900896.jpg"
+    FRAME_DELAY = 50
+
     cv2.destroyAllWindows()
 
-    #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
-    folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
-    #folder_path = "DEVELOPMENT/downloads from drone/sim_images/"
-    all_image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
-    start_idx   = random.randint(0, len(all_image_paths) - 1)
-    image_paths = all_image_paths[start_idx:] + all_image_paths[:start_idx]
+
+    if MODE == 2:
+        image_paths = [SINGLE_IMAGE_PATH]
+        start_idx   = 0
+    else:
+        #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
+        folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
+        #folder_path = "DEVELOPMENT/downloads from drone/sim_images/"
+        image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
+
+        start_idx   = random.randint(0, len(image_paths) - 1)
 
     oa_color_count_frac = 0.05
 
     # ── scale factors ──────────────────────────────────────────────────────
     SCALE_FACTOR       = 0.8
-    PLANT_SCALE_FACTOR = 0.15*0.8   # relative to the already-downscaled image
+    PLANT_SCALE_FACTOR = 0.15*0.8  
 
     p = get_scaled_params(SCALE_FACTOR)
     plant_blur_ksize = scale_odd(5, PLANT_SCALE_FACTOR)
@@ -462,7 +475,7 @@ if __name__ == "__main__":
           f"{PLANT_SCALE_FACTOR:.2f}  →  plant blur_ksize: {plant_blur_ksize}")
 
     # state
-    ground_baseline = None
+    #ground_baseline = None
 
     if len(image_paths) == 0:
         print("No images found in the specified path.")
@@ -478,139 +491,169 @@ if __name__ == "__main__":
 
     WINDOW = 'Original (top) | Ground mask (mid) | Plants (bot)'
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW, target_W, target_H * 3)
+    cv2.resizeWindow(WINDOW, orig_W * 3, orig_H * 3)
 
-    for image_path in image_paths:
-        raw = cv2.imread(image_path)
-        if raw is None:
-            print(f"Skipping: {image_path}")
-            continue
+    
+    needs_processing = True
+    idx = start_idx
+    ground_baseline = np.full(target_H, p['no_ground_baseline'], dtype=np.float32)
 
-        # ── downscale to main resolution ───────────────────────────────────
-        image_bgr     = cv2.resize(raw, (target_W, target_H), interpolation=cv2.INTER_AREA)
-        image_display = image_bgr.copy()
+    while True:
+        try:
+            if needs_processing:
+                image_path = image_paths[idx]
+                raw = cv2.imread(image_path)
+                if raw is None:
+                    print(f"Skipping: {image_path}")
+                    idx = (idx + 1) % len(image_paths) 
+                    continue
 
-        # ── single unified call ────────────────────────────────────────────
-        detections, ground_baseline, debug = get_obstacle_info(
-            image_bgr,
-            ground_baseline,
-            oa_color_count_frac    = oa_color_count_frac,
-            median_ksize           = p['median_ksize'],
-            min_width              = p['min_width'],
-            max_col_gap            = p['max_col_gap'],
-            min_ground_pixels      = p['min_ground_pixels'],
-            max_gap                = p['max_gap'],
-            smooth_kernel          = p['smooth_kernel'],
-            obstacle_threshold     = p['obstacle_threshold'],
-            no_ground_baseline     = p['no_ground_baseline'],
-            plant_scale_factor     = PLANT_SCALE_FACTOR,
-            plant_blur_ksize       = plant_blur_ksize,
-            plant_min_width        = 20,
-            plant_min_pixels_per_col = 2,
-            plant_max_col_gap      = 5,
-        )
+                # ── downscale to main resolution ───────────────────────────────────
+                image_bgr     = cv2.resize(raw, (target_W, target_H), interpolation=cv2.INTER_AREA)
+                image_display = image_bgr.copy()
+                
+                # If we are in single image mode, ALWAYS reset the baseline before processing
+                if MODE == 2:
+                    ground_baseline = np.full(target_H, p['no_ground_baseline'], dtype=np.float32)
 
-        # ── unpack debug info ──────────────────────────────────────────────
-        status               = debug["status"]
-        actual_frac          = debug["green_frac"]
-        boundary_rows        = debug["boundary_rows"]
-        obstacle_regions_raw = debug["obstacle_regions_raw"]
-        clean_mask           = debug["clean_mask"]
-        plant_mask           = debug["plant_mask"]
-        plant_regions_raw    = debug["plant_regions_raw"]
+                # ── single unified call ────────────────────────────────────────────
+                detections, ground_baseline, debug = get_obstacle_info(
+                    image_bgr,
+                    ground_baseline,
+                    oa_color_count_frac    = oa_color_count_frac,
+                    median_ksize           = p['median_ksize'],
+                    min_width              = p['min_width'],
+                    max_col_gap            = p['max_col_gap'],
+                    min_ground_pixels      = p['min_ground_pixels'],
+                    max_gap                = p['max_gap'],
+                    smooth_kernel          = p['smooth_kernel'],
+                    obstacle_threshold     = p['obstacle_threshold'],
+                    no_ground_baseline     = p['no_ground_baseline'],
+                    plant_scale_factor     = PLANT_SCALE_FACTOR,
+                    plant_blur_ksize       = plant_blur_ksize,
+                    plant_min_width        = 20,
+                    plant_min_pixels_per_col = 2,
+                    plant_max_col_gap      = 5,
+                )
 
-        # ── split detections by type for display ───────────────────────────
-        if detections.shape[0] > 0:
-            obs_dets   = detections[detections[:, 2] == DET_OBSTACLE]
-            plant_dets = detections[detections[:, 2] == DET_PLANT]
-        else:
-            obs_dets   = np.empty((0, 3), dtype=np.int32)
-            plant_dets = np.empty((0, 3), dtype=np.int32)
+                # ── unpack debug info ──────────────────────────────────────────────
+                status               = debug["status"]
+                actual_frac          = debug["green_frac"]
+                boundary_rows        = debug["boundary_rows"]
+                obstacle_regions_raw = debug["obstacle_regions_raw"]
+                clean_mask           = debug["clean_mask"]
+                plant_mask           = debug["plant_mask"]
+                plant_regions_raw    = debug["plant_regions_raw"]
 
-        n_obs   = obs_dets.shape[0]
-        n_plant = plant_dets.shape[0]
-        print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%}) "
-              f"| obstacles: {n_obs}  plants: {n_plant}")
+                # ── split detections by type for display ───────────────────────────
+                if detections.shape[0] > 0:
+                    obs_dets   = detections[detections[:, 2] == DET_OBSTACLE]
+                    plant_dets = detections[detections[:, 2] == DET_PLANT]
+                    print(f"obstacles: {obs_dets} ")
+                else:
+                    obs_dets   = np.empty((0, 3), dtype=np.int32)
+                    plant_dets = np.empty((0, 3), dtype=np.int32)
 
-        # ── build display panels ───────────────────────────────────────────
-        result = np.zeros_like(image_bgr)
-        result[..., 0] = clean_mask
-        result[..., 1] = clean_mask
-        result[..., 2] = clean_mask
+                n_obs   = obs_dets.shape[0]
+                n_plant = plant_dets.shape[0]
+                print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%}) "
+                      f"| obstacles: {n_obs}  plants: {n_plant}")
 
-        plant_result = np.zeros_like(image_display)
-        plant_result[plant_mask > 0] = [0, 255, 0]
-        edges = sdd.get_blob_edge(plant_mask)
-        plant_result[edges > 0] = [0, 0, 255]
+                # ── build display panels ───────────────────────────────────────────
+                result = np.zeros_like(image_bgr)
+                result[..., 0] = clean_mask
+                result[..., 1] = clean_mask
+                result[..., 2] = clean_mask
 
-        image_rot  = cv2.rotate(image_display, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        result_rot = cv2.rotate(result,        cv2.ROTATE_90_COUNTERCLOCKWISE)
-        plant_rot  = cv2.rotate(plant_result,  cv2.ROTATE_90_COUNTERCLOCKWISE)
-        combined_view = np.vstack((image_rot, result_rot, plant_rot))
+                plant_result = np.zeros_like(image_display)
+                plant_result[plant_mask > 0] = [0, 255, 0]
+                edges = sdd.get_blob_edge(plant_mask)
+                plant_result[edges > 0] = [0, 0, 255]
 
-        cv2.putText(combined_view,
-                    f"{status} | {actual_frac:.2%}",
-                    (p['status_x'], p['status_y']),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    p['status_font_scale'],
-                    (0, 0, 255),
-                    p['status_thickness'])
+                image_rot  = cv2.rotate(image_display, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                result_rot = cv2.rotate(result,        cv2.ROTATE_90_COUNTERCLOCKWISE)
+                plant_rot  = cv2.rotate(plant_result,  cv2.ROTATE_90_COUNTERCLOCKWISE)
+                combined_view = np.vstack((image_rot, result_rot, plant_rot))
 
-        h_rot = image_rot.shape[0]
-
-        # ── draw obstacle boxes (red) ──────────────────────────────────────
-        if status == "GROUND FOUND":
-            if ground_baseline is not None:
-                valid_r = np.where(ground_baseline < combined_view.shape[0])[0]
-                if len(valid_r) > 1:
-                    pts = np.array(
-                        [[int(r), int(ground_baseline[r]) + h_rot] for r in valid_r],
-                        dtype=np.int32)
-                    cv2.polylines(combined_view, [pts], False, (255, 0, 0), 1)
-
-            for (start_col, end_col, width) in obstacle_regions_raw:
-                y_top = int(min(boundary_rows[start_col:end_col + 1]))
-                y_bot = int(max(boundary_rows[start_col:end_col + 1])) + p['box_bottom_pad']
-
-                cv2.rectangle(combined_view,
-                              (start_col, y_top + h_rot),
-                              (end_col,   y_bot + h_rot),
-                              (0, 0, 255), p['box_thickness'])
-                cv2.putText(combined_view, f"w={width}",
-                            (start_col, y_top + h_rot - p['label_y_offset']),
+                cv2.putText(combined_view,
+                            f"{status} | {actual_frac:.2%}",
+                            (p['status_x'], p['status_y']),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            p['label_font_scale'],
+                            p['status_font_scale'],
                             (0, 0, 255),
-                            p['label_thickness'])
+                            p['status_thickness'])
 
-                cv2.rectangle(combined_view,
-                              (start_col, 0),
-                              (end_col,   h_rot - 1),
-                              (0, 0, 255), p['box_thickness'])
-                cv2.putText(combined_view, f"w={width}",
-                            (start_col, p['label_y_top']),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            p['label_font_scale'],
-                            (0, 0, 255),
-                            p['label_thickness'])
+                h_rot = image_rot.shape[0]
 
-        # ── draw plant boxes (green) ───────────────────────────────────────
-        for (start_col, end_col, width) in plant_regions_raw:
-            cv2.rectangle(combined_view,
-                          (start_col, 0),
-                          (end_col,   h_rot - 1),
-                          (0, 255, 0), p['box_thickness'])
-            cv2.putText(combined_view, f"p={width}",
-                        (start_col, p['label_y_top']),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        p['label_font_scale'],
-                        (0, 255, 0),
-                        p['label_thickness'])
+                # ── draw obstacle boxes (red) ──────────────────────────────────────
+                if status == "GROUND FOUND":
+                    if ground_baseline is not None:
+                        valid_r = np.where(ground_baseline < combined_view.shape[0])[0]
+                        if len(valid_r) > 1:
+                            pts = np.array(
+                                [[int(r), int(ground_baseline[r]) + h_rot] for r in valid_r],
+                                dtype=np.int32)
+                            cv2.polylines(combined_view, [pts], False, (255, 0, 0), 1)
 
-        cv2.imshow(WINDOW, combined_view)
+                    for (start_col, end_col, width) in obstacle_regions_raw:
+                        y_top = int(min(boundary_rows[start_col:end_col + 1]))
+                        y_bot = int(max(boundary_rows[start_col:end_col + 1])) + p['box_bottom_pad']
 
-        key = cv2.waitKey(40)
-        if key == ord('q'):
+                        cv2.rectangle(combined_view,
+                                      (start_col, y_top + h_rot),
+                                      (end_col,   y_bot + h_rot),
+                                      (0, 0, 255), p['box_thickness'])
+                        cv2.putText(combined_view, f"w={width}",
+                                    (start_col, y_top + h_rot - p['label_y_offset']),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    p['label_font_scale'],
+                                    (0, 0, 255),
+                                    p['label_thickness'])
+
+                        cv2.rectangle(combined_view,
+                                      (start_col, 0),
+                                      (end_col,   h_rot - 1),
+                                      (0, 0, 255), p['box_thickness'])
+                        cv2.putText(combined_view, f"w={width}",
+                                    (start_col, p['label_y_top']),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    p['label_font_scale'],
+                                    (0, 0, 255),
+                                    p['label_thickness'])
+
+                # ── draw plant boxes (green) ───────────────────────────────────────
+                for (start_col, end_col, width) in plant_regions_raw:
+                    cv2.rectangle(combined_view,
+                                  (start_col, 0),
+                                  (end_col,   h_rot - 1),
+                                  (0, 255, 0), p['box_thickness'])
+                    cv2.putText(combined_view, f"p={width}",
+                                (start_col, p['label_y_top']),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                p['label_font_scale'],
+                                (0, 255, 0),
+                                p['label_thickness'])
+
+                cv2.imshow(WINDOW, combined_view)
+                
+                # Processing complete. Wait for user to trigger the next image.
+                needs_processing = False 
+
+            # ── Handle Input / Delay ───────────────────────────────────────────────
+            # Using FRAME_DELAY instead of 0 prevents OpenCV from blocking KeyboardInterrupt
+            key = cv2.waitKey(FRAME_DELAY) & 0xFF
+
+            if key == ord('q'):
+                break
+            elif key == ord('d'):      # next image
+                idx = (idx + 1) % len(image_paths)
+                needs_processing = True
+            elif key == ord('a'):      # previous image
+                idx = (idx - 1) % len(image_paths)
+                needs_processing = True
+
+        except KeyboardInterrupt:
+            print("\nProcess interrupted by user (Ctrl+C). Exiting...")
             break
 
     cv2.destroyAllWindows()
