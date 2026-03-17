@@ -63,7 +63,7 @@ float heading_increment = 5.f;          // heading angle increment [deg]
 float maxDistance = 2.25;               // max waypoint displacement [m]
 
 // define script-level variables
-struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
+struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS]; 
 uint8_t   obstacle_count        = 0;
 uint16_t  total_obstacle_width  = 0;
 

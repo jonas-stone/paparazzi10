@@ -146,4 +146,3 @@ if __name__ == '__main__':
 
     viewer.run()
     viewer.cleanup()
-
