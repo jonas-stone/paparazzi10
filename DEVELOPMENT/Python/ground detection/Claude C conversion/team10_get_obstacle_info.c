@@ -1,15 +1,7 @@
 /*
- * team10_get_obstacle_info.c
- *
- * C port of the Python obstacle-detection pipeline.
- * See team10_get_obstacle_info.h for documentation.
- *
- * Memory strategy
- * ───────────────
- * All large work buffers are file-scope static so they live in BSS
- * (zero-cost at startup, no heap fragmentation).  This means the
- * functions are NOT re-entrant, but on the drone only one camera
- * callback thread uses them, so that is fine.
+ * team10_get_obstacle_info.c — Paparazzi build.
+ * Complete pipeline with is_smooth_blob (perimeter + fractal dimension).
+ * Same algorithm as _standalone.c, with real Paparazzi includes.
  */
 
 #include "team10_get_obstacle_info.h"
@@ -18,1127 +10,611 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  STATIC WORK BUFFERS  (allocated once in BSS)
+ *  STATIC WORK BUFFERS
  * ══════════════════════════════════════════════════════════════════════════════ */
-#define MAX_PIXELS (MAX_IMAGE_WIDTH * MAX_IMAGE_HEIGHT)
+#define MAX_PLANT_PIXELS (MAX_PLANT_WIDTH * MAX_PLANT_HEIGHT)
 
-static uint8_t  work_mask[MAX_PIXELS];        /* binary mask (0 / 255)        */
-static uint8_t  work_mask2[MAX_PIXELS];       /* second mask for median blur  */
-static int16_t  work_labels[MAX_PIXELS];      /* connected-component labels   */
-static uint8_t  work_visited[MAX_PIXELS];     /* flood-fill visited flags     */
-static uint8_t  work_flipped[MAX_PIXELS];     /* left-right flipped mask      */
-
-/* flood-fill queue (BFS) – worst case every pixel */
+static uint8_t  work_mask[MAX_PIXELS];
+static uint8_t  work_mask2[MAX_PIXELS];
+static int16_t  work_labels[MAX_PIXELS];
+static uint8_t  work_visited[MAX_PIXELS];   /* also used as padded blob mask */
+static uint8_t  work_flipped[MAX_PIXELS];   /* also used as edge image       */
 static int32_t  ff_queue[MAX_PIXELS];
-
-/* union-find parent array for connected components */
 static int16_t  uf_parent[MAX_CC_LABELS];
-static int32_t  cc_area[MAX_CC_LABELS];       /* area per label               */
-static int16_t  cc_min_x[MAX_CC_LABELS];      /* bounding box                 */
-static int16_t  cc_max_x[MAX_CC_LABELS];
-static int16_t  cc_min_y[MAX_CC_LABELS];
-static int16_t  cc_max_y[MAX_CC_LABELS];
+static int32_t  cc_area[MAX_CC_LABELS];
+static int16_t  cc_bb_x0[MAX_CC_LABELS];    /* bounding box per label */
+static int16_t  cc_bb_x1[MAX_CC_LABELS];
+static int16_t  cc_bb_y0[MAX_CC_LABELS];
+static int16_t  cc_bb_y1[MAX_CC_LABELS];
 
-/* 1-D arrays sized by image width */
-static float    med_tmp[MAX_IMAGE_WIDTH];     /* for 1-D median of boundary   */
+static uint8_t  plant_green_small[MAX_PLANT_PIXELS];
+static uint8_t  plant_blur_buf[MAX_PLANT_PIXELS];
+static uint8_t  plant_clean_small[MAX_PLANT_PIXELS];
+static uint8_t  plant_mask_small[MAX_PLANT_PIXELS];
+static uint8_t  plant_mask_full[MAX_PIXELS];
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  PIXEL ACCESS HELPERS  (YUV422 / UYVY)
- * ══════════════════════════════════════════════════════════════════════════════
- *
- *  Buffer layout per macro-pixel (2 pixels):
- *    byte 0 = U,  byte 1 = Y0,  byte 2 = V,  byte 3 = Y1
- *
- *  For pixel (x, y) in an image of width w:
- *    Y = buf[ y*w*2 + x*2 + 1 ]
- *    U = buf[ y*w*2 + (x & ~1)*2 ]           (shared with neighbour)
- *    V = buf[ y*w*2 + (x & ~1)*2 + 2 ]       (shared with neighbour)
- */
-
+ *  YUV422 (UYVY) PIXEL ACCESS
+ * ══════════════════════════════════════════════════════════════════════════════ */
 static inline uint8_t yuv422_Y(const uint8_t *buf, int w, int x, int y)
-{
-    return buf[y * w * 2 + x * 2 + 1];
-}
+{ return buf[y * w * 2 + x * 2 + 1]; }
 static inline uint8_t yuv422_U(const uint8_t *buf, int w, int x, int y)
-{
-    return buf[y * w * 2 + (x & ~1) * 2];
-}
+{ return buf[y * w * 2 + (x & ~1) * 2]; }
 static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
-{
-    return buf[y * w * 2 + (x & ~1) * 2 + 2];
-}
+{ return buf[y * w * 2 + (x & ~1) * 2 + 2]; }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  1.  DECISION-TREE COLOUR CLASSIFIER
- * ══════════════════════════════════════════════════════════════════════════════
- *
- *  Exact translation of the Python is_ground(Y, U, V) tree.
- */
-
+ *  1. DECISION TREE (exact match of Python is_ground)
+ * ══════════════════════════════════════════════════════════════════════════════ */
 uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
 {
     if (U <= 115) {
         if (V <= 145) {
-            if (Y <= 85) {
-                return 0;   /* both Y<=78 and 78<Y<=85 → 0 */
-            } else {
-                if (U <= 92)
-                    return 0;
-                else
-                    return 255;
-            }
+            if (Y <= 85) return 0;
+            else         return (U <= 92) ? 0 : 255;
         } else {
-            if (V <= 152) {
-                if (Y <= 177)
-                    return 255;
-                else
-                    return 0;
-            } else {
-                return 0;
-            }
+            if (V <= 152) return (Y <= 177) ? 255 : 0;
+            else          return 0;
         }
     } else {
         if (U <= 121) {
-            if (V <= 137) {
-                if (Y <= 87)
-                    return 0;
-                else
-                    return 255;
-            } else {
-                return 0;  /* both U<=116 and 116<U<=121 → 0 */
-            }
+            if (V <= 137) return (Y <= 87) ? 0 : 255;
+            else          return 0;
         } else {
-            if (U <= 122) {
-                if (V <= 126)
-                    return 0;
-                else
-                    return 0;
-            } else {
-                if (Y <= 62)
-                    return 0;
-                else
-                    return 0;
-            }
+            return 0;
         }
     }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  2.  MEDIAN BLUR  (optimised for binary images: majority vote)
- * ══════════════════════════════════════════════════════════════════════════════
- *
- *  Since the mask is binary (0 or 255), median = majority vote within the
- *  kernel window.  We just count how many neighbours are 255.
- */
-
-static void median_blur_binary(const uint8_t *src, uint8_t *dst,
-                               int w, int h, int ksize)
+ *  2. BINARY MEDIAN BLUR (majority vote)
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static void median_blur_binary(const uint8_t *src, uint8_t *dst, int w, int h, int ksize)
 {
-    int half = ksize / 2;
-    int threshold = (ksize * ksize) / 2;  /* majority = more than half */
-
+    int half = ksize / 2, threshold = (ksize * ksize) / 2;
     for (int y = 0; y < h; y++) {
+        int y0 = (y - half < 0) ? 0 : y - half;
+        int y1 = (y + half >= h) ? h - 1 : y + half;
         for (int x = 0; x < w; x++) {
             int count = 0;
-
-            /* scan kernel window */
-            int y0 = (y - half < 0)  ? 0     : y - half;
-            int y1 = (y + half >= h) ? h - 1 : y + half;
-            int x0 = (x - half < 0)  ? 0     : x - half;
+            int x0 = (x - half < 0) ? 0 : x - half;
             int x1 = (x + half >= w) ? w - 1 : x + half;
-
-            for (int ky = y0; ky <= y1; ky++) {
-                for (int kx = x0; kx <= x1; kx++) {
-                    if (src[ky * w + kx])
-                        count++;
-                }
-            }
-
+            for (int ky = y0; ky <= y1; ky++)
+                for (int kx = x0; kx <= x1; kx++)
+                    if (src[ky * w + kx]) count++;
             dst[y * w + x] = (count > threshold) ? 255 : 0;
         }
     }
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  FULL GREEN DETECTION  (classify + blur + fraction)
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-void detect_green_ground_ml(struct image_t *img,
-                            uint8_t         mask_out[],
-                            int             median_ksize,
-                            float          *green_frac_out)
+void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[],
+                            int median_ksize, float *green_frac_out)
 {
-    int w = img->w;
-    int h = img->h;
+    int w = img->w, h = img->h;
     const uint8_t *buf = (const uint8_t *)img->buf;
-
-    /* ── apply decision tree to every pixel ──────────────────────────────── */
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            uint8_t Y = yuv422_Y(buf, w, x, y);
-            uint8_t U = yuv422_U(buf, w, x, y);
-            uint8_t V = yuv422_V(buf, w, x, y);
-            work_mask2[y * w + x] = is_ground_pixel(Y, U, V);
-        }
-    }
-
-    /* ── median blur (binary-optimised) ──────────────────────────────────── */
-    if (median_ksize >= 3 && (median_ksize & 1)) {
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            work_mask2[y * w + x] = is_ground_pixel(
+                yuv422_Y(buf, w, x, y), yuv422_U(buf, w, x, y), yuv422_V(buf, w, x, y));
+    if (median_ksize >= 3 && (median_ksize & 1))
         median_blur_binary(work_mask2, mask_out, w, h, median_ksize);
-    } else {
+    else
         memcpy(mask_out, work_mask2, w * h);
-    }
-
-    /* ── compute green fraction ──────────────────────────────────────────── */
-    int green_count = 0;
-    int total = w * h;
-    for (int i = 0; i < total; i++) {
-        if (mask_out[i])
-            green_count++;
-    }
-    if (green_frac_out)
-        *green_frac_out = (total > 0) ? (float)green_count / (float)total : 0.0f;
+    int gc = 0, total = w * h;
+    for (int i = 0; i < total; i++) if (mask_out[i]) gc++;
+    if (green_frac_out) *green_frac_out = total > 0 ? (float)gc / total : 0.0f;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  3.  CONNECTED-COMPONENT LABELLING  (two-pass with union-find)
+ *  3. CONNECTED COMPONENTS (union-find, 8-connectivity, with bounding boxes)
  * ══════════════════════════════════════════════════════════════════════════════ */
-
-/* ── union-find primitives ────────────────────────────────────────────────── */
-
-static void uf_init(int n)
-{
-    for (int i = 0; i < n; i++)
-        uf_parent[i] = (int16_t)i;
+static void uf_init(int n) { for (int i = 0; i < n; i++) uf_parent[i] = (int16_t)i; }
+static int16_t uf_find(int16_t x) {
+    while (uf_parent[x] != x) { uf_parent[x] = uf_parent[uf_parent[x]]; x = uf_parent[x]; } return x;
+}
+static void uf_union(int16_t a, int16_t b) {
+    a = uf_find(a); b = uf_find(b);
+    if (a != b) { if (a < b) uf_parent[b] = a; else uf_parent[a] = b; }
 }
 
-static int16_t uf_find(int16_t x)
-{
-    while (uf_parent[x] != x) {
-        uf_parent[x] = uf_parent[uf_parent[x]];   /* path compression */
-        x = uf_parent[x];
-    }
-    return x;
-}
-
-static void uf_union(int16_t a, int16_t b)
-{
-    a = uf_find(a);
-    b = uf_find(b);
-    if (a != b) {
-        if (a < b)
-            uf_parent[b] = a;
-        else
-            uf_parent[a] = b;
-    }
-}
-
-/* ── two-pass connected-component labelling (8-connectivity) ─────────────── */
-
-static int connected_components(const uint8_t *mask, int16_t *labels,
-                                int w, int h)
+static int connected_components(const uint8_t *mask, int16_t *labels, int w, int h)
 {
     int16_t next_label = 1;
-
     uf_init(MAX_CC_LABELS);
     memset(labels, 0, w * h * sizeof(int16_t));
 
-    /* ── first pass: assign provisional labels ───────────────────────────── */
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             int idx = y * w + x;
-            if (mask[idx] == 0) continue;
+            if (!mask[idx]) continue;
+            int16_t nb[4]; int nn = 0;
+            if (y > 0 && x > 0     && labels[(y-1)*w+(x-1)]) nb[nn++] = labels[(y-1)*w+(x-1)];
+            if (y > 0               && labels[(y-1)*w+x])     nb[nn++] = labels[(y-1)*w+x];
+            if (y > 0 && x < w - 1 && labels[(y-1)*w+(x+1)]) nb[nn++] = labels[(y-1)*w+(x+1)];
+            if (x > 0               && labels[y*w+(x-1)])     nb[nn++] = labels[y*w+(x-1)];
+            if (nn == 0) { if (next_label < MAX_CC_LABELS) labels[idx] = next_label++; }
+            else {
+                int16_t m = uf_find(nb[0]);
+                for (int i = 1; i < nn; i++) { int16_t r = uf_find(nb[i]); if (r < m) m = r; }
+                labels[idx] = m;
+                for (int i = 0; i < nn; i++) uf_union(m, nb[i]);
+            }
+        }
+    }
+    /* flatten labels */
+    for (int i = 0; i < w * h; i++) if (labels[i]) labels[i] = uf_find(labels[i]);
 
-            /* collect labels of already-labelled neighbours (8-connected) */
-            int16_t neighbours[4];
-            int nn = 0;
+    /* compute per-label area and bounding boxes */
+    int max_label = 0;
+    for (int i = 0; i < w * h; i++) if (labels[i] > max_label) max_label = labels[i];
+    if (max_label >= MAX_CC_LABELS) max_label = MAX_CC_LABELS - 1;
 
-            /* up-left */
-            if (y > 0 && x > 0 && labels[(y-1)*w + (x-1)])
-                neighbours[nn++] = labels[(y-1)*w + (x-1)];
-            /* up */
-            if (y > 0 && labels[(y-1)*w + x])
-                neighbours[nn++] = labels[(y-1)*w + x];
-            /* up-right */
-            if (y > 0 && x < w-1 && labels[(y-1)*w + (x+1)])
-                neighbours[nn++] = labels[(y-1)*w + (x+1)];
-            /* left */
-            if (x > 0 && labels[y*w + (x-1)])
-                neighbours[nn++] = labels[y*w + (x-1)];
-
-            if (nn == 0) {
-                /* new label */
-                if (next_label < MAX_CC_LABELS) {
-                    labels[idx] = next_label++;
-                }
-                /* else: overflow – pixel stays 0 (background) */
-            } else {
-                /* find minimum root label among neighbours */
-                int16_t min_lbl = uf_find(neighbours[0]);
-                for (int i = 1; i < nn; i++) {
-                    int16_t r = uf_find(neighbours[i]);
-                    if (r < min_lbl) min_lbl = r;
-                }
-                labels[idx] = min_lbl;
-
-                /* union all neighbours */
-                for (int i = 0; i < nn; i++)
-                    uf_union(min_lbl, neighbours[i]);
+    for (int l = 0; l <= max_label; l++) {
+        cc_area[l] = 0;
+        cc_bb_x0[l] = (int16_t)(w - 1); cc_bb_x1[l] = 0;
+        cc_bb_y0[l] = (int16_t)(h - 1); cc_bb_y1[l] = 0;
+    }
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int16_t l = labels[y * w + x];
+            if (l > 0 && l <= max_label) {
+                cc_area[l]++;
+                if (x < cc_bb_x0[l]) cc_bb_x0[l] = (int16_t)x;
+                if (x > cc_bb_x1[l]) cc_bb_x1[l] = (int16_t)x;
+                if (y < cc_bb_y0[l]) cc_bb_y0[l] = (int16_t)y;
+                if (y > cc_bb_y1[l]) cc_bb_y1[l] = (int16_t)y;
             }
         }
     }
 
-    /* ── second pass: flatten labels to roots ─────────────────────────────── */
-    for (int i = 0; i < w * h; i++) {
-        if (labels[i])
-            labels[i] = uf_find(labels[i]);
-    }
-
-    return (int)(next_label - 1);   /* total provisional labels assigned */
+    return (int)(next_label - 1);
 }
 
-/* ── isolate_ground_blob: keep only blobs above area threshold ───────────── */
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  BLOB PERIMETER (matching Python: transitions in zero-padded image)
+ *
+ *  Counts horizontal + vertical transitions between blob and non-blob,
+ *  including the implicit zero-padding border.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+int compute_blob_perimeter(const int16_t *labels, int w, int h, int16_t lbl)
+{
+    int perim = 0;
 
+    /* horizontal transitions */
+    for (int y = 0; y < h; y++) {
+        /* left border → first pixel */
+        if (labels[y * w] == lbl) perim++;
+        /* interior */
+        for (int x = 0; x < w - 1; x++) {
+            int a = (labels[y * w + x] == lbl) ? 1 : 0;
+            int b = (labels[y * w + x + 1] == lbl) ? 1 : 0;
+            if (a != b) perim++;
+        }
+        /* last pixel → right border */
+        if (labels[y * w + w - 1] == lbl) perim++;
+    }
+
+    /* vertical transitions */
+    for (int x = 0; x < w; x++) {
+        /* top border → first pixel */
+        if (labels[x] == lbl) perim++;
+        /* interior */
+        for (int y = 0; y < h - 1; y++) {
+            int a = (labels[y * w + x] == lbl) ? 1 : 0;
+            int b = (labels[(y + 1) * w + x] == lbl) ? 1 : 0;
+            if (a != b) perim++;
+        }
+        /* last pixel → bottom border */
+        if (labels[(h - 1) * w + x] == lbl) perim++;
+    }
+
+    return perim;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  FRACTAL DIMENSION (box-counting on blob edge, matching Python exactly)
+ *
+ *  Steps:
+ *    1. Create zero-padded blob mask (h+2)×(w+2) in work_visited
+ *    2. Compute edge image in work_flipped:
+ *         edge[y,x] = (padded[y,x+1] != padded[y,x]) || (padded[y+1,x] != padded[y,x])
+ *    3. Box-counting at scales 2, 4, 8, 16, ...
+ *    4. Linear regression on log(scale) vs log(count)
+ *    5. Return -slope
+ * ══════════════════════════════════════════════════════════════════════════════ */
+float compute_fractal_dimension(const int16_t *labels, int w, int h, int16_t lbl)
+{
+    int pw = w + 2, ph = h + 2;
+
+    /* step 1: create padded blob mask in work_visited */
+    memset(work_visited, 0, pw * ph);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (labels[y * w + x] == lbl)
+                work_visited[(y + 1) * pw + (x + 1)] = 1;
+
+    /* step 2: compute edge image in work_flipped */
+    memset(work_flipped, 0, pw * ph);
+    for (int y = 0; y < ph; y++) {
+        for (int x = 0; x < pw; x++) {
+            int cur = work_visited[y * pw + x];
+            int e1 = 0, e2 = 0;
+            if (x < pw - 1) e1 = (work_visited[y * pw + x + 1] != cur) ? 1 : 0;
+            if (y < ph - 1) e2 = (work_visited[(y + 1) * pw + x] != cur) ? 1 : 0;
+            work_flipped[y * pw + x] = (e1 || e2) ? 1 : 0;
+        }
+    }
+
+    /* step 3: box-counting at powers of 2 */
+    float log_eps[16], log_boxes[16];
+    int n_scales = 0;
+    int min_dim = (pw < ph) ? pw : ph;
+
+    for (int p = 1; (1 << p) < min_dim && n_scales < 16; p++) {
+        int s = 1 << p;
+        int trimmed_h = (ph / s) * s;
+        int trimmed_w = (pw / s) * s;
+        int count = 0;
+
+        for (int by = 0; by < trimmed_h; by += s) {
+            for (int bx = 0; bx < trimmed_w; bx += s) {
+                /* check if any pixel in this s×s block is edge */
+                int found = 0;
+                for (int dy = 0; dy < s && !found; dy++)
+                    for (int dx = 0; dx < s && !found; dx++)
+                        if (work_flipped[(by + dy) * pw + (bx + dx)])
+                            found = 1;
+                if (found) count++;
+            }
+        }
+
+        if (count > 0) {
+            log_eps[n_scales] = logf((float)s);
+            log_boxes[n_scales] = logf((float)count);
+            n_scales++;
+        }
+    }
+
+    /* step 4: linear regression y = a*x + b */
+    if (n_scales < 2) return 1.0f;  /* not enough data → assume smooth */
+
+    float sx = 0, sy = 0, sxy = 0, sxx = 0;
+    for (int i = 0; i < n_scales; i++) {
+        sx  += log_eps[i];
+        sy  += log_boxes[i];
+        sxy += log_eps[i] * log_boxes[i];
+        sxx += log_eps[i] * log_eps[i];
+    }
+    float denom = n_scales * sxx - sx * sx;
+    if (fabsf(denom) < 1e-9f) return 1.0f;
+
+    float slope = (n_scales * sxy - sx * sy) / denom;
+    return -slope;   /* negate: slope is negative, fractal dim is positive */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  IS_SMOOTH_BLOB (matching Python solidity_detection.is_smooth_blob)
+ *
+ *  A blob is "smooth" (likely ground) if EITHER:
+ *    perimeter / equiv_rect_perimeter < 2.0
+ *    OR fractal_dimension < 1.3
+ *
+ *  Returns 1 = smooth (keep), 0 = spiky (remove).
+ * ══════════════════════════════════════════════════════════════════════════════ */
+int is_smooth_blob(const int16_t *labels, int w, int h,
+                   int16_t lbl, int blob_area, int bb_height)
+{
+    /* bb_height = bounding box HEIGHT in pixels (Python calls this "width"
+       because the camera is sideways — values[label, 3] = CC_STAT_HEIGHT) */
+    if (bb_height <= 0) return 1;  /* degenerate → keep */
+
+    int perim = compute_blob_perimeter(labels, w, h, lbl);
+
+    /* average height = area / bb_height  (matches Python compute_average_blob_height) */
+    int avg_height = blob_area / bb_height;
+
+    /* equivalent rectangle perimeter */
+    int equiv_rect_perim = 2 * (avg_height + bb_height);
+
+    /* perimeter ratio check */
+    float perim_ratio = (equiv_rect_perim > 0) ?
+        (float)perim / (float)equiv_rect_perim : 0.0f;
+
+    if (perim_ratio < SMOOTH_PERIMETER_RATIO_THRESH)
+        return 1;  /* smooth */
+
+    /* fractal dimension check (expensive — only if perimeter ratio failed) */
+    float fd = compute_fractal_dimension(labels, w, h, lbl);
+
+    if (fd < SMOOTH_FRACTAL_DIM_THRESH)
+        return 1;  /* smooth */
+
+    return 0;  /* both checks failed → spiky, remove this blob */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  ISOLATE GROUND BLOB (CC + area filter + smooth-blob filter)
+ * ══════════════════════════════════════════════════════════════════════════════ */
 void isolate_ground_blob(uint8_t mask[], int w, int h, int blob_area_threshold)
 {
     int n_labels = connected_components(mask, work_labels, w, h);
     if (n_labels == 0) return;
 
-    /* count area per root label */
     int max_label = 0;
-    for (int i = 0; i < w * h; i++) {
-        if (work_labels[i] > max_label)
-            max_label = work_labels[i];
-    }
-    if (max_label >= MAX_CC_LABELS)
-        max_label = MAX_CC_LABELS - 1;
+    for (int i = 0; i < w * h; i++) if (work_labels[i] > max_label) max_label = work_labels[i];
+    if (max_label >= MAX_CC_LABELS) max_label = MAX_CC_LABELS - 1;
 
-    memset(cc_area, 0, (max_label + 1) * sizeof(int32_t));
-    for (int i = 0; i < w * h; i++) {
-        int16_t lbl = work_labels[i];
-        if (lbl > 0 && lbl <= max_label)
-            cc_area[lbl]++;
+    /* decide which labels pass ONCE (not per-pixel!) */
+    static uint8_t label_keep[MAX_CC_LABELS];
+    memset(label_keep, 0, max_label + 1);
+
+    for (int l = 1; l <= max_label; l++) {
+        if (cc_area[l] < blob_area_threshold) continue;
+
+        int bb_height = cc_bb_y1[l] - cc_bb_y0[l] + 1;
+        if (!is_smooth_blob(work_labels, w, h, (int16_t)l, cc_area[l], bb_height))
+            continue;
+
+        label_keep[l] = 1;
     }
 
-    /* zero out small blobs in the mask */
+    /* apply: keep only passing labels */
     for (int i = 0; i < w * h; i++) {
-        int16_t lbl = work_labels[i];
-        if (lbl > 0 && lbl <= max_label) {
-            if (cc_area[lbl] < blob_area_threshold)
-                mask[i] = 0;
-            else
-                mask[i] = 255;
-        }
-        /* lbl == 0 stays 0 */
+        int16_t l = work_labels[i];
+        mask[i] = (l > 0 && l <= max_label && label_keep[l]) ? 255 : 0;
     }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  4.  HOLE FILLING  (border flood-fill approach)
- * ══════════════════════════════════════════════════════════════════════════════
- *
- *  Strategy:
- *    1. BFS from all border pixels that are 0 → mark as "exterior"
- *    2. Any pixel that is 0 but NOT exterior → it's a hole → set to 255
- */
-
+ *  4. HOLE FILLING (border flood-fill BFS)
+ * ══════════════════════════════════════════════════════════════════════════════ */
 void fill_holes_mask(uint8_t mask[], int w, int h)
 {
     int total = w * h;
     memset(work_visited, 0, total);
-
-    int q_head = 0, q_tail = 0;
-
-    /* seed BFS with all border pixels that are background (0) */
+    int qh = 0, qt = 0;
     for (int x = 0; x < w; x++) {
-        /* top row */
-        if (mask[x] == 0 && !work_visited[x]) {
-            work_visited[x] = 1;
-            ff_queue[q_tail++] = x;
-        }
-        /* bottom row */
-        int idx = (h - 1) * w + x;
-        if (mask[idx] == 0 && !work_visited[idx]) {
-            work_visited[idx] = 1;
-            ff_queue[q_tail++] = idx;
-        }
+        if (!mask[x] && !work_visited[x]) { work_visited[x] = 1; ff_queue[qt++] = x; }
+        int b = (h-1)*w+x;
+        if (!mask[b] && !work_visited[b]) { work_visited[b] = 1; ff_queue[qt++] = b; }
     }
     for (int y = 0; y < h; y++) {
-        /* left column */
-        int idx = y * w;
-        if (mask[idx] == 0 && !work_visited[idx]) {
-            work_visited[idx] = 1;
-            ff_queue[q_tail++] = idx;
-        }
-        /* right column */
-        idx = y * w + (w - 1);
-        if (mask[idx] == 0 && !work_visited[idx]) {
-            work_visited[idx] = 1;
-            ff_queue[q_tail++] = idx;
-        }
+        int l = y*w;
+        if (!mask[l] && !work_visited[l]) { work_visited[l] = 1; ff_queue[qt++] = l; }
+        int r = y*w+(w-1);
+        if (!mask[r] && !work_visited[r]) { work_visited[r] = 1; ff_queue[qt++] = r; }
     }
-
-    /* BFS: flood through all 0-pixels reachable from the border */
-    /* 4-connectivity is sufficient for exterior fill */
-    while (q_head < q_tail) {
-        int idx = ff_queue[q_head++];
-        int y = idx / w;
-        int x = idx % w;
-
-        /* 4 neighbours */
-        int nb[4];
-        int nn = 0;
-        if (y > 0)     nb[nn++] = idx - w;
-        if (y < h - 1) nb[nn++] = idx + w;
-        if (x > 0)     nb[nn++] = idx - 1;
-        if (x < w - 1) nb[nn++] = idx + 1;
-
-        for (int i = 0; i < nn; i++) {
-            int ni = nb[i];
-            if (!work_visited[ni] && mask[ni] == 0) {
-                work_visited[ni] = 1;
-                ff_queue[q_tail++] = ni;
-            }
-        }
+    while (qh < qt) {
+        int i = ff_queue[qh++]; int cy = i / w, cx = i % w;
+        if (cy > 0     && !work_visited[i-w] && !mask[i-w]) { work_visited[i-w] = 1; ff_queue[qt++] = i-w; }
+        if (cy < h - 1 && !work_visited[i+w] && !mask[i+w]) { work_visited[i+w] = 1; ff_queue[qt++] = i+w; }
+        if (cx > 0     && !work_visited[i-1] && !mask[i-1]) { work_visited[i-1] = 1; ff_queue[qt++] = i-1; }
+        if (cx < w - 1 && !work_visited[i+1] && !mask[i+1]) { work_visited[i+1] = 1; ff_queue[qt++] = i+1; }
     }
-
-    /* any 0-pixel NOT visited is a hole → fill it */
-    for (int i = 0; i < total; i++) {
-        if (mask[i] == 0 && !work_visited[i])
-            mask[i] = 255;
-    }
+    for (int i = 0; i < total; i++)
+        if (!mask[i] && !work_visited[i]) mask[i] = 255;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  5.  GROUND BOUNDARY SCAN
- * ══════════════════════════════════════════════════════════════════════════════
- *
- *  For each row (= original column) of the left-right-flipped mask:
- *    - Scan from the bottom (high index) upward
- *    - Find where continuous ground ends (gap > max_gap)
- *    - Boundary = top of that continuous ground strip
- *
- *  Then smooth with a 1-D median filter.
- */
-
-/* ── 1-D median filter on int array ──────────────────────────────────────── */
-
-static void insertion_sort_float(float *arr, int n)
-{
-    for (int i = 1; i < n; i++) {
-        float key = arr[i];
-        int j = i - 1;
-        while (j >= 0 && arr[j] > key) {
-            arr[j + 1] = arr[j];
-            j--;
-        }
-        arr[j + 1] = key;
-    }
+ *  5. BOUNDARY SCAN + 1-D MEDIAN
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static void insertion_sort_f(float *a, int n) {
+    for (int i = 1; i < n; i++) { float k = a[i]; int j = i-1; while (j >= 0 && a[j] > k) { a[j+1] = a[j]; j--; } a[j+1] = k; }
 }
-
-static void median_filter_1d(int *data, int n, int ksize)
-{
+static void median_filter_1d(int *data, int n, int ksize) {
     if (ksize < 3 || n <= ksize) return;
-    int half = ksize / 2;
-    float window[25];   /* ksize ≤ 25 assumed; DEFAULT_SMOOTH_KERNEL = 5 */
-
-    /* need a copy because we read while writing */
-    static int med_copy[MAX_IMAGE_WIDTH];
-    memcpy(med_copy, data, n * sizeof(int));
-
+    int half = ksize / 2; float win[25];
+    static int mc[MAX_IMAGE_HEIGHT]; if (n > MAX_IMAGE_HEIGHT) n = MAX_IMAGE_HEIGHT;
+    memcpy(mc, data, n * sizeof(int));
     for (int i = 0; i < n; i++) {
-        int wn = 0;
-        int lo = (i - half < 0) ? 0 : i - half;
-        int hi = (i + half >= n) ? n - 1 : i + half;
-        for (int j = lo; j <= hi; j++)
-            window[wn++] = (float)med_copy[j];
-        insertion_sort_float(window, wn);
-        data[i] = (int)window[wn / 2];
+        int wn = 0, lo = (i-half < 0) ? 0 : i-half, hi = (i+half >= n) ? n-1 : i+half;
+        for (int j = lo; j <= hi; j++) win[wn++] = (float)mc[j];
+        insertion_sort_f(win, wn);
+        data[i] = (int)win[wn / 2];
     }
 }
 
-/* ── find_ground_boundary  (matches Python find_ground_boundary exactly) ──── */
-
-void find_ground_boundary(const uint8_t mask_flipped[],
-                          int  w,
-                          int  h,
-                          int  boundary_out[],
-                          int  min_ground_pixels,
-                          int  max_gap,
-                          int  smooth_kernel)
+void find_ground_boundary(const uint8_t mask_flipped[], int w, int h,
+                          int boundary_out[], int mgp, int mg, int sk)
 {
-    /*
-     * mask_flipped is laid out row-major: mask_flipped[row * h + col]
-     * because the Python code does  mask_flipped = clean_mask[:, ::-1]
-     * and then iterates over rows of mask_flipped.
-     *
-     * BUT: in the Python code, mask_rotated is actually the original
-     * 2-D image with columns flipped (left-right flip).  Each "row" of
-     * the Python iteration corresponds to a row of the image (i.e. a
-     * horizontal scan line), and "image_height" = number of columns.
-     *
-     * In the Python, mask_rotated.shape = (H_original, W_original) after
-     * flipping columns.  The boundary is computed per row (H entries).
-     * image_height = W_original = mask_rotated.shape[1].
-     *
-     * Mapping to our C variables:
-     *   n_rows       = w   (number of rows to scan = image width)
-     *   image_height = h   (length of each row = image height)
-     *
-     * WAIT – re-reading the Python more carefully:
-     *   clean_mask has shape (H, W)
-     *   mask_flipped = clean_mask[:, ::-1]  → shape still (H, W), columns reversed
-     *   find_ground_boundary(mask_rotated=mask_flipped)
-     *     image_height = mask_rotated.shape[1] = W
-     *     n_rows       = mask_rotated.shape[0] = H
-     *     boundary_rows has n_rows = H entries
-     *
-     * But then update_and_detect receives boundary_rows (H entries) and
-     * uses the image width W as 'h' parameter to compare boundary < h.
-     *
-     * This means:
-     *   - We iterate over H rows of the flipped mask
-     *   - Each row has W pixels
-     *   - boundary_out has H entries
-     *   - "image_height" in the boundary logic = W
-     *
-     * So:
-     *   n_rows = h (image height, iterating over rows)
-     *   row_len = w (image width, the length of each row)
-     *   boundary_out[n_rows]
-     *   default boundary value = row_len (= w)
-     */
-
-    int n_rows  = h;  /* iterate over image rows */
-    int row_len = w;  /* each row has this many pixels */
-
-    for (int r = 0; r < n_rows; r++)
-        boundary_out[r] = row_len;   /* default = "no boundary found" */
-
-    for (int r = 0; r < n_rows; r++) {
-        const uint8_t *row = &mask_flipped[r * row_len];
-
-        /* ── collect positions of green (non-zero) pixels ────────────── */
-        /* scan from right (high index = bottom of column) to left */
-
-        /* first check: any green at all? */
-        int has_any_green = 0;
-        for (int c = 0; c < row_len; c++) {
-            if (row[c]) { has_any_green = 1; break; }
+    int nr = h, rl = w;
+    for (int r = 0; r < nr; r++) boundary_out[r] = rl;
+    for (int r = 0; r < nr; r++) {
+        const uint8_t *row = &mask_flipped[r * rl];
+        int any = 0;
+        for (int c = 0; c < rl; c++) if (row[c]) { any = 1; break; }
+        if (!any) continue;
+        int gv = 1;
+        for (int c = rl - mgp; c < rl; c++) { if (c < 0) continue; if (!row[c]) { gv = 0; break; } }
+        if (!gv) {
+            int mr = 0, cr = 0;
+            for (int c = 0; c < rl; c++) { if (row[c]) { cr++; if (cr > mr) mr = cr; } else cr = 0; }
+            if (mr < mg) continue;
         }
-        if (!has_any_green) continue;
-
-        /* check if the last min_ground_pixels are all green ("ground valid") */
-        int ground_valid = 1;
-        for (int c = row_len - min_ground_pixels; c < row_len; c++) {
-            if (c < 0) continue;
-            if (row[c] == 0) { ground_valid = 0; break; }
-        }
-
-        if (!ground_valid) {
-            /* check if there's any contiguous run >= max_gap */
-            int max_run = 0, cur_run = 0;
-            for (int c = 0; c < row_len; c++) {
-                if (row[c]) {
-                    cur_run++;
-                    if (cur_run > max_run) max_run = cur_run;
-                } else {
-                    cur_run = 0;
-                }
-            }
-            if (max_run < max_gap) continue;
-        }
-
-        /* ── scan from bottom (right end) upward ─────────────────────── */
-        /* Collect green positions in reverse order */
-        /* gp = green_pos[::-1]  (Python) */
-
-        /* find the last green pixel (bottom of ground) */
-        int gp_count = 0;
-        /* We need the green positions sorted from high to low index */
-        /* For efficiency, build on the fly */
-
-        /* Count green pixels for this row */
-        for (int c = 0; c < row_len; c++) {
-            if (row[c]) gp_count++;
-        }
-
-        if (gp_count == 1) {
-            /* single green pixel: use its position as boundary */
-            for (int c = 0; c < row_len; c++) {
-                if (row[c]) { boundary_out[r] = c; break; }
-            }
-            continue;
-        }
-
-        /* Scan from right to left (reversed green positions) */
-        /* We need to find the first "big gap" scanning from bottom */
-        int prev_gp = -1;  /* previous green position (going right to left) */
-        int first_big_gap_gp = -1;    /* gp[fg] – the green pixel just before the gap */
-        int first_big_gap_idx = -1;   /* index in reverse order */
-        int after_gap_start = -1;     /* first green pixel after the gap */
-        int topmost_green = -1;       /* overall topmost (leftmost) green pixel */
-
-        /* We'll scan right-to-left and track gaps */
-        int gp_reverse_idx = 0;
-        int found_big_gap = 0;
-
-        /* collect reverse-sorted green positions into a temp array */
-        /* (we need random access for the after-gap logic) */
-        /* Use a portion of ff_queue as temp storage since it's not in use here */
-        int *gp_arr = (int *)ff_queue;  /* reuse ff_queue memory */
-        int gp_n = 0;
-        for (int c = row_len - 1; c >= 0; c--) {
-            if (row[c])
-                gp_arr[gp_n++] = c;
-        }
-        /* gp_arr[0] = rightmost green, gp_arr[gp_n-1] = leftmost green */
-
-        if (gp_n <= 1) {
-            /* already handled above, but safety */
-            if (gp_n == 1) boundary_out[r] = gp_arr[0];
-            continue;
-        }
-
-        /* find first big gap: gaps[i] = -(gp[i+1] - gp[i]) - 1 */
+        int *gp = (int *)ff_queue; int gn = 0;
+        for (int c = rl - 1; c >= 0; c--) if (row[c]) gp[gn++] = c;
+        if (gn <= 1) { if (gn == 1) boundary_out[r] = gp[0]; continue; }
         int fg = -1;
-        for (int i = 0; i < gp_n - 1; i++) {
-            int gap = gp_arr[i] - gp_arr[i + 1] - 1;
-            if (gap > max_gap) {
-                fg = i;
-                break;
-            }
+        for (int i = 0; i < gn - 1; i++) if (gp[i] - gp[i+1] - 1 > mg) { fg = i; break; }
+        if (fg < 0) { boundary_out[r] = gp[gn - 1]; continue; }
+        int pending = gp[fg], ac = gn - (fg + 1);
+        if (ac >= mg) {
+            int *af = &gp[fg+1]; int mr2 = 1, cr2 = 1;
+            for (int i = 1; i < ac; i++) { if (af[i-1]-af[i]-1==0) { cr2++; if(cr2>mr2) mr2=cr2; } else cr2=1; }
+            if (mr2 >= mg) { boundary_out[r] = gp[gn - 1]; continue; }
         }
-
-        if (fg < 0) {
-            /* no big gap → boundary is the topmost (leftmost) green pixel */
-            boundary_out[r] = gp_arr[gp_n - 1];
-            continue;
-        }
-
-        int pending_boundary = gp_arr[fg];
-
-        /* check after-gap region: gp[fg+1:] */
-        int after_count = gp_n - (fg + 1);
-        if (after_count >= max_gap) {
-            /* check if there's a contiguous run >= max_gap in after_gap */
-            int *after = &gp_arr[fg + 1];
-            int max_run = 1, cur_run = 1;
-            for (int i = 1; i < after_count; i++) {
-                /* consecutive if gap between them is 0 (i.e. adjacent positions) */
-                int g = after[i - 1] - after[i] - 1;
-                if (g == 0) {
-                    cur_run++;
-                    if (cur_run > max_run) max_run = cur_run;
-                } else {
-                    cur_run = 1;
-                }
-            }
-            if (max_run >= max_gap) {
-                /* big run after gap → use topmost green */
-                boundary_out[r] = gp_arr[gp_n - 1];
-                continue;
-            }
-        }
-
-        boundary_out[r] = pending_boundary;
+        boundary_out[r] = pending;
     }
-
-    /* ── smooth valid boundary values with 1-D median ────────────────── */
-    int valid_count = 0;
-    for (int r = 0; r < n_rows; r++) {
-        if (boundary_out[r] < row_len)
-            valid_count++;
-    }
-
-    if (valid_count > smooth_kernel) {
-        median_filter_1d(boundary_out, n_rows, smooth_kernel);
-        /* only apply smoothed values where boundary was valid */
-        /* (The Python applies smoothed only at valid_mask positions,
-           but since median_filter_1d already wrote in-place and the
-           invalid positions were row_len, the median of mostly-row_len
-           neighbours will stay row_len.  So this is equivalent.) */
-    }
+    int vc = 0;
+    for (int r = 0; r < nr; r++) if (boundary_out[r] < rl) vc++;
+    if (vc > sk) median_filter_1d(boundary_out, nr, sk);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  6.  OBSTACLE REGION MERGING
+ *  6-8. OBSTACLE REGION MERGE + BASELINE UPDATE
  * ══════════════════════════════════════════════════════════════════════════════ */
-
-static int merge_obstacle_cols(const uint8_t *obstacle_mask_cols,
-                               int n_cols,
-                               int min_width,
-                               int max_col_gap,
-                               struct obstacle_region_t out[])
+static int merge_obstacle_cols(const uint8_t *om, int nc, int mw, int mcg,
+                               struct obstacle_region_t out[], int mx)
 {
-    /* obstacle_mask_cols[i] = 1 if column i is an obstacle, else 0 */
-    /* collect obstacle column indices */
-    int obs_cols[MAX_IMAGE_HEIGHT];  /* reuse; n_cols ≤ MAX_IMAGE_HEIGHT */
-    int n_obs = 0;
-
-    for (int i = 0; i < n_cols; i++) {
-        if (obstacle_mask_cols[i])
-            obs_cols[n_obs++] = i;
+    static int ocb[MAX_IMAGE_HEIGHT]; int no = 0;
+    for (int i = 0; i < nc && no < MAX_IMAGE_HEIGHT; i++) if (om[i]) ocb[no++] = i;
+    if (no == 0) return 0;
+    int cnt = 0, s = ocb[0], e = ocb[0];
+    for (int i = 1; i < no; i++) {
+        if (ocb[i] - e <= mcg) e = ocb[i];
+        else { int w = e-s+1; if (w >= mw && cnt < mx) { out[cnt].start=s; out[cnt].width=w; cnt++; } s=ocb[i]; e=ocb[i]; }
     }
-
-    if (n_obs == 0) return 0;
-
-    /* merge adjacent columns with gap ≤ max_col_gap */
-    int count = 0;
-    int start = obs_cols[0];
-    int end   = obs_cols[0];
-
-    for (int i = 1; i < n_obs; i++) {
-        if (obs_cols[i] - end <= max_col_gap) {
-            end = obs_cols[i];
-        } else {
-            int w = end - start + 1;
-            if (w >= min_width && count < MAX_OBSTACLE_REGIONS) {
-                out[count].start = (uint16_t)start;
-                out[count].width = (uint16_t)w;
-                count++;
-            }
-            start = obs_cols[i];
-            end   = obs_cols[i];
-        }
-    }
-    /* last region */
-    {
-        int w = end - start + 1;
-        if (w >= min_width && count < MAX_OBSTACLE_REGIONS) {
-            out[count].start = (uint16_t)start;
-            out[count].width = (uint16_t)w;
-            count++;
-        }
-    }
-
-    return count;
+    { int w = e-s+1; if (w >= mw && cnt < mx) { out[cnt].start=s; out[cnt].width=w; cnt++; } }
+    return cnt;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  7.  BASELINE UPDATE + OBSTACLE DETECTION
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-uint8_t update_and_detect(const int                  boundary_row[],
-                          int                        h,        /* "image_height" = cols of original img */
-                          int                        w,        /* number of boundary entries = rows of original img */
-                          float                      ground_baseline[],
-                          int                       *baseline_inited,
-                          int                        min_width,
-                          int                        obstacle_threshold,
-                          int                        no_ground_baseline,
-                          int                        max_col_gap,
-                          struct obstacle_region_t    obstacles_out[])
+uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
+                          int mw, int ot, int ngb, int mcg,
+                          struct obstacle_region_t oo[])
 {
     float alpha = DEFAULT_BASELINE_ALPHA;
-
-    if (!(*baseline_inited)) {
-        /* initialise baseline from first frame */
-        for (int i = 0; i < w; i++) {
-            if (boundary_row[i] < h)
-                ground_baseline[i] = (float)boundary_row[i];
-            else
-                ground_baseline[i] = (float)no_ground_baseline;
-        }
-        *baseline_inited = 1;
-        return 0;   /* no obstacles on first frame */
+    if (!(*bi)) {
+        for (int i = 0; i < w; i++) gb[i] = (br[i] < h) ? (float)br[i] : (float)ngb;
+        *bi = 1; return 0;
     }
-
-    /* classify each column */
-    static uint8_t obs_col_mask[MAX_IMAGE_HEIGHT];  /* 1 = obstacle column */
-    static uint8_t no_obs_mask[MAX_IMAGE_HEIGHT];   /* 1 = valid, not obstacle */
-    memset(obs_col_mask, 0, w);
-    memset(no_obs_mask, 0, w);
-
+    static uint8_t om[MAX_IMAGE_HEIGHT], nom[MAX_IMAGE_HEIGHT];
+    memset(om, 0, w); memset(nom, 0, w);
     for (int i = 0; i < w; i++) {
-        int valid    = (boundary_row[i] < h);
-        int no_ground = !valid;
-
-        if (valid) {
-            float deviation = (float)boundary_row[i] - ground_baseline[i];
-            if (deviation > (float)obstacle_threshold) {
-                obs_col_mask[i] = 1;
-            } else {
-                no_obs_mask[i] = 1;
-            }
-        }
-        if (no_ground) {
-            obs_col_mask[i] = 1;
-        }
+        int v = br[i] < h;
+        if (v) { float d = (float)br[i] - gb[i]; if (d > (float)ot) om[i] = 1; else nom[i] = 1; }
+        else om[i] = 1;
     }
-
-    /* merge obstacle columns into regions (in flipped coordinate space) */
-    struct obstacle_region_t flipped_regions[MAX_OBSTACLE_REGIONS];
-    int n_flipped = merge_obstacle_cols(obs_col_mask, w, min_width, max_col_gap, flipped_regions);
-
-    /* update baseline for non-obstacle valid columns */
-    for (int i = 0; i < w; i++) {
-        if (no_obs_mask[i]) {
-            ground_baseline[i] = (1.0f - alpha) * ground_baseline[i]
-                               + alpha * (float)boundary_row[i];
-        }
+    struct obstacle_region_t fl[MAX_OBSTACLE_REGIONS];
+    int nf = merge_obstacle_cols(om, w, mw, mcg, fl, MAX_OBSTACLE_REGIONS);
+    for (int i = 0; i < w; i++)
+        if (nom[i]) gb[i] = (1.0f - alpha) * gb[i] + alpha * (float)br[i];
+    float lg = (float)ngb;
+    for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
+    int no = 0;
+    for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
+        int s = fl[i].start, rw = fl[i].width, e = s + rw - 1;
+        int left = h - 1 - e; if (left < 0) left = 0;
+        oo[no].start = (uint16_t)left; oo[no].width = (uint16_t)rw; no++;
     }
-
-    /* forward-fill: propagate last good baseline value */
-    float last_good = (float)no_ground_baseline;
-    for (int i = 0; i < w; i++) {
-        if (no_obs_mask[i]) {
-            last_good = ground_baseline[i];
-        } else {
-            ground_baseline[i] = last_good;
-        }
-    }
-
-    /* ── convert flipped regions back to original coordinates ─────────── */
-    /* Python:  left = W - 1 - e   where W = h (the original image height / col count)
-     *          but wait, "h" here is the column count of the original image.
-     *
-     *  Actually in the Python:
-     *    boundary_rows has w entries (one per row of flipped mask = H of original image)
-     *    update_and_detect receives: boundary_row, h=W, ground_baseline
-     *    obstacle_regions are (start, end, width) in the row-index space
-     *    Then:  left = W - 1 - end
-     *
-     *  In our C code:
-     *    w = number of boundary entries = H of original image
-     *    h = column count = W of original image
-     *    flipped_regions[i].start = start row index
-     *    flipped_regions[i].width = width
-     *    end = start + width - 1
-     *
-     *  Convert:  left_original = h - 1 - (start + width - 1) = h - start - width
-     *            Wait no. The Python uses W-1-e where e = end column.
-     *            But flipped_regions are in the row-index space, not column space.
-     *
-     *  Hmm, I need to re-read the Python carefully.
-     *
-     *  In the Python get_obstacle_info:
-     *    - clean_mask[:, ::-1] flips columns (horizontal flip)
-     *    - find_ground_boundary iterates rows of flipped mask
-     *      (each row = horizontal scanline, shape[0]=H rows, shape[1]=W cols)
-     *    - boundary_rows has H entries (one per row)
-     *    - update_and_detect(boundary_rows, W, ground_baseline, ...)
-     *      inside: boundary_row has len = H entries
-     *              h = W
-     *              obstacle_cols are indices into boundary_row (row indices = 0..H-1)
-     *              obstacle_regions are (start_row, end_row, width_in_rows)
-     *    - Then: left = W - 1 - e  ... NO that doesn't make sense either.
-     *
-     *  Wait, looking at the Python more carefully:
-     *    for (s, e, w) in obstacle_regions:
-     *        left = W - 1 - e
-     *        rows.append([int(left), int(w), DET_OBSTACLE])
-     *
-     *  obstacle_regions come from get_obstacle_regions(obstacle_cols) where
-     *  obstacle_cols are row indices (0..H-1).
-     *
-     *  But the flipping was on columns: mask_flipped = clean_mask[:, ::-1]
-     *  So column j in original → column (W-1-j) in flipped.
-     *
-     *  The boundary scan iterates ROWS (axis 0) and scans along COLUMNS (axis 1).
-     *  Then deviation is computed per ROW.  Obstacle columns = row indices where
-     *  the boundary deviates.
-     *
-     *  So obstacle_regions' start/end are ROW indices.
-     *  left = W - 1 - e ... W is the column count.  That doesn't map row→column.
-     *
-     *  Wait, I think I was wrong. Let me re-read:
-     *    H, W = image_bgr.shape[:2]   →  H=height, W=width
-     *    mask has shape (H, W)
-     *    mask_flipped = clean_mask[:, ::-1]  → shape (H, W)
-     *
-     *    find_ground_boundary(mask_rotated=mask_flipped):
-     *      image_height = mask_rotated.shape[1] = W
-     *      n_rows = mask_rotated.shape[0] = H
-     *
-     *    The function iterates idx in range(n_rows) = range(H)
-     *    For each row, scans along axis 1 (W columns) from right (bottom conceptually)
-     *    boundary_rows[idx] = position along the W-axis
-     *
-     *    update_and_detect(boundary_row, h=W, ground_baseline):
-     *      Valid = boundary_row < h = boundary_row < W
-     *      deviation = boundary_row - ground_baseline
-     *      obstacle_cols = row indices where deviation > threshold (these are H-axis indices)
-     *      obstacle_regions = merged groups of these row indices
-     *
-     *    So obstacle_regions (s, e, w) have s,e as row indices (0..H-1)
-     *    Then: left = W - 1 - e   →  this maps a row index to... a column?
-     *
-     *    That seems wrong unless the image is rotated 90°.
-     *
-     *    OH WAIT. The image is from a drone camera that is mounted sideways!
-     *    Looking at the display code:
-     *      image_rot = cv2.rotate(image_display, cv2.ROTATE_90_COUNTERCLOCKWISE)
-     *
-     *    So the camera image is rotated 90° CCW for display.
-     *    The "rows" of the original image are actually vertical columns in the
-     *    physical scene.
-     *
-     *    After CCW rotation, original row r → becomes column (H-1-r) in the
-     *    rotated view.  And obstacle_regions' start/end are row indices.
-     *
-     *    left = W - 1 - e  ... hmm, but W is column count of original.
-     *
-     *    Actually I think there might be a coordinate system issue I'm over-thinking.
-     *    Let me just match the Python output exactly.
-     *
-     *    The key thing for the drone is: obstacles_out[i].start and .width
-     *    are what get sent via ABI to the autopilot.
-     *
-     *    In the C caller (team10_ground_detection.c), obstacles are printed as:
-     *      printf("Obstacle %d: left=%d width=%d\n", i, global_obstacles[i].start, global_obstacles[i].width);
-     *
-     *    In the Python:
-     *      for (s, e, w) in obstacle_regions:
-     *          left = W - 1 - e
-     *          rows.append([int(left), int(w), DET_OBSTACLE])
-     *
-     *    So the output "left" = W - 1 - end_row_index.
-     *
-     *    W = image_bgr.shape[1] = original image width (= number of columns).
-     *    But the boundary scan was on rows (shape[0] = H).
-     *
-     *    Hmm, unless the image width and height are swapped because of the
-     *    sideways camera.  Let me check the calling code:
-     *
-     *    In team10_ground_detection.c:
-     *      get_obstacle_info(img, ...)
-     *
-     *    img->w = image width, img->h = image height as reported by the camera.
-     *
-     *    I think the Python code works with the assumption that the image is
-     *    landscape (wider than tall) but displayed rotated.  The "left" in the
-     *    obstacle output refers to a position in the rotated (display) view.
-     *
-     *    For the C code, I'll match the Python's output transform exactly:
-     *      left = img->w - 1 - (region_end_in_row_space)
-     *
-     *    No wait, in the Python W = image_bgr.shape[1] which is the second
-     *    dimension = columns = width.  And the boundary has H entries (one per
-     *    row).  obstacle_regions has (start, end, width) where start/end are
-     *    row indices (0..H-1).
-     *
-     *    left = W - 1 - e   ... this is using W (columns) to transform a
-     *    row index e.  This only makes sense if H == W, which generally isn't true.
-     *
-     *    OR... the Python code has a convention where the image dimensions
-     *    are such that H < W and the scan happens in a particular way.
-     *
-     *    Actually, I think I might be wrong. Let me re-check.  The Python code
-     *    uses shape[:2] which returns (rows, cols) = (H, W).  The flipped mask
-     *    still has shape (H, W).  find_ground_boundary iterates H rows, each
-     *    of length W.  boundary_rows has H entries, values in [0, W).
-     *    update_and_detect receives boundary_rows and h=W.
-     *
-     *    In update_and_detect:
-     *      obstacle_cols = np.where(obstacle_mask)[0]
-     *      This returns indices where obstacle_mask is True.
-     *      obstacle_mask has len = len(boundary_row) = H.
-     *      So obstacle_cols are indices 0..H-1.
-     *
-     *    get_obstacle_regions receives obstacle_cols (indices 0..H-1):
-     *      returns regions (start, end, width) where start,end ∈ [0, H-1].
-     *
-     *    Then: left = W - 1 - e.
-     *    If e can be up to H-1 and W != H, this can go negative.
-     *    This seems like a bug in the Python... or I'm misunderstanding.
-     *
-     *    Let me look at the Python main() display code:
-     *      for (start_col, end_col, width) in obstacle_regions_raw:
-     *          y_top = int(min(boundary_rows[start_col:end_col + 1]))
-     *
-     *    Here boundary_rows is indexed by start_col..end_col which are the
-     *    region row indices.  And y_top is a column value (boundary position
-     *    within a row, in the range [0, W)).  This is drawn on the rotated image.
-     *
-     *    So the variable names "start_col" / "end_col" in the display code
-     *    actually refer to row indices used as column positions in the rotated view.
-     *
-     *    After 90° CCW rotation:
-     *      rotated image has shape (W, H)  (width becomes height, height becomes width)
-     *      Original pixel (row_r, col_c) → rotated pixel (col_c, H-1-row_r)
-     *      Or equivalently: rotated_x = row_r, rotated_y = col_c  (for CCW rotation)
-     *
-     *    Actually for cv2.ROTATE_90_COUNTERCLOCKWISE:
-     *      rotated[x][y] = original[y][W-1-x]   ... wait, let me think.
-     *      For 90° CCW: new shape is (W, H).
-     *      new(row, col) = original(col, W - 1 - row)
-     *      So: new_row = original_col, new_col = W - 1 - original_row
-     *
-     *    So original row r becomes new column = W - 1 - r.
-     *    And in the rotated view, "left" of an obstacle = W - 1 - end_row_index
-     *    because end_row_index maps to the leftmost column in rotated space.
-     *
-     *    OK so: left = W - 1 - e  is correct for the rotated display.
-     *    But W here should actually be... hmm.
-     *
-     *    Actually wait. I just realized: in the Python:
-     *      H, W = image_bgr.shape[:2]
-     *    Then the obstacle info returns [left, w, type] where left is computed as:
-     *      left = W - 1 - e
-     *    And e is a row index (0..H-1).
-     *
-     *    But the rotated image has original rows becoming columns:
-     *      new_col = W - 1 - original_row   (from 90° CCW rotation)
-     *
-     *    Wait no, that's wrong. For 90° CCW rotation of an image with shape (H, W):
-     *      new image has shape (W, H)
-     *      Mapping: new_pixel(new_r, new_c) = old_pixel(new_c, W - 1 - new_r)
-     *      Or equivalently: old_pixel(r, c) → new_pixel(W - 1 - c, r)
-     *      So: new_row = W - 1 - old_col, new_col = old_row
-     *
-     *    So original row r → new column r.
-     *    Original col c → new row W - 1 - c.
-     *
-     *    Hmm, then obstacle region at rows [s, e] in original →
-     *    columns [s, e] in rotated.
-     *    left in rotated = s (the start row index).
-     *
-     *    But the Python says left = W - 1 - e.  That uses W (original width = cols).
-     *
-     *    There must be something else going on.  Let me look at what the drone
-     *    autopilot actually needs.  The ABI message just sends local_obstacles
-     *    and obstacle_count.  The autopilot interprets start and width.
-     *
-     *    For the C code, I'll just reproduce the Python's transform exactly:
-     *      left = W_original - 1 - region_end
-     *    where region_end = region_start + region_width - 1 (in the row-index space).
-     *
-     *    Hmm actually, W in the Python = img->w in C (the camera image width).
-     *    And the regions are over H rows (img->h in C).
-     *    So left = img->w - 1 - end.
-     *
-     *    As long as H <= W (which it typically is for landscape cameras), this
-     *    won't go negative.  And for the sideways-mounted camera on the drone,
-     *    the physical meaning makes sense.
-     *
-     *    OK, I'll just implement it as-is and trust the Python.
-     */
-
-    int n_out = 0;
-    for (int i = 0; i < n_flipped; i++) {
-        int s = flipped_regions[i].start;
-        int region_w = flipped_regions[i].width;
-        int e = s + region_w - 1;
-
-        int left = h - 1 - e;   /* h = column count of original image (W in Python) */
-        if (left < 0) left = 0;
-
-        if (n_out < MAX_OBSTACLE_REGIONS) {
-            obstacles_out[n_out].start = (uint16_t)left;
-            obstacles_out[n_out].width = (uint16_t)region_w;
-            n_out++;
-        }
-    }
-
-    return (uint8_t)n_out;
+    return (uint8_t)no;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  8.  MAIN PIPELINE FUNCTION
+ *  9-15. PLANT DETECTION
  * ══════════════════════════════════════════════════════════════════════════════ */
-
-uint8_t get_obstacle_info(
-        struct image_t            *img,
-        float                      ground_baseline[],
-        int                       *baseline_inited,
-        float                      oa_color_count_frac,
-        int                        median_ksize,
-        int                        min_width,
-        struct obstacle_region_t   obstacles_out[],
-        int                        boundary_rows_out[],
-        int                       *ground_found_out,
-        float                     *green_frac_out)
+void detect_all_green_lax(struct image_t *img, int sn, int sd, int bk,
+                          uint8_t mo[], int *pwo, int *pho)
 {
-    int w = img->w;
-    int h = img->h;
+    int w = img->w, h = img->h;
+    const uint8_t *buf = (const uint8_t *)img->buf;
+    int pw = (w * sn) / sd, ph = (h * sn) / sd;
+    if (pw < 1) pw = 1; if (ph < 1) ph = 1;
+    if (pw > MAX_PLANT_WIDTH) pw = MAX_PLANT_WIDTH;
+    if (ph > MAX_PLANT_HEIGHT) ph = MAX_PLANT_HEIGHT;
+    *pwo = pw; *pho = ph;
 
-    /* safety: clamp to buffer sizes */
-    if (w > MAX_IMAGE_WIDTH)  w = MAX_IMAGE_WIDTH;
+    for (int py = 0; py < ph; py++) {
+        int sy = (py * sd) / sn; if (sy >= h) sy = h - 1;
+        for (int px = 0; px < pw; px++) {
+            int sx = (px * sd) / sn; if (sx >= w) sx = w - 1;
+            uint8_t Y = yuv422_Y(buf, w, sx, sy);
+            uint8_t U = yuv422_U(buf, w, sx, sy);
+            uint8_t V = yuv422_V(buf, w, sx, sy);
+            plant_green_small[py * pw + px] = (U <= LAX_GREEN_U_MAX && V <= LAX_GREEN_V_MAX &&
+                                                Y >= LAX_GREEN_Y_MIN && Y <= LAX_GREEN_Y_MAX) ? 255 : 0;
+        }
+    }
+    int lt = pw / 3;
+    for (int py = 0; py < ph; py++) for (int px = 0; px < lt; px++) plant_green_small[py * pw + px] = 0;
+
+    if (bk >= 3) {
+        int half = bk / 2;
+        for (int py = 0; py < ph; py++)
+            for (int px = 0; px < pw; px++) {
+                int sum = 0, cnt = 0;
+                int y0 = (py-half < 0) ? 0 : py-half, y1 = (py+half >= ph) ? ph-1 : py+half;
+                int x0 = (px-half < 0) ? 0 : px-half, x1 = (px+half >= pw) ? pw-1 : px+half;
+                for (int ky = y0; ky <= y1; ky++) for (int kx = x0; kx <= x1; kx++) { sum += plant_green_small[ky*pw+kx]; cnt++; }
+                plant_blur_buf[py * pw + px] = (sum / cnt > 127) ? 255 : 0;
+            }
+        memcpy(mo, plant_blur_buf, pw * ph);
+    } else memcpy(mo, plant_green_small, pw * ph);
+}
+
+static void downsample_nn(const uint8_t *s, int sw, int sh, uint8_t *d, int dw, int dh)
+{ for (int y = 0; y < dh; y++) { int sy = y*sh/dh; if(sy>=sh)sy=sh-1; for (int x = 0; x < dw; x++) { int sx = x*sw/dw; if(sx>=sw)sx=sw-1; d[y*dw+x] = s[sy*sw+sx]; } } }
+
+static void upsample_nn(const uint8_t *s, int sw, int sh, uint8_t *d, int dw, int dh)
+{ for (int y = 0; y < dh; y++) { int sy = y*sh/dh; if(sy>=sh)sy=sh-1; for (int x = 0; x < dw; x++) { int sx = x*sw/dw; if(sx>=sw)sx=sw-1; d[y*dw+x] = s[sy*sw+sx]; } } }
+
+uint8_t detect_plant_regions(const uint8_t pm[], int w, int h, int mw, int mpc, int mcg,
+                             struct obstacle_region_t po[])
+{
+    static uint8_t am[MAX_IMAGE_HEIGHT]; memset(am, 0, h);
+    for (int r = 0; r < h; r++) {
+        int mr = 0, cr = 0;
+        for (int c = 0; c < w; c++) { int fc = w-1-c; if (pm[r*w+fc]) { cr++; if (cr > mr) mr = cr; } else cr = 0; }
+        if (mr > mpc) am[r] = 1;
+    }
+    return (uint8_t)merge_obstacle_cols(am, h, mw, mcg, po, MAX_PLANT_REGIONS);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  MAIN PIPELINE
+ * ══════════════════════════════════════════════════════════════════════════════ */
+uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
+                          float oacf, int mk, int mw,
+                          struct obstacle_region_t oo[],
+                          struct obstacle_region_t po[], uint8_t *pco,
+                          int bro[], int *gfo, float *gfro)
+{
+    int w = img->w, h = img->h;
+    if (w > MAX_IMAGE_WIDTH) w = MAX_IMAGE_WIDTH;
     if (h > MAX_IMAGE_HEIGHT) h = MAX_IMAGE_HEIGHT;
 
-    /* ── Step 1+2: classify + median blur → binary mask ──────────────── */
-    float green_frac = 0.0f;
-    detect_green_ground_ml(img, work_mask, median_ksize, &green_frac);
+    float gf = 0.0f;
+    detect_green_ground_ml(img, work_mask, mk, &gf);
+    if (gfro) *gfro = gf;
+    int ground = (gf > oacf) ? 1 : 0;
+    if (gfo) *gfo = ground;
 
-    if (green_frac_out) *green_frac_out = green_frac;
-
-    int ground_found = (green_frac > oa_color_count_frac) ? 1 : 0;
-    if (ground_found_out) *ground_found_out = ground_found;
-
-    if (!ground_found) {
-        /* no ground → no obstacles, baseline unchanged */
-        return 0;
+    uint8_t no = 0;
+    if (ground) {
+        isolate_ground_blob(work_mask, w, h, DEFAULT_BLOB_AREA_THRESH);
+        fill_holes_mask(work_mask, w, h);
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) work_flipped[y*w+x] = work_mask[y*w+(w-1-x)];
+        static int bl[MAX_IMAGE_HEIGHT];
+        find_ground_boundary(work_flipped, w, h, bl, DEFAULT_MIN_GROUND_PX, DEFAULT_MAX_GAP, DEFAULT_SMOOTH_KERNEL);
+        if (bro) memcpy(bro, bl, h * sizeof(int));
+        no = update_and_detect(bl, w, h, gb, bi, mw, DEFAULT_OBSTACLE_THRESH, DEFAULT_NO_GROUND_BASE, DEFAULT_MAX_COL_GAP, oo);
     }
 
-    /* ── Step 3: connected-component blob filtering ──────────────────── */
-    isolate_ground_blob(work_mask, w, h, DEFAULT_BLOB_AREA_THRESH);
-
-    /* ── Step 4: fill holes in the mask ──────────────────────────────── */
-    fill_holes_mask(work_mask, w, h);
-
-    /* ── Step 5: flip mask left-right, then find ground boundary ─────── */
-    /* mask_flipped[row][col] = work_mask[row][(w-1) - col] */
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            work_flipped[y * w + x] = work_mask[y * w + (w - 1 - x)];
+    if (po != NULL) {
+        int pw = 0, ph = 0;
+        detect_all_green_lax(img, DEFAULT_PLANT_SCALE_NUM, DEFAULT_PLANT_SCALE_DEN,
+                             DEFAULT_PLANT_BLUR_KSIZE, plant_mask_small, &pw, &ph);
+        if (ground) downsample_nn(work_mask, w, h, plant_clean_small, pw, ph);
+        else memset(plant_clean_small, 0, pw * ph);
+        for (int i = 0; i < pw * ph; i++) {
+            int v = (int)plant_mask_small[i] - (int)plant_clean_small[i];
+            plant_mask_small[i] = (v > 0) ? (uint8_t)v : 0;
         }
-    }
+        upsample_nn(plant_mask_small, pw, ph, plant_mask_full, w, h);
+        uint8_t np = detect_plant_regions(plant_mask_full, w, h,
+                                          DEFAULT_PLANT_MIN_WIDTH, DEFAULT_PLANT_MIN_PX_COL,
+                                          DEFAULT_PLANT_MAX_COL_GAP, po);
+        if (pco) *pco = np;
+    } else { if (pco) *pco = 0; }
 
-    /* boundary has h entries (one per row) */
-    static int boundary_rows_local[MAX_IMAGE_HEIGHT];
-    find_ground_boundary(work_flipped, w, h,
-                         boundary_rows_local,
-                         DEFAULT_MIN_GROUND_PX,
-                         DEFAULT_MAX_GAP,
-                         DEFAULT_SMOOTH_KERNEL);
-
-    /* copy boundary to caller if requested */
-    if (boundary_rows_out) {
-        /* The caller's array is MAX_IMAGE_WIDTH but boundary has h entries */
-        memcpy(boundary_rows_out, boundary_rows_local, h * sizeof(int));
-    }
-
-    /* ── Step 6+7+8: update baseline and detect obstacles ────────────── */
-    uint8_t n_obstacles = update_and_detect(
-            boundary_rows_local,
-            w,   /* "h" param = column count of original image */
-            h,   /* "w" param = number of boundary entries = row count */
-            ground_baseline,
-            baseline_inited,
-            min_width,
-            DEFAULT_OBSTACLE_THRESH,
-            DEFAULT_NO_GROUND_BASE,
-            DEFAULT_MAX_COL_GAP,
-            obstacles_out);
-
-    return n_obstacles;
+    return no;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  DEBUG / VALIDATION HELPERS
- * ══════════════════════════════════════════════════════════════════════════════ */
-
-int dump_mask_to_file(const char *path, const uint8_t mask[], int w, int h)
-{
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    fwrite(mask, 1, w * h, f);
-    fclose(f);
-    return 0;
-}
-
-int dump_obstacles_to_file(const char *path,
-                           const struct obstacle_region_t obs[], int count)
-{
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    fprintf(f, "%d\n", count);
-    for (int i = 0; i < count; i++)
-        fprintf(f, "%d %d\n", obs[i].start, obs[i].width);
-    fclose(f);
-    return 0;
-}
+/* ── DEBUG ────────────────────────────────────────────────────────────────── */
+int dump_mask_to_file(const char *p, const uint8_t m[], int w, int h)
+{ FILE *f = fopen(p, "wb"); if (!f) return -1; fwrite(m, 1, w*h, f); fclose(f); return 0; }
+int dump_obstacles_to_file(const char *p, const struct obstacle_region_t o[], int c)
+{ FILE *f = fopen(p, "w"); if (!f) return -1; fprintf(f, "%d\n", c); for (int i = 0; i < c; i++) fprintf(f, "%d %d\n", o[i].start, o[i].width); fclose(f); return 0; }

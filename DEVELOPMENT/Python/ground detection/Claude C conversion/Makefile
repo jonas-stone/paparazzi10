@@ -1,37 +1,17 @@
-# ──────────────────────────────────────────────────────────────────────────────
-#  Makefile for team10 obstacle detection
-#
-#  Targets:
-#    make test       – build the standalone test binary (no Paparazzi needed)
-#    make validate   – build + run validation against Python reference
-#    make clean      – remove build artifacts
-# ──────────────────────────────────────────────────────────────────────────────
-
 CC      = gcc
 CFLAGS  = -O2 -Wall -Wno-unused-function -I.
 LDFLAGS = -lm
+COMMON  = team10_get_obstacle_info_standalone.c team10_get_obstacle_info.h
 
-# ── standalone test binary ───────────────────────────────────────────────────
+.PHONY: all test clean
 
-TEST_BIN  = test_obstacle_detection
-TEST_SRCS = test_obstacle_detection.c team10_get_obstacle_info_standalone.c
+all: test_obstacle_detection
 
-.PHONY: test validate clean
+test: test_obstacle_detection
+	@echo "Usage: ./test_obstacle_detection <yuv422> <w> <h> <outdir> [frames]"
 
-test: $(TEST_BIN)
-	@echo ""
-	@echo "Built $(TEST_BIN) successfully."
-	@echo "Usage:  ./$(TEST_BIN)  <raw_yuv422_file>  <width>  <height>  <output_dir>"
-
-$(TEST_BIN): $(TEST_SRCS) team10_get_obstacle_info.h
-	$(CC) $(CFLAGS) -o $@ $(TEST_SRCS) $(LDFLAGS)
-
-# ── validation run (requires Python + OpenCV) ────────────────────────────────
-
-validate: $(TEST_BIN)
-	@echo "Running Python validation..."
-	python3 validate_c_vs_python.py --src-dir . --work-dir /tmp/obstacle_validation $(IMAGE)
+test_obstacle_detection: test_obstacle_detection.c $(COMMON)
+	$(CC) $(CFLAGS) -o $@ test_obstacle_detection.c team10_get_obstacle_info_standalone.c $(LDFLAGS)
 
 clean:
-	rm -f $(TEST_BIN) *.o
-	rm -rf /tmp/obstacle_validation
+	rm -f test_obstacle_detection *.o
