@@ -8,17 +8,18 @@ import numpy as np
 import random
 import os
 
-def detect_edges(img_in, sigma=0):
+def detect_edges(img_in, sigma=0.01, scale=4, img_width=104*2, img_height=48*2):
     img = cv2.imread(img_in)
-    img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     if img is None:
         raise FileNotFoundError(f"Could not read image: {img_in}")
 
+    img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # blurred = cv2.GaussianBlur(input=gray, sigmaX=5, sigmaY=5, order=0.000000000000001)
     blurred = cv2.GaussianBlur(src=gray, ksize=(5, 5), sigmaX=sigma, sigmaY=sigma)
     edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
+    edges = cv2.resize(edges, (img_width, img_height), interpolation=cv2.INTER_NEAREST)
 
     # Partition into 3 vertical sections
     h, w = edges.shape
@@ -31,24 +32,20 @@ def detect_edges(img_in, sigma=0):
         density = np.sum(part > 0) / part.size
         print(f"{name} density: {density:.4f}")
 
-    # cv2.imshow("Original", img) # Comment or un-comment to see the original
-    # cv2.imshow("Canny Edges", edges)
-    # Convert gray edges to BGR so it can be stacked with the color image
+    img_resized = cv2.resize(img, (img_width, img_height))
     edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+    combined = np.hstack((img_resized, edges_bgr))
 
-    # Stack side by side
-    combined = np.hstack((img, edges_bgr))
-
-    cv2.imshow("Original | Canny Edges", combined)
-
+    combined_big = cv2.resize(combined, (img_width * 2 * scale, img_height * scale), interpolation=cv2.INTER_NEAREST)
+    cv2.imshow("Original | Canny Edges", combined_big)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
+detect_edges(r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260313-100130\70964142.jpg",scale=4, img_width=104*2, img_height=48*2)
 
 
-detect_edges("../../downloads from drone/20240322-084506/350680718.jpg")
-# # def random_image(folder):
+
 # #     """
 # #     Function to select a random image in a folder
 # #     """
