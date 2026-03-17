@@ -2,11 +2,13 @@
  * team10_get_obstacle_info.h
  *
  * Ground detection and obstacle finding pipeline.
+ * Designed to be included by team10_ground_detection_copy.c.
  *
  * Changelog vs. previous version
  * --------------------------------
- * 1. Added MAX_IMAGE_HEIGHT constant (matches MAX_IMAGE_WIDTH = 520).
- * 2. No changes to any public function signatures.
+ * 1. update_and_detect: added max_col_gap parameter.
+ * 2. get_obstacle_info: added min_ground_pixels, max_gap, smooth_kernel
+ *    and max_col_gap parameters.
  */
 
 #ifndef TEAM10_GET_OBSTACLES_INFO_H
@@ -24,7 +26,6 @@
 #define NO_GROUND_BASELINE   220.0f
 #define MAX_OBSTACLE_REGIONS 8
 #define MAX_IMAGE_WIDTH      520
-#define MAX_IMAGE_HEIGHT     520   /* added: needed for static buffer sizing */
 
 /* ------------------------------------------------------------------ */
 /* Shared struct                                                        */
@@ -53,13 +54,13 @@ struct obstacle_region_t {
  *
  * Classifies every pixel of a YUV422 image with the decision-tree
  * ground classifier, writes a binary grayscale mask (255 = ground,
- * 0 = not ground), optionally applies a 3x3 median blur, and returns
+ * 0 = not ground), optionally applies a 3×3 median blur, and returns
  * the ground fraction plus a found/not-found flag.
  *
  * @param input          Source IMAGE_YUV422
  * @param mask_out       Pre-created IMAGE_GRAYSCALE, same dimensions
- * @param threshold      Fraction in [0,1]; above this -> ground found
- * @param apply_median   Non-zero -> apply 3x3 median blur on the mask
+ * @param threshold      Fraction in [0,1]; above this → ground found
+ * @param apply_median   Non-zero → apply 3×3 median blur on the mask
  * @param use_sim        0 = real flight (is_ground), 1 = simulator (is_ground_sim)
  * @param green_fraction OUTPUT: fraction of pixels classified as ground
  * @return               1 = GROUND FOUND, 0 = NO GROUND
@@ -78,7 +79,7 @@ int detect_green_ground_ml(struct image_t *input,
  * finds the row index of the ground boundary (furthest safe ground
  * pixel), then smooths the result with a 1-D median filter.
  *
- * @param mask_flipped       IMAGE_GRAYSCALE, dimensions W x H
+ * @param mask_flipped       IMAGE_GRAYSCALE, dimensions W × H
  * @param boundary_rows_out  Caller-supplied int array of length W.
  *                           Set to H when no ground found in that column.
  * @param min_ground_pixels  Minimum ground pixels required at far edge
@@ -119,7 +120,7 @@ uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
  *
  * @param boundary_row    int array of length `width` (current boundaries)
  * @param width           Image width
- * @param h               Image height; boundary_row[x] >= h -> no ground
+ * @param h               Image height; boundary_row[x] >= h → no ground
  * @param ground_baseline Float array of length `width` (persistent state)
  * @param baseline_inited Flag; set to 0 before the very first call
  * @param min_width       Minimum obstacle region width to report
@@ -139,13 +140,10 @@ uint8_t update_and_detect(const int  *boundary_row,
 /**
  * get_obstacle_info
  *
- * Full pipeline: ground mask -> blob isolation -> hole filling ->
- *                boundary finding -> obstacle detection.
+ * Full pipeline: ground mask → boundary finding → obstacle detection.
  * Results are expressed in original (un-flipped) image coordinates.
- *
- * NEW vs. previous version: the raw mask is now cleaned by
- * isolate_ground_blob() + fill_holes() before boundary detection,
- * matching the Python pipeline. Function signature is UNCHANGED.
+ * Also overwrites the source YUV buffer with the ground mask so the
+ * drone video stream shows what the classifier sees (debug view).
  *
  * @param input               Source IMAGE_YUV422
  * @param ground_baseline     Float array of length input->w (persistent)
