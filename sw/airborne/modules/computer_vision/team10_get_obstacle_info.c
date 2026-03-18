@@ -507,12 +507,62 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     int nf = merge_obstacle_cols(om, w, mw, mcg, fl, MAX_OBSTACLE_REGIONS);
     for (int i = 0; i < w; i++)
         if (nom[i]) gb[i] = (1.0f - alpha) * gb[i] + alpha * (float)br[i];
+    /* Two-pass propagation: left-to-right, then right-to-left, take min */
     float lg = (float)ngb;
-    for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
+    for (int i = 0; i < w; i++) {
+        if (nom[i]) lg = gb[i];
+        else gb[i] = lg;  /* left neighbor's value */
+    }
+
+    /* Right-to-left pass */
+    float rg = (float)ngb;
+    for (int i = w - 1; i >= 0; i--) {
+        if (nom[i]) {
+            rg = gb[i];
+        } else {
+            /* If we haven't seen ANY valid ground to the right yet, 
+               force it to the default low baseline, ignoring the left anchor. */
+            if (rg == (float)ngb) {
+                gb[i] = (float)ngb;
+            } else {
+                /* Keep the MINIMUM (visually highest) of left-propagated and right-propagated */
+                if (rg < gb[i]) {
+                    gb[i] = rg;
+                }
+            }
+        }
+    }
     int no = 0;
     for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
+        if (fl[i].width < 5) continue;
         oo[no].start = (uint16_t)fl[i].start;
         oo[no].width = (uint16_t)fl[i].width;
+
+        int s = fl[i].start;
+        int e = s + fl[i].width - 1;
+        
+        int max_br = 0; 
+        int valid_points = 0;
+        
+        for (int r = s; r <= e; r++) {
+            if (r < w) {
+                // br[r] == h means "no ground found".
+                if (br[r] < h) {
+                    if (br[r] > max_br) {
+                        max_br = br[r];
+                    }
+                    valid_points++;
+                }
+            }
+        }
+        
+        // NEW LOGIC: If the entire obstacle blocked the ground line (no valid points), 
+        // immediately set it to the default low baseline (ngb).
+        if (valid_points == 0) {
+            max_br = ngb;
+        }
+        
+        oo[no].baseline_height = (uint16_t)max_br;
         no++;
     }
     return (uint8_t)no;

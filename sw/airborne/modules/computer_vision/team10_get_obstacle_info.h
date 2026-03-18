@@ -47,7 +47,7 @@
 #define DEFAULT_MAX_GAP           10
 #define DEFAULT_SMOOTH_KERNEL     5
 #define DEFAULT_OBSTACLE_THRESH   50
-#define DEFAULT_NO_GROUND_BASE    220
+#define DEFAULT_NO_GROUND_BASE    235
 #define DEFAULT_BLOB_AREA_THRESH  1000
 #define DEFAULT_BASELINE_ALPHA    0.6f
 
@@ -78,6 +78,7 @@
 struct obstacle_region_t {
     uint16_t start;
     uint16_t width;
+    uint16_t baseline_height;
 };
 
 /* ══════════════════════════════════════════════════════════════════════════════

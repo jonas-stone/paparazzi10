@@ -138,12 +138,14 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
 
     /* ── Scale coordinates back to native resolution ──────────────────────── */
     for (int i = 0; i < obstacle_count; i++) {
-        local_obstacles[i].start = (uint16_t)((local_obstacles[i].start * SCALE_DEN) / SCALE_NUM);
-        local_obstacles[i].width = (uint16_t)((local_obstacles[i].width * SCALE_DEN) / SCALE_NUM);
+        local_obstacles[i].start           = (uint16_t)((local_obstacles[i].start * SCALE_DEN) / SCALE_NUM);
+        local_obstacles[i].width           = (uint16_t)((local_obstacles[i].width * SCALE_DEN) / SCALE_NUM);
+        local_obstacles[i].baseline_height = (uint16_t)((local_obstacles[i].baseline_height * SCALE_DEN) / SCALE_NUM);
     }
     for (int i = 0; i < plant_count; i++) {
-        local_plants[i].start = (uint16_t)((local_plants[i].start * SCALE_DEN) / SCALE_NUM);
-        local_plants[i].width = (uint16_t)((local_plants[i].width * SCALE_DEN) / SCALE_NUM);
+        local_plants[i].start           = (uint16_t)((local_plants[i].start * SCALE_DEN) / SCALE_NUM);
+        local_plants[i].width           = (uint16_t)((local_plants[i].width * SCALE_DEN) / SCALE_NUM);
+        local_plants[i].baseline_height = 0;  /* not meaningful for plants */
     }
 
     /* ── Copy to globals ──────────────────────────────────────────────────── */

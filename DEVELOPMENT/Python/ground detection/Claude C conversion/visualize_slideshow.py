@@ -48,7 +48,7 @@ class ImageT(ctypes.Structure):
     ]
 
 class ObstacleRegionT(ctypes.Structure):
-    _fields_ = [("start", ctypes.c_uint16), ("width", ctypes.c_uint16)]
+    _fields_ = [("start", ctypes.c_uint16), ("width", ctypes.c_uint16), ("baseline_height", ctypes.c_uint16)]
 
 # Setup paths for auto-compilation
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,13 +105,14 @@ def bgr_to_uyvy_bytes(bgr):
 def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
                         boundary_rows, ground_baseline, label):
     vis = img_rot.copy()
-    h_rot = vis.shape[0] # This is 240
-    w_rot = vis.shape[1] # This is 520
+    h_rot = vis.shape[0] # This is 240 (original image row-wise, rotated width)
+    w_rot = vis.shape[1] # This is 520 (original image column-wise, rotated height)
 
     if ground_baseline is not None:
         valid = ground_baseline < h_rot
         rv = np.where(valid)[0]
         if len(rv) > 1:
+            # Drawing on the rotated image, so x=column index (r), y=ground_baseline[r]
             pts = np.array([[int(r), int(ground_baseline[r])] for r in rv], np.int32)
             cv2.polylines(vis, [pts], False, (255, 0, 0), 1)
 
@@ -124,7 +125,7 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
 
     # Draw Obstacles exactly as C outputs them
     for region in obs_regions_raw:
-        s, e, w = int(region[0]), int(region[1]), int(region[2])
+        s, e, w, bh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
         if boundary_rows is not None:
             b_slice = boundary_rows[s:e+1]
             vb = b_slice[b_slice < h_rot]
@@ -138,9 +139,20 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
         ov = vis.copy()
         cv2.rectangle(vis, (s, 0), (e, h_rot-1), (0, 0, 255), 2)
         cv2.putText(vis, f"w={w}", (s, max(15, yt-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,255), 1)
+        
+        # Original text display
+        # cv2.putText(vis, f"h={bh}", (s, max(30, yt-20)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,150,255), 1)
+
+        # Updated display for h=bh and the white horizontal line
+        y_text = max(30, yt-20)
+        cv2.putText(vis, f"h={bh}", (s, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,150,255), 1)
+        
+        # Calculate the y-coordinate for the line, slightly below the text baseline
+        y_line = min(bh, h_rot - 1)
+        cv2.line(vis, (s, y_line), (e, y_line), (255, 255, 255), 1)
 
     for region in plant_regions_raw:
-        s, e, w = int(region[0]), int(region[1]), int(region[2])
+        s, e, w, bh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
         cv2.rectangle(vis, (s, 0), (e, h_rot-1), (0, 255, 0), 2)
         cv2.putText(vis, f"p={w}", (s, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 1)
 
@@ -205,8 +217,8 @@ def main():
             H, W = bgr.shape[:2]
             
             # Clamp target dimensions so they never exceed C's buffers
-            tW = max(1, int(W * 0.8))
-            tH = max(1, int(H * 0.8))
+            tW = max(1, int(W))#max(1, int(W * 0.8))
+            tH = max(1, int(H))#max(1, int(H * 0.8))
             
             bgr_s = cv2.resize(bgr, (tW, tH), interpolation=cv2.INTER_AREA)
             uyvy_bytes = bgr_to_uyvy_bytes(bgr_s)
@@ -238,13 +250,13 @@ def main():
 
             obs_raw = []
             for i in range(num_obs):
-                s, w = obs_out[i].start, obs_out[i].width
-                obs_raw.append((s, s + w - 1, w))
+                s, w, bh = obs_out[i].start, obs_out[i].width, obs_out[i].baseline_height
+                obs_raw.append((s, s + w - 1, w, bh))
 
             plt_raw = []
             for i in range(num_plants):
                 s, w = plants_out[i].start, plants_out[i].width
-                plt_raw.append((s, s + w - 1, w))
+                plt_raw.append((s, s + w - 1, w, 0))
             
             # Safe read from C buffers
             mask_ptr = lib.get_work_mask()
@@ -282,7 +294,7 @@ def main():
                     f"Frame {idx}/{len(paths)}", f"{name}", f"",
                     f"Status: {st}", f"Green:  {green_frac_out.value:.3f}", f"",
                     f"Obstacles: {num_obs}",
-                ] + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])}" for i, r in enumerate(obs_raw)] + [
+                ] + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])} h={int(r[3])}" for i, r in enumerate(obs_raw)] + [
                     f"", f"Plants: {num_plants}",
                 ] + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])}" for i, r in enumerate(plt_raw)] + [
                     f"", f"{'PAUSED' if paused else 'PLAYING'}  delay={a.delay}ms",
