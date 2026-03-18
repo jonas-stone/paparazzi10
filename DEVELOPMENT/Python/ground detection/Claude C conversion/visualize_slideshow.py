@@ -4,17 +4,31 @@ visualize_slideshow.py
 
 Continuous slideshow: processes every image in a folder through the
 COMPILED C PIPELINE and displays detections in real-time.
+Includes auto-compilation and VS Code hardcoded arguments.
 """
 import os
 import sys
 import argparse
 import ctypes
+import subprocess
 import numpy as np
 import cv2
 from glob import glob
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  C-TYPES BINDINGS
+#  OVERRIDE FOR VS CODE RUN BUTTON (HARDCODED ARGS)
+# ═══════════════════════════════════════════════════════════════════════════════
+if len(sys.argv) == 1:
+    sys.argv = [
+        "visualize_slideshow.py",
+        "/home/jonas/paparazzi/DEVELOPMENT/downloads from drone/20260306-095826/",
+        "--python-dir", "/home/jonas/paparazzi/DEVELOPMENT/Python/ground detection/",
+        "--start", "300",
+        "--delay", "50"
+    ]
+# "/home/jonas/paparazzi/DEVELOPMENT/downloads from drone/20260313-100130/",
+# ═══════════════════════════════════════════════════════════════════════════════
+#  C-TYPES BINDINGS & AUTO-COMPILATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FloatEulers(ctypes.Structure):
@@ -36,10 +50,32 @@ class ImageT(ctypes.Structure):
 class ObstacleRegionT(ctypes.Structure):
     _fields_ = [("start", ctypes.c_uint16), ("width", ctypes.c_uint16)]
 
+# Setup paths for auto-compilation
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+lib_path = os.path.join(SCRIPT_DIR, 'libobstacle.so')
+c_wrapper_path = os.path.join(SCRIPT_DIR, 'c_wrapper.c')
+
+# Auto-compile if the library doesn't exist
+if not os.path.exists(lib_path):
+    print(f"⚙️  {lib_path} not found! Compiling automatically...")
+    try:
+        subprocess.run(
+            ["gcc", "-shared", "-fPIC", "-O3", "-o", lib_path, c_wrapper_path],
+            check=True
+        )
+        print("✅ Compilation successful!")
+    except subprocess.CalledProcessError:
+        print(f"❌ ERROR: Compilation failed. Please check {c_wrapper_path} for errors.")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("❌ ERROR: 'gcc' not found. Please ensure build-essential is installed.")
+        sys.exit(1)
+
+# Load the library
 try:
-    lib = ctypes.CDLL(os.path.abspath('./libobstacle.so'))
-except OSError:
-    print("ERROR: Could not load libobstacle.so. Did you compile c_wrapper.c?")
+    lib = ctypes.CDLL(lib_path)
+except OSError as e:
+    print(f"ERROR: Could not load {lib_path}. Details: {e}")
     sys.exit(1)
 
 lib.get_obstacle_info.argtypes = [
@@ -118,6 +154,7 @@ def main():
     p.add_argument("folder")
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--delay", type=int, default=50, help="ms between frames (default 50)")
+    p.add_argument("--python-dir", type=str, help="Path to Python directory") # Added to prevent crash
     a = p.parse_args()
 
     paths = sorted(glob(os.path.join(a.folder, "*.jpg")))
@@ -170,8 +207,6 @@ def main():
             # Clamp target dimensions so they never exceed C's buffers
             tW = max(1, int(W * 0.8))
             tH = max(1, int(H * 0.8))
-            # tW = min(MAX_IMAGE_WIDTH, max(1, W))
-            # tH = min(MAX_IMAGE_HEIGHT, max(1, H))
             
             bgr_s = cv2.resize(bgr, (tW, tH), interpolation=cv2.INTER_AREA)
             uyvy_bytes = bgr_to_uyvy_bytes(bgr_s)
@@ -218,7 +253,7 @@ def main():
             pmask_ptr = lib.get_plant_mask()
             plant_mask = np.ctypeslib.as_array(pmask_ptr, shape=(tH, tW)).copy()
 
-            # FIX: Read up to tH (520) because the arrays represent rows of the rotated image
+            # Read up to tH (520) because the arrays represent rows of the rotated image
             boundary = np.array([boundary_arr[i] for i in range(tH)])
             py_baseline = np.array([ground_baseline_arr[i] for i in range(tH)]) if baseline_inited.value else None
 
