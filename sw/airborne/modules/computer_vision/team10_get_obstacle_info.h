@@ -1,184 +1,122 @@
 /*
  * team10_get_obstacle_info.h
  *
- * Ground detection and obstacle finding pipeline.
- *
- * Changelog vs. previous version
- * --------------------------------
- * 1. Added MAX_IMAGE_HEIGHT constant (matches MAX_IMAGE_WIDTH = 520).
- * 2. No changes to any public function signatures.
+ * Complete C port of the Python obstacle+plant detection pipeline
+ * including is_smooth_blob (perimeter ratio + fractal dimension).
  */
 
-#ifndef TEAM10_GET_OBSTACLES_INFO_H
-#define TEAM10_GET_OBSTACLES_INFO_H
+#ifndef TEAM10_GET_OBSTACLE_INFO_H
+#define TEAM10_GET_OBSTACLE_INFO_H
 
-#include "modules/computer_vision/lib/vision/image.h"
 #include <stdint.h>
+#include <stdbool.h>
 
-/* ------------------------------------------------------------------ */
-/* Constants                                                            */
-/* ------------------------------------------------------------------ */
+/* ── image dimensions (both 520 to handle sideways camera) ─────────────────── */
+#ifndef MAX_IMAGE_WIDTH
+#define MAX_IMAGE_WIDTH   520
+#endif
+#ifndef MAX_IMAGE_HEIGHT
+#define MAX_IMAGE_HEIGHT  520
+#endif
 
-#define OBSTACLE_ALPHA       0.6f
-#define OBSTACLE_THRESHOLD   50.0f
-#define NO_GROUND_BASELINE   220.0f
-#define MAX_OBSTACLE_REGIONS 8
-#define MAX_IMAGE_WIDTH      520
-#define MAX_IMAGE_HEIGHT     520   /* added: needed for static buffer sizing */
+/* buffer size includes +2 padding for smooth blob analysis */
+#define MAX_PIXELS ((MAX_IMAGE_WIDTH + 2) * (MAX_IMAGE_HEIGHT + 2))
 
-/* ------------------------------------------------------------------ */
-/* Shared struct                                                        */
-/* ------------------------------------------------------------------ */
+/* ── output limits ─────────────────────────────────────────────────────────── */
+#ifndef MAX_OBSTACLE_REGIONS
+#define MAX_OBSTACLE_REGIONS 20
+#endif
+#ifndef MAX_PLANT_REGIONS
+#define MAX_PLANT_REGIONS 20
+#endif
 
-/**
- * A contiguous obstacle region expressed in original (un-flipped)
- * image column coordinates.
- *
- *  start : leftmost column  (inclusive)
- *  end   : rightmost column (inclusive)
- *  width : end - start + 1
- */
+#ifndef MAX_CC_LABELS
+#define MAX_CC_LABELS 512
+#endif
+
+/* ── detection type flags ──────────────────────────────────────────────────── */
+#define DET_OBSTACLE  0
+#define DET_PLANT     1
+
+/* ── obstacle pipeline defaults (calibrated for full resolution) ───────────── */
+#define DEFAULT_OA_COLOR_FRAC     0.05f
+#define DEFAULT_MEDIAN_KSIZE      5
+#define DEFAULT_MIN_WIDTH         20
+#define DEFAULT_MAX_COL_GAP       5
+#define DEFAULT_MIN_GROUND_PX     5
+#define DEFAULT_MAX_GAP           10
+#define DEFAULT_SMOOTH_KERNEL     5
+#define DEFAULT_OBSTACLE_THRESH   50
+#define DEFAULT_NO_GROUND_BASE    220
+#define DEFAULT_BLOB_AREA_THRESH  1000
+#define DEFAULT_BASELINE_ALPHA    0.6f
+
+/* ── smooth blob thresholds ────────────────────────────────────────────────── */
+#define SMOOTH_PERIMETER_RATIO_THRESH  2.0f
+#define SMOOTH_FRACTAL_DIM_THRESH      1.3f
+
+/* ── plant pipeline defaults ───────────────────────────────────────────────── */
+#define DEFAULT_PLANT_SCALE_NUM     3
+#define DEFAULT_PLANT_SCALE_DEN    25
+#define DEFAULT_PLANT_BLUR_KSIZE    3
+#define DEFAULT_PLANT_MIN_WIDTH    20
+#define DEFAULT_PLANT_MIN_PX_COL    2
+#define DEFAULT_PLANT_MAX_COL_GAP   5
+
+#define MAX_PLANT_WIDTH  ((MAX_IMAGE_WIDTH  * DEFAULT_PLANT_SCALE_NUM / DEFAULT_PLANT_SCALE_DEN) + 2)
+#define MAX_PLANT_HEIGHT ((MAX_IMAGE_HEIGHT * DEFAULT_PLANT_SCALE_NUM / DEFAULT_PLANT_SCALE_DEN) + 2)
+
+/* ── lax green thresholds (YUV, 0-255) ─────────────────────────────────────── */
+#define LAX_GREEN_Y_MIN   29
+#define LAX_GREEN_Y_MAX  140
+#define LAX_GREEN_U_MIN    0
+#define LAX_GREEN_U_MAX  116
+#define LAX_GREEN_V_MIN    0
+#define LAX_GREEN_V_MAX  141
+
+/* ── region descriptor ─────────────────────────────────────────────────────── */
 struct obstacle_region_t {
-  uint16_t start;
-  uint16_t end;
-  uint16_t width;
+    uint16_t start;
+    uint16_t width;
 };
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                           */
-/* ------------------------------------------------------------------ */
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  PUBLIC API
+ * ══════════════════════════════════════════════════════════════════════════════ */
+struct image_t;
 
-/**
- * detect_green_ground_ml
- *
- * Classifies every pixel of a YUV422 image with the decision-tree
- * ground classifier, writes a binary grayscale mask (255 = ground,
- * 0 = not ground), optionally applies a 3x3 median blur, and returns
- * the ground fraction plus a found/not-found flag.
- *
- * @param input          Source IMAGE_YUV422
- * @param mask_out       Pre-created IMAGE_GRAYSCALE, same dimensions
- * @param threshold      Fraction in [0,1]; above this -> ground found
- * @param apply_median   Non-zero -> apply 3x3 median blur on the mask
- * @param use_sim        0 = real flight (is_ground), 1 = simulator (is_ground_sim)
- * @param green_fraction OUTPUT: fraction of pixels classified as ground
- * @return               1 = GROUND FOUND, 0 = NO GROUND
- */
-int detect_green_ground_ml(struct image_t *input,
-                           struct image_t *mask_out,
-                           float           threshold,
-                           int             apply_median,
-                           int             use_sim,
-                           float          *green_fraction);
+uint8_t get_obstacle_info(
+        struct image_t            *img,
+        float                      ground_baseline[],
+        int                       *baseline_inited,
+        float                      oa_color_count_frac,
+        int                        median_ksize,
+        int                        min_width,
+        struct obstacle_region_t   obstacles_out[],
+        struct obstacle_region_t   plants_out[],
+        uint8_t                   *plant_count_out,
+        int                        boundary_rows_out[],
+        int                       *ground_found_out,
+        float                     *green_frac_out
+);
 
-/**
- * find_ground_boundary
- *
- * For each column of a horizontally-flipped grayscale ground mask,
- * finds the row index of the ground boundary (furthest safe ground
- * pixel), then smooths the result with a 1-D median filter.
- *
- * @param mask_flipped       IMAGE_GRAYSCALE, dimensions W x H
- * @param boundary_rows_out  Caller-supplied int array of length W.
- *                           Set to H when no ground found in that column.
- * @param min_ground_pixels  Minimum ground pixels required at far edge
- * @param max_gap            Maximum gap allowed inside a ground run
- * @param smooth_kernel      Odd window size for 1-D median smoothing
- */
-void find_ground_boundary(const struct image_t *mask_flipped,
-                          int                  *boundary_rows_out,
-                          int                   min_ground_pixels,
-                          int                   max_gap,
-                          int                   smooth_kernel);
+/* ── exposed helpers for testing ───────────────────────────────────────────── */
+uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V);
+void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[], int median_ksize, float *green_frac_out);
+void isolate_ground_blob(uint8_t mask[], int w, int h, int blob_area_threshold);
+void fill_holes_mask(uint8_t mask[], int w, int h);
+void find_ground_boundary(const uint8_t mask_flipped[], int w, int h, int boundary_out[], int min_ground_pixels, int max_gap, int smooth_kernel);
+uint8_t update_and_detect(const int boundary_row[], int h, int w, float ground_baseline[], int *baseline_inited, int min_width, int obstacle_threshold, int no_ground_baseline, int max_col_gap, struct obstacle_region_t obstacles_out[]);
+void detect_all_green_lax(struct image_t *img, int scale_num, int scale_den, int blur_ksize, uint8_t plant_mask_out[], int *pw_out, int *ph_out);
+uint8_t detect_plant_regions(const uint8_t plant_mask[], int w, int h, int min_width, int min_pixels_per_col, int max_col_gap, struct obstacle_region_t plants_out[]);
 
-/**
- * get_obstacle_regions
- *
- * Groups a sorted list of obstacle column indices into contiguous
- * regions, bridging gaps of at most max_col_gap columns and keeping
- * only regions with width >= min_width.
- *
- * @param obstacle_cols  Sorted array of obstacle column indices
- * @param n_cols         Length of obstacle_cols
- * @param min_width      Minimum region width to keep
- * @param max_col_gap    Maximum gap to bridge
- * @param regions_out    Caller-supplied array, size MAX_OBSTACLE_REGIONS
- * @return               Number of regions written
- */
-uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
-                            int                       n_cols,
-                            int                       min_width,
-                            int                       max_col_gap,
-                            struct obstacle_region_t *regions_out);
+/* smooth blob analysis */
+int  compute_blob_perimeter(const int16_t *labels, int w, int h, int16_t lbl);
+float compute_fractal_dimension(const int16_t *labels, int w, int h, int16_t lbl);
+int  is_smooth_blob(const int16_t *labels, int w, int h, int16_t lbl, int blob_area, int bb_height);
 
-/**
- * update_and_detect
- *
- * Updates the rolling ground baseline with an EMA and detects obstacle
- * regions by comparing the current boundary against the baseline.
- *
- * @param boundary_row    int array of length `width` (current boundaries)
- * @param width           Image width
- * @param h               Image height; boundary_row[x] >= h -> no ground
- * @param ground_baseline Float array of length `width` (persistent state)
- * @param baseline_inited Flag; set to 0 before the very first call
- * @param min_width       Minimum obstacle region width to report
- * @param max_col_gap     Maximum column gap to bridge when grouping regions
- * @param regions_out     Caller-supplied array, size MAX_OBSTACLE_REGIONS
- * @return                Number of obstacle regions (0 on first call)
- */
-uint8_t update_and_detect(const int  *boundary_row,
-                        int         width,
-                        int         h,
-                        float      *ground_baseline,
-                        int        *baseline_inited,
-                        int         min_width,
-                        int         max_col_gap,
-                        struct obstacle_region_t *regions_out);
+/* debug */
+int dump_mask_to_file(const char *path, const uint8_t mask[], int w, int h);
+int dump_obstacles_to_file(const char *path, const struct obstacle_region_t obs[], int count);
 
-/**
- * get_obstacle_info
- *
- * Full pipeline: ground mask -> blob isolation -> hole filling ->
- *                boundary finding -> obstacle detection.
- * Results are expressed in original (un-flipped) image coordinates.
- *
- * NEW vs. previous version: the raw mask is now cleaned by
- * isolate_ground_blob() + fill_holes() before boundary detection,
- * matching the Python pipeline. Function signature is UNCHANGED.
- *
- * @param input               Source IMAGE_YUV422
- * @param ground_baseline     Float array of length input->w (persistent)
- * @param baseline_inited     Flag pointer; set to 0 before first call
- * @param oa_color_count_frac Ground fraction threshold
- * @param median_ksize        Odd kernel for median blur (0/1 = skip)
- * @param min_width           Minimum obstacle region width (columns)
- * @param min_ground_pixels   Minimum ground pixels at the far edge per col
- * @param max_gap             Maximum gap allowed inside a ground run
- * @param smooth_kernel       Odd kernel size for 1-D boundary smoothing
- * @param max_col_gap         Maximum column gap when grouping obstacle cols
- * @param use_sim             0 = real flight (is_ground), 1 = simulator (is_ground_sim)
- * @param obstacles_out       Caller array of obstacle_region_t,
- *                            size MAX_OBSTACLE_REGIONS
- * @param boundary_rows_out   Caller int array of length input->w
- * @param ground_found_out    OUTPUT: 1 if ground was detected, else 0
- * @param green_frac_out      OUTPUT: ground pixel fraction (may be NULL)
- * @return                    Number of obstacles found (0 when no ground)
- */
-uint8_t get_obstacle_info(struct image_t           *input,
-                        float                    *ground_baseline,
-                        int                      *baseline_inited,
-                        float                     oa_color_count_frac,
-                        int                       median_ksize,
-                        int                       min_width,
-                        int                       min_ground_pixels,
-                        int                       max_gap,
-                        int                       smooth_kernel,
-                        int                       max_col_gap,
-                        int                       use_sim,
-                        struct obstacle_region_t *obstacles_out,
-                        int                      *boundary_rows_out,
-                        int                      *ground_found_out,
-                        float                    *green_frac_out);
-
-#endif /* TEAM10_GET_OBSTACLES_INFO_H */
+#endif

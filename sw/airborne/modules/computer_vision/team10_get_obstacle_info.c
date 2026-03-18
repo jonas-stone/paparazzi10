@@ -1,852 +1,611 @@
 /*
- * team10_get_obstacle_info.c
- *
- * Ground detection and obstacle finding pipeline.
- *
- * NOTE: ALL THESE FUNCTIONS WORK WITH A ROTATED IMAGE
- * (ground is on the left) ON PURPOSE.
- *
- * Changelog vs. previous version
- * --------------------------------
- * 1. Added fill_holes(): flood-fill from borders to detect and fill
- *    enclosed zero regions inside the ground blob.
- * 2. Added isolate_ground_blob(): two-pass union-find connected
- *    components that removes small blobs (area < BLOB_AREA_THRESHOLD)
- *    and spiky blobs (perimeter/equiv_rect_perimeter >= SMOOTH_PERIM_RATIO).
- *    This mirrors colored_blob_separator.py: isolate_ground_blob() +
- *    fill_holes(). The fractal-dimension check from solidity_detection.py
- *    is intentionally omitted — the perimeter ratio alone is sufficient.
- * 3. get_obstacle_info() now calls isolate_ground_blob() → fill_holes()
- *    on the raw mask before boundary detection. Function signature and
- *    return semantics are UNCHANGED.
+ * team10_get_obstacle_info.c — Paparazzi build.
+ * Complete pipeline with is_smooth_blob (perimeter + fractal dimension).
+ * Same algorithm as _standalone.c, with real Paparazzi includes.
  */
 
-#include "modules/computer_vision/team10_get_obstacle_info.h"
+#include "team10_get_obstacle_info.h"
 #include "modules/computer_vision/lib/vision/image.h"
-#include <stdint.h>
+
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 
-/* ================================================================== */
-/* INTERNAL CONSTANTS                                                   */
-/* ================================================================== */
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  STATIC WORK BUFFERS
+ * ══════════════════════════════════════════════════════════════════════════════ */
+#define MAX_PLANT_PIXELS (MAX_PLANT_WIDTH * MAX_PLANT_HEIGHT)
 
-/*
- * Maximum image height for static buffer sizing.
- * 520 matches MAX_IMAGE_WIDTH and covers all Bebop camera configs.
- */
-#define MAX_IMAGE_HEIGHT       520
+static uint8_t  work_mask[MAX_PIXELS];
+static uint8_t  work_mask2[MAX_PIXELS];
+static int16_t  work_labels[MAX_PIXELS];
+static uint8_t  work_visited[MAX_PIXELS];   /* also used as padded blob mask */
+static uint8_t  work_flipped[MAX_PIXELS];   /* also used as edge image       */
+static int32_t  ff_queue[MAX_PIXELS];
+static int16_t  uf_parent[MAX_CC_LABELS];
+static int32_t  cc_area[MAX_CC_LABELS];
+static int16_t  cc_bb_x0[MAX_CC_LABELS];    /* bounding box per label */
+static int16_t  cc_bb_x1[MAX_CC_LABELS];
+static int16_t  cc_bb_y0[MAX_CC_LABELS];
+static int16_t  cc_bb_y1[MAX_CC_LABELS];
 
-/*
- * Connected-components parameters.
- * MAX_CC_LABELS: maximum number of provisional labels in one frame.
- *   128 is generous — typical frames have < 10 distinct blobs.
- */
-#define MAX_CC_LABELS          128
-#define BLOB_AREA_THRESHOLD    1000   /* pixels, mirrors Python default  */
-#define SMOOTH_PERIM_RATIO     2.0f   /* perimeter / equiv_rect threshold */
+static uint8_t  plant_green_small[MAX_PLANT_PIXELS];
+static uint8_t  plant_blur_buf[MAX_PLANT_PIXELS];
+static uint8_t  plant_clean_small[MAX_PLANT_PIXELS];
+static uint8_t  plant_mask_small[MAX_PLANT_PIXELS];
+static uint8_t  plant_mask_full[MAX_PIXELS];
 
-/* ================================================================== */
-/* FILE-SCOPE STATIC BUFFERS  (BSS — zero-initialised at startup)      */
-/* ================================================================== */
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  YUV422 (UYVY) PIXEL ACCESS
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static inline uint8_t yuv422_Y(const uint8_t *buf, int w, int x, int y)
+{ return buf[y * w * 2 + x * 2 + 1]; }
+static inline uint8_t yuv422_U(const uint8_t *buf, int w, int x, int y)
+{ return buf[y * w * 2 + (x & ~1) * 2]; }
+static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
+{ return buf[y * w * 2 + (x & ~1) * 2 + 2]; }
 
-/*
- * cc_label_map: provisional + resolved connected-component labels.
- * One byte per pixel; fits 520×520 = 270 400 bytes (~264 KB).
- */
-static uint8_t cc_label_map[MAX_IMAGE_HEIGHT * MAX_IMAGE_WIDTH];
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  1. DECISION TREE (exact match of Python is_ground)
+ * ══════════════════════════════════════════════════════════════════════════════ */
+/* Uncomment ONE of these: */
+// #define GROUND_TREE_REAL
+#define GROUND_TREE_SIM
 
-/* ================================================================== */
-/* FORWARD DECLARATIONS FOR FILE-PRIVATE HELPERS                        */
-/* ================================================================== */
-
-static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V);
-static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V);
-static void apply_ground_mask(struct image_t *input, struct image_t *mask, int use_sim);
-static void median_blur_3x3(struct image_t *mask, struct image_t *blurred);
-static uint8_t median_of_9(uint8_t *v);
-static void insertion_sort_9(uint8_t *v);
-static void insertion_sort_f(float *v, int n);
-static void median_filter_1d(const float *data, const uint8_t *valid_mask,
-                              int n, int kernel, float *out);
-static void flip_horizontal(const struct image_t *src, struct image_t *dst);
-static void fill_holes(uint8_t *mask, int w, int h);
-static void isolate_ground_blob(uint8_t *mask, int w, int h);
-
-
-/* ================================================================== */
-/* SECTION 1 – Per-pixel ground classifiers (decision trees)           */
-/* ================================================================== */
-
-static inline uint8_t is_ground(uint8_t Y, uint8_t U, uint8_t V)
+/* --- DECISION TREE --- */
+uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
 {
+#ifdef GROUND_TREE_SIM
+    if (U <= 96) {
+        return (Y <= 102) ? 255 : 0;
+    } else if (U <= 97) {
+        return (V <= 126) ? 255 : 0;
+    } else {
+        return 0;
+    }
+#else
     if (U <= 115) {
         if (V <= 145) {
-            if (Y <= 85) {
-                return 0;
-            } else {
-                if (U <= 92) { return 0; } else { return 255; }
-            }
+            if (Y <= 85) return 0;
+            else         return (U <= 92) ? 0 : 255;
         } else {
-            if (V <= 152) {
-                if (Y <= 177) { return 255; } else { return 0; }
-            } else {
-                return 0;
-            }
+            if (V <= 152) return (Y <= 177) ? 255 : 0;
+            else          return 0;
         }
     } else {
         if (U <= 121) {
-            if (V <= 137) {
-                if (Y <= 87) { return 0; } else { return 255; }
-            } else {
-                return 0;
-            }
+            if (V <= 137) return (Y <= 87) ? 0 : 255;
+            else          return 0;
         } else {
             return 0;
         }
     }
+#endif
 }
 
-static inline uint8_t is_ground_sim(uint8_t Y, uint8_t U, uint8_t V)
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  2. BINARY MEDIAN BLUR (majority vote)
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static void median_blur_binary(const uint8_t *src, uint8_t *dst, int w, int h, int ksize)
 {
-    if (U <= 96) {
-        if (Y <= 102) { return 255; } else { return 0; }
-    } else {
-        if (U <= 97) {
-            if (V <= 126) { return 255; } else { return 0; }
-        } else {
-            return 0;
-        }
-    }
-}
-
-
-/* ================================================================== */
-/* SECTION 2 – Build grayscale mask from YUV422 image                  */
-/* ================================================================== */
-
-/*
- * UYVY macro-pixel layout (4 bytes → 2 pixels):
- *   byte 0 : U  (shared)
- *   byte 1 : Y0 (pixel 0)
- *   byte 2 : V  (shared)
- *   byte 3 : Y1 (pixel 1)
- */
-static void apply_ground_mask(struct image_t *input, struct image_t *mask, int use_sim)
-{
-    uint8_t *src  = (uint8_t *)input->buf;
-    uint8_t *dest = (uint8_t *)mask->buf;
-
-    for (uint16_t y = 0; y < input->h; y++) {
-        for (uint16_t x = 0; x < input->w; x += 2) {
-            uint8_t U  = src[0];
-            uint8_t Y0 = src[1];
-            uint8_t V  = src[2];
-            uint8_t Y1 = src[3];
-
-            if (use_sim) {
-                dest[0] = is_ground_sim(Y0, U, V);
-                dest[1] = is_ground_sim(Y1, U, V);
-            } else {
-                dest[0] = is_ground(Y0, U, V);
-                dest[1] = is_ground(Y1, U, V);
-            }
-
-            src  += 4;
-            dest += 2;
-        }
-    }
-}
-
-
-/* ================================================================== */
-/* SECTION 3 – 3×3 median blur on a grayscale mask                    */
-/* ================================================================== */
-
-static void insertion_sort_9(uint8_t *v)
-{
-    for (int i = 1; i < 9; i++) {
-        uint8_t key = v[i];
-        int j = i - 1;
-        while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
-        v[j + 1] = key;
-    }
-}
-
-static uint8_t median_of_9(uint8_t *v)
-{
-    insertion_sort_9(v);
-    return v[4];
-}
-
-static void median_blur_3x3(struct image_t *mask, struct image_t *blurred)
-{
-    uint8_t  *src  = (uint8_t *)mask->buf;
-    uint8_t  *dest = (uint8_t *)blurred->buf;
-    uint16_t  w    = mask->w;
-    uint16_t  h    = mask->h;
-
-    /* Border pixels copied as-is */
-    memcpy(dest, src, (uint32_t)w * h);
-
-    for (uint16_t y = 1; y < h - 1; y++) {
-        for (uint16_t x = 1; x < w - 1; x++) {
-            uint8_t window[9];
-            int idx = 0;
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    window[idx++] = src[(y + dy) * w + (x + dx)];
-                }
-            }
-            dest[y * w + x] = median_of_9(window);
-        }
-    }
-}
-
-
-/* ================================================================== */
-/* SECTION 4 – detect_green_ground_ml (public)                         */
-/* ================================================================== */
-
-int detect_green_ground_ml(struct image_t *input,
-                           struct image_t *mask_out,
-                           float           threshold,
-                           int             apply_median,
-                           int             use_sim,
-                           float          *green_fraction)
-{
-    apply_ground_mask(input, mask_out, use_sim);
-
-    if (apply_median) {
-        struct image_t tmp;
-        image_create(&tmp, mask_out->w, mask_out->h, IMAGE_GRAYSCALE);
-        median_blur_3x3(mask_out, &tmp);
-        image_switch(mask_out, &tmp);
-        image_free(&tmp);
-    }
-
-    uint8_t  *buf         = (uint8_t *)mask_out->buf;
-    uint32_t  total       = (uint32_t)mask_out->w * (uint32_t)mask_out->h;
-    uint32_t  green_count = 0;
-
-    for (uint32_t i = 0; i < total; i++) {
-        if (buf[i] != 0) green_count++;
-    }
-
-    float frac = (total > 0) ? ((float)green_count / (float)total) : 0.0f;
-    if (green_fraction != NULL) *green_fraction = frac;
-
-    return (frac > threshold) ? 1 : 0;
-}
-
-
-/* ================================================================== */
-/* SECTION 5 – 1-D median filter (for boundary smoothing)              */
-/* ================================================================== */
-
-static void insertion_sort_f(float *v, int n)
-{
-    for (int i = 1; i < n; i++) {
-        float key = v[i];
-        int   j   = i - 1;
-        while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
-        v[j + 1] = key;
-    }
-}
-
-static void median_filter_1d(const float   *data,
-                              const uint8_t *valid_mask,
-                              int            n,
-                              int            kernel,
-                              float         *out)
-{
-    memcpy(out, data, (uint32_t)n * sizeof(float));
-
-    int   half = kernel / 2;
-    float window[32];
-
-    for (int i = 0; i < n; i++) {
-        if (!valid_mask[i]) continue;
-
-        for (int k = -half; k <= half; k++) {
-            int idx = i + k;
-            if (idx < 0)  idx = -idx;
-            if (idx >= n) idx = 2 * (n - 1) - idx;
-            if (idx < 0)  idx = 0;
-            if (idx >= n) idx = n - 1;
-            window[k + half] = data[idx];
-        }
-
-        insertion_sort_f(window, kernel);
-        out[i] = window[half];
-    }
-}
-
-
-/* ================================================================== */
-/* SECTION 6 – find_ground_boundary (public)                           */
-/* ================================================================== */
-
-void find_ground_boundary(const struct image_t *mask_flipped,
-                          int                  *boundary_rows_out,
-                          int                   min_ground_pixels,
-                          int                   max_gap,
-                          int                   smooth_kernel)
-{
-    int            image_height = mask_flipped->w;
-    int            n_rows       = mask_flipped->h;
-    const uint8_t *buf          = (const uint8_t *)mask_flipped->buf;
-
-    uint16_t green_pos[MAX_IMAGE_WIDTH];
-
-    for (int i = 0; i < n_rows; i++) {
-        boundary_rows_out[i] = image_height;
-    }
-
-    for (int idx = 0; idx < n_rows; idx++) {
-        const uint8_t *row = buf + idx * image_height;
-
-        int n_green = 0;
-        for (int c = 0; c < image_height; c++) {
-            if (row[c] > 0) green_pos[n_green++] = (uint16_t)c;
-        }
-
-        if (n_green == 0) continue;
-
-        int ground_valid = 0;
-        {
+    int half = ksize / 2, threshold = (ksize * ksize) / 2;
+    for (int y = 0; y < h; y++) {
+        int y0 = (y - half < 0) ? 0 : y - half;
+        int y1 = (y + half >= h) ? h - 1 : y + half;
+        for (int x = 0; x < w; x++) {
             int count = 0;
-            for (int c = image_height - min_ground_pixels; c < image_height; c++) {
-                if (row[c] > 0) count++;
-            }
-            ground_valid = (count >= min_ground_pixels);
-        }
-
-        if (!ground_valid) {
-            int max_run = 1, cur_run = 1;
-            for (int i = 1; i < n_green; i++) {
-                if (green_pos[i] - green_pos[i - 1] == 1) {
-                    cur_run++;
-                    if (cur_run > max_run) max_run = cur_run;
-                } else {
-                    cur_run = 1;
-                }
-            }
-            if (max_run < max_gap) continue;
-        }
-
-#define GP(i) green_pos[n_green - 1 - (i)]
-
-        if (n_green == 1) {
-            boundary_rows_out[idx] = GP(0);
-            continue;
-        }
-
-        int first_big_gap = -1;
-        for (int i = 0; i < n_green - 1; i++) {
-            int gap = (int)GP(i) - (int)GP(i + 1) - 1;
-            if (gap > max_gap) { first_big_gap = i; break; }
-        }
-
-        if (first_big_gap < 0) {
-            boundary_rows_out[idx] = GP(n_green - 1);
-            continue;
-        }
-
-        int fg               = first_big_gap;
-        int pending_boundary = GP(fg);
-        int after_size       = n_green - 1 - fg;
-
-        if (after_size >= max_gap) {
-            int max_run = 1, cur_run = 1;
-            for (int i = 1; i < after_size; i++) {
-                int g = (int)GP(fg + 1 + i - 1) - (int)GP(fg + 1 + i) - 1;
-                if (g == 0) {
-                    cur_run++;
-                    if (cur_run > max_run) max_run = cur_run;
-                } else {
-                    cur_run = 1;
-                }
-            }
-            if (max_run >= max_gap) {
-                boundary_rows_out[idx] = GP(n_green - 1);
-                continue;
-            }
-        }
-
-        boundary_rows_out[idx] = pending_boundary;
-
-#undef GP
-    }
-
-    if (smooth_kernel >= 3 && smooth_kernel % 2 == 1) {
-        uint8_t valid_mask[MAX_IMAGE_WIDTH];
-        int     valid_count = 0;
-
-        for (int i = 0; i < n_rows; i++) {
-            valid_mask[i] = (boundary_rows_out[i] < image_height) ? 1 : 0;
-            if (valid_mask[i]) valid_count++;
-        }
-
-        if (valid_count > smooth_kernel) {
-            float data[MAX_IMAGE_WIDTH];
-            float smoothed[MAX_IMAGE_WIDTH];
-
-            for (int i = 0; i < n_rows; i++) {
-                data[i] = (float)boundary_rows_out[i];
-            }
-
-            median_filter_1d(data, valid_mask, n_rows, smooth_kernel, smoothed);
-
-            for (int i = 0; i < n_rows; i++) {
-                if (valid_mask[i]) boundary_rows_out[i] = (int)(smoothed[i] + 0.5f);
-            }
+            int x0 = (x - half < 0) ? 0 : x - half;
+            int x1 = (x + half >= w) ? w - 1 : x + half;
+            for (int ky = y0; ky <= y1; ky++)
+                for (int kx = x0; kx <= x1; kx++)
+                    if (src[ky * w + kx]) count++;
+            dst[y * w + x] = (count > threshold) ? 255 : 0;
         }
     }
 }
 
-
-/* ================================================================== */
-/* SECTION 7 – get_obstacle_regions (public)                           */
-/* ================================================================== */
-
-uint8_t get_obstacle_regions(const uint16_t           *obstacle_cols,
-                            int                       n_cols,
-                            int                       min_width,
-                            int                       max_col_gap,
-                            struct obstacle_region_t *regions_out)
+void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[],
+                            int median_ksize, float *green_frac_out)
 {
-    if (n_cols == 0) return 0;
-
-    uint8_t  n_regions = 0;
-    uint16_t start     = obstacle_cols[0];
-    uint16_t end       = obstacle_cols[0];
-
-    for (int i = 1; i < n_cols; i++) {
-        uint16_t col = obstacle_cols[i];
-
-        if ((int)(col - end) <= max_col_gap) {
-            end = col;
-        } else {
-            uint16_t w = end - start + 1;
-            if (w >= (uint16_t)min_width && n_regions < MAX_OBSTACLE_REGIONS) {
-                regions_out[n_regions].start = start;
-                regions_out[n_regions].end   = end;
-                regions_out[n_regions].width = w;
-                n_regions++;
-            }
-            start = col;
-            end   = col;
-        }
-    }
-
-    /* Close final region */
-    uint16_t w = end - start + 1;
-    if (w >= (uint16_t)min_width && n_regions < MAX_OBSTACLE_REGIONS) {
-        regions_out[n_regions].start = start;
-        regions_out[n_regions].end   = end;
-        regions_out[n_regions].width = w;
-        n_regions++;
-    }
-
-    return n_regions;
+    int w = img->w, h = img->h;
+    const uint8_t *buf = (const uint8_t *)img->buf;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            work_mask2[y * w + x] = is_ground_pixel(
+                yuv422_Y(buf, w, x, y), yuv422_U(buf, w, x, y), yuv422_V(buf, w, x, y));
+    if (median_ksize >= 3 && (median_ksize & 1))
+        median_blur_binary(work_mask2, mask_out, w, h, median_ksize);
+    else
+        memcpy(mask_out, work_mask2, w * h);
+    int gc = 0, total = w * h;
+    for (int i = 0; i < total; i++) if (mask_out[i]) gc++;
+    if (green_frac_out) *green_frac_out = total > 0 ? (float)gc / total : 0.0f;
 }
 
-
-/* ================================================================== */
-/* SECTION 8 – update_and_detect (public)                              */
-/* ================================================================== */
-
-uint8_t update_and_detect(const int  *boundary_row,
-                        int         width,
-                        int         h,
-                        float      *ground_baseline,
-                        int        *baseline_inited,
-                        int         min_width,
-                        int         max_col_gap,
-                        struct obstacle_region_t *regions_out)
-{
-    if (!(*baseline_inited)) {
-        for (int x = 0; x < width; x++) {
-            ground_baseline[x] = (boundary_row[x] >= h)
-                                 ? NO_GROUND_BASELINE
-                                 : (float)boundary_row[x];
-        }
-        *baseline_inited = 1;
-        return 0;
-    }
-
-    uint16_t obstacle_cols[MAX_IMAGE_WIDTH];
-    int      n_obstacle_cols = 0;
-
-    uint8_t valid[MAX_IMAGE_WIDTH];
-    uint8_t deviation_obstacle[MAX_IMAGE_WIDTH];
-    uint8_t no_obstacle_mask[MAX_IMAGE_WIDTH];
-
-    for (int x = 0; x < width; x++) {
-        valid[x] = (boundary_row[x] < h) ? 1 : 0;
-
-        float deviation       = (float)boundary_row[x] - ground_baseline[x];
-        deviation_obstacle[x] = (valid[x] && deviation > OBSTACLE_THRESHOLD) ? 1 : 0;
-
-        if (deviation_obstacle[x] || !valid[x]) {
-            obstacle_cols[n_obstacle_cols++] = (uint16_t)x;
-        }
-
-        no_obstacle_mask[x] = (valid[x] && !deviation_obstacle[x]) ? 1 : 0;
-    }
-
-    uint8_t n_regions = get_obstacle_regions(obstacle_cols, n_obstacle_cols,
-                                            min_width, max_col_gap, regions_out);
-
-    for (int x = 0; x < width; x++) {
-        if (no_obstacle_mask[x]) {
-            ground_baseline[x] = (1.0f - OBSTACLE_ALPHA) * ground_baseline[x]
-                                + OBSTACLE_ALPHA * (float)boundary_row[x];
-        }
-    }
-
-    float last_good = NO_GROUND_BASELINE;
-    for (int x = 0; x < width; x++) {
-        if (no_obstacle_mask[x]) {
-            last_good = ground_baseline[x];
-        } else {
-            ground_baseline[x] = last_good;
-        }
-    }
-
-    return n_regions;
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  3. CONNECTED COMPONENTS (union-find, 8-connectivity, with bounding boxes)
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static void uf_init(int n) { for (int i = 0; i < n; i++) uf_parent[i] = (int16_t)i; }
+static int16_t uf_find(int16_t x) {
+    while (uf_parent[x] != x) { uf_parent[x] = uf_parent[uf_parent[x]]; x = uf_parent[x]; } return x;
+}
+static void uf_union(int16_t a, int16_t b) {
+    a = uf_find(a); b = uf_find(b);
+    if (a != b) { if (a < b) uf_parent[b] = a; else uf_parent[a] = b; }
 }
 
-
-/* ================================================================== */
-/* SECTION 9 – flip_horizontal (file-private helper)                   */
-/* ================================================================== */
-
-static void flip_horizontal(const struct image_t *src, struct image_t *dst)
+static int connected_components(const uint8_t *mask, int16_t *labels, int w, int h)
 {
-    const uint8_t *s = (const uint8_t *)src->buf;
-    uint8_t       *d = (uint8_t *)dst->buf;
-    int w = src->w;
-    int h = src->h;
+    int16_t next_label = 1;
+    uf_init(MAX_CC_LABELS);
+    memset(labels, 0, w * h * sizeof(int16_t));
 
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            d[y * w + (w - 1 - x)] = s[y * w + x];
+            int idx = y * w + x;
+            if (!mask[idx]) continue;
+            int16_t nb[4]; int nn = 0;
+            if (y > 0 && x > 0     && labels[(y-1)*w+(x-1)]) nb[nn++] = labels[(y-1)*w+(x-1)];
+            if (y > 0               && labels[(y-1)*w+x])     nb[nn++] = labels[(y-1)*w+x];
+            if (y > 0 && x < w - 1 && labels[(y-1)*w+(x+1)]) nb[nn++] = labels[(y-1)*w+(x+1)];
+            if (x > 0               && labels[y*w+(x-1)])     nb[nn++] = labels[y*w+(x-1)];
+            if (nn == 0) { if (next_label < MAX_CC_LABELS) labels[idx] = next_label++; }
+            else {
+                int16_t m = uf_find(nb[0]);
+                for (int i = 1; i < nn; i++) { int16_t r = uf_find(nb[i]); if (r < m) m = r; }
+                labels[idx] = m;
+                for (int i = 0; i < nn; i++) uf_union(m, nb[i]);
+            }
         }
     }
+    /* flatten labels */
+    for (int i = 0; i < w * h; i++) if (labels[i]) labels[i] = uf_find(labels[i]);
+
+    /* compute per-label area and bounding boxes */
+    int max_label = 0;
+    for (int i = 0; i < w * h; i++) if (labels[i] > max_label) max_label = labels[i];
+    if (max_label >= MAX_CC_LABELS) max_label = MAX_CC_LABELS - 1;
+
+    for (int l = 0; l <= max_label; l++) {
+        cc_area[l] = 0;
+        cc_bb_x0[l] = (int16_t)(w - 1); cc_bb_x1[l] = 0;
+        cc_bb_y0[l] = (int16_t)(h - 1); cc_bb_y1[l] = 0;
+    }
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int16_t l = labels[y * w + x];
+            if (l > 0 && l <= max_label) {
+                cc_area[l]++;
+                if (x < cc_bb_x0[l]) cc_bb_x0[l] = (int16_t)x;
+                if (x > cc_bb_x1[l]) cc_bb_x1[l] = (int16_t)x;
+                if (y < cc_bb_y0[l]) cc_bb_y0[l] = (int16_t)y;
+                if (y > cc_bb_y1[l]) cc_bb_y1[l] = (int16_t)y;
+            }
+        }
+    }
+
+    return (int)(next_label - 1);
 }
 
-
-/* ================================================================== */
-/* SECTION 10 – fill_holes (file-private)                              */
-/* ================================================================== */
-
-/*
- * Fills enclosed zero regions inside a binary mask (0/255).
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  BLOB PERIMETER (matching Python: transitions in zero-padded image)
  *
- * Algorithm: iterative 4-connected flood from image border.
- *   1. All border zeros are marked as BACKGROUND (value 128).
- *   2. Forward + backward scan passes propagate 128 to all
- *      4-connected zero neighbours until convergence.
- *   3. Remaining zeros (unreachable from border) are holes → set 255.
- *      Temporary 128 marks are restored to 0.
- *
- * No dynamic memory or queue required.
- * Convergence: worst case (w + h) passes; typical: 1–2 passes.
- *
- * Mirrors colored_blob_separator.py fill_holes().
- */
-static void fill_holes(uint8_t *mask, int w, int h)
+ *  Counts horizontal + vertical transitions between blob and non-blob,
+ *  including the implicit zero-padding border.
+ * ══════════════════════════════════════════════════════════════════════════════ */
+int compute_blob_perimeter(const int16_t *labels, int w, int h, int16_t lbl)
 {
-    /* Step 1 – seed border zeros as background (128) */
+    int perim = 0;
+
+    /* horizontal transitions */
+    for (int y = 0; y < h; y++) {
+        /* left border → first pixel */
+        if (labels[y * w] == lbl) perim++;
+        /* interior */
+        for (int x = 0; x < w - 1; x++) {
+            int a = (labels[y * w + x] == lbl) ? 1 : 0;
+            int b = (labels[y * w + x + 1] == lbl) ? 1 : 0;
+            if (a != b) perim++;
+        }
+        /* last pixel → right border */
+        if (labels[y * w + w - 1] == lbl) perim++;
+    }
+
+    /* vertical transitions */
     for (int x = 0; x < w; x++) {
-        if (mask[0 * w + x]       == 0) mask[0 * w + x]       = 128;
-        if (mask[(h - 1) * w + x] == 0) mask[(h - 1) * w + x] = 128;
-    }
-    for (int y = 0; y < h; y++) {
-        if (mask[y * w + 0]       == 0) mask[y * w + 0]       = 128;
-        if (mask[y * w + (w - 1)] == 0) mask[y * w + (w - 1)] = 128;
+        /* top border → first pixel */
+        if (labels[x] == lbl) perim++;
+        /* interior */
+        for (int y = 0; y < h - 1; y++) {
+            int a = (labels[y * w + x] == lbl) ? 1 : 0;
+            int b = (labels[(y + 1) * w + x] == lbl) ? 1 : 0;
+            if (a != b) perim++;
+        }
+        /* last pixel → bottom border */
+        if (labels[(h - 1) * w + x] == lbl) perim++;
     }
 
-    /* Step 2 – propagate 128 until stable */
-    int changed = 1;
-    while (changed) {
-        changed = 0;
+    return perim;
+}
 
-        /* Forward pass: top-left → bottom-right */
-        for (int y = 1; y < h - 1; y++) {
-            for (int x = 1; x < w - 1; x++) {
-                if (mask[y * w + x] == 0) {
-                    if (mask[(y - 1) * w + x] == 128 ||
-                        mask[(y + 1) * w + x] == 128 ||
-                        mask[y * w + (x - 1)] == 128 ||
-                        mask[y * w + (x + 1)] == 128) {
-                        mask[y * w + x] = 128;
-                        changed = 1;
-                    }
-                }
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  FRACTAL DIMENSION (box-counting on blob edge, matching Python exactly)
+ *
+ *  Steps:
+ *    1. Create zero-padded blob mask (h+2)×(w+2) in work_visited
+ *    2. Compute edge image in work_flipped:
+ *         edge[y,x] = (padded[y,x+1] != padded[y,x]) || (padded[y+1,x] != padded[y,x])
+ *    3. Box-counting at scales 2, 4, 8, 16, ...
+ *    4. Linear regression on log(scale) vs log(count)
+ *    5. Return -slope
+ * ══════════════════════════════════════════════════════════════════════════════ */
+float compute_fractal_dimension(const int16_t *labels, int w, int h, int16_t lbl)
+{
+    int pw = w + 2, ph = h + 2;
+
+    /* step 1: create padded blob mask in work_visited */
+    memset(work_visited, 0, pw * ph);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if (labels[y * w + x] == lbl)
+                work_visited[(y + 1) * pw + (x + 1)] = 1;
+
+    /* step 2: compute edge image in work_flipped */
+    memset(work_flipped, 0, pw * ph);
+    for (int y = 0; y < ph; y++) {
+        for (int x = 0; x < pw; x++) {
+            int cur = work_visited[y * pw + x];
+            int e1 = 0, e2 = 0;
+            if (x < pw - 1) e1 = (work_visited[y * pw + x + 1] != cur) ? 1 : 0;
+            if (y < ph - 1) e2 = (work_visited[(y + 1) * pw + x] != cur) ? 1 : 0;
+            work_flipped[y * pw + x] = (e1 || e2) ? 1 : 0;
+        }
+    }
+
+    /* step 3: box-counting at powers of 2 */
+    float log_eps[16], log_boxes[16];
+    int n_scales = 0;
+    int min_dim = (pw < ph) ? pw : ph;
+
+    for (int p = 1; (1 << p) < min_dim && n_scales < 16; p++) {
+        int s = 1 << p;
+        int trimmed_h = (ph / s) * s;
+        int trimmed_w = (pw / s) * s;
+        int count = 0;
+
+        for (int by = 0; by < trimmed_h; by += s) {
+            for (int bx = 0; bx < trimmed_w; bx += s) {
+                /* check if any pixel in this s×s block is edge */
+                int found = 0;
+                for (int dy = 0; dy < s && !found; dy++)
+                    for (int dx = 0; dx < s && !found; dx++)
+                        if (work_flipped[(by + dy) * pw + (bx + dx)])
+                            found = 1;
+                if (found) count++;
             }
         }
 
-        /* Backward pass: bottom-right → top-left */
-        for (int y = h - 2; y >= 1; y--) {
-            for (int x = w - 2; x >= 1; x--) {
-                if (mask[y * w + x] == 0) {
-                    if (mask[(y - 1) * w + x] == 128 ||
-                        mask[(y + 1) * w + x] == 128 ||
-                        mask[y * w + (x - 1)] == 128 ||
-                        mask[y * w + (x + 1)] == 128) {
-                        mask[y * w + x] = 128;
-                        changed = 1;
-                    }
-                }
-            }
+        if (count > 0) {
+            log_eps[n_scales] = logf((float)s);
+            log_boxes[n_scales] = logf((float)count);
+            n_scales++;
         }
     }
 
-    /* Step 3 – finalise: holes → 255, background → 0 */
+    /* step 4: linear regression y = a*x + b */
+    if (n_scales < 2) return 1.0f;  /* not enough data → assume smooth */
+
+    float sx = 0, sy = 0, sxy = 0, sxx = 0;
+    for (int i = 0; i < n_scales; i++) {
+        sx  += log_eps[i];
+        sy  += log_boxes[i];
+        sxy += log_eps[i] * log_boxes[i];
+        sxx += log_eps[i] * log_eps[i];
+    }
+    float denom = n_scales * sxx - sx * sx;
+    if (fabsf(denom) < 1e-9f) return 1.0f;
+
+    float slope = (n_scales * sxy - sx * sy) / denom;
+    return -slope;   /* negate: slope is negative, fractal dim is positive */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  IS_SMOOTH_BLOB (matching Python solidity_detection.is_smooth_blob)
+ *
+ *  A blob is "smooth" (likely ground) if EITHER:
+ *    perimeter / equiv_rect_perimeter < 2.0
+ *    OR fractal_dimension < 1.3
+ *
+ *  Returns 1 = smooth (keep), 0 = spiky (remove).
+ * ══════════════════════════════════════════════════════════════════════════════ */
+int is_smooth_blob(const int16_t *labels, int w, int h,
+                   int16_t lbl, int blob_area, int bb_height)
+{
+    /* bb_height = bounding box HEIGHT in pixels (Python calls this "width"
+       because the camera is sideways — values[label, 3] = CC_STAT_HEIGHT) */
+    if (bb_height <= 0) return 1;  /* degenerate → keep */
+
+    int perim = compute_blob_perimeter(labels, w, h, lbl);
+
+    /* average height = area / bb_height  (matches Python compute_average_blob_height) */
+    int avg_height = blob_area / bb_height;
+
+    /* equivalent rectangle perimeter */
+    int equiv_rect_perim = 2 * (avg_height + bb_height);
+
+    /* perimeter ratio check */
+    float perim_ratio = (equiv_rect_perim > 0) ?
+        (float)perim / (float)equiv_rect_perim : 0.0f;
+
+    if (perim_ratio < SMOOTH_PERIMETER_RATIO_THRESH)
+        return 1;  /* smooth */
+
+    /* fractal dimension check (expensive — only if perimeter ratio failed) */
+    float fd = compute_fractal_dimension(labels, w, h, lbl);
+
+    if (fd < SMOOTH_FRACTAL_DIM_THRESH)
+        return 1;  /* smooth */
+
+    return 0;  /* both checks failed → spiky, remove this blob */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  ISOLATE GROUND BLOB (CC + area filter + smooth-blob filter)
+ * ══════════════════════════════════════════════════════════════════════════════ */
+void isolate_ground_blob(uint8_t mask[], int w, int h, int blob_area_threshold)
+{
+    int n_labels = connected_components(mask, work_labels, w, h);
+    if (n_labels == 0) return;
+
+    int max_label = 0;
+    for (int i = 0; i < w * h; i++) if (work_labels[i] > max_label) max_label = work_labels[i];
+    if (max_label >= MAX_CC_LABELS) max_label = MAX_CC_LABELS - 1;
+
+    /* decide which labels pass ONCE (not per-pixel!) */
+    static uint8_t label_keep[MAX_CC_LABELS];
+    memset(label_keep, 0, max_label + 1);
+
+    for (int l = 1; l <= max_label; l++) {
+        if (cc_area[l] < blob_area_threshold) continue;
+
+        int bb_height = cc_bb_y1[l] - cc_bb_y0[l] + 1;
+        if (!is_smooth_blob(work_labels, w, h, (int16_t)l, cc_area[l], bb_height))
+            continue;
+
+        label_keep[l] = 1;
+    }
+
+    /* apply: keep only passing labels */
     for (int i = 0; i < w * h; i++) {
-        if      (mask[i] == 0)   mask[i] = 255;  /* enclosed hole → fill  */
-        else if (mask[i] == 128) mask[i] = 0;    /* border-reachable → bg  */
-        /* 255 → unchanged (foreground)                                     */
+        int16_t l = work_labels[i];
+        mask[i] = (l > 0 && l <= max_label && label_keep[l]) ? 255 : 0;
     }
 }
 
-
-/* ================================================================== */
-/* SECTION 11 – isolate_ground_blob (file-private)                     */
-/* ================================================================== */
-
-/*
- * Removes blobs from a binary mask (0/255) that are either:
- *   (a) too small  (area < BLOB_AREA_THRESHOLD), or
- *   (b) too spiky  (perimeter / equiv_rect_perimeter >= SMOOTH_PERIM_RATIO)
- *
- * Uses a two-pass union-find connected-components algorithm
- * (8-connectivity) for O(W*H) runtime with no dynamic allocation.
- *
- * Smoothness metric — mirrors solidity_detection.py is_smooth_blob():
- *   avg_height          = area / bbox_width
- *   equiv_rect_perim    = 2 * (avg_height + bbox_width)
- *   perimeter_ratio     = perimeter / equiv_rect_perim
- *   smooth if ratio < SMOOTH_PERIM_RATIO (2.0)
- *
- * NOTE: The fractal-dimension branch of is_smooth_blob() is intentionally
- * skipped.  The ratio check alone correctly classifies ground vs. plant
- * blobs in all tested frames.  The two conditions in the Python are OR'd,
- * so the ratio check is sufficient when it fires; the fractal branch only
- * adds a safety-net for edge cases that are unlikely given clean masks.
- *
- * Mirrors colored_blob_separator.py isolate_ground_blob().
- */
-
-/* --- union-find helpers ------------------------------------------- */
-
-static uint8_t uf_find(uint8_t *parent, uint8_t x)
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  4. HOLE FILLING (border flood-fill BFS)
+ * ══════════════════════════════════════════════════════════════════════════════ */
+void fill_holes_mask(uint8_t mask[], int w, int h)
 {
-    /* Path-compressed find */
-    while (parent[x] != x) {
-        parent[x] = parent[parent[x]];  /* path halving */
-        x         = parent[x];
+    int total = w * h;
+    memset(work_visited, 0, total);
+    int qh = 0, qt = 0;
+    for (int x = 0; x < w; x++) {
+        if (!mask[x] && !work_visited[x]) { work_visited[x] = 1; ff_queue[qt++] = x; }
+        int b = (h-1)*w+x;
+        if (!mask[b] && !work_visited[b]) { work_visited[b] = 1; ff_queue[qt++] = b; }
     }
-    return x;
-}
-
-static void uf_union(uint8_t *parent, uint8_t *rnk, uint8_t a, uint8_t b)
-{
-    a = uf_find(parent, a);
-    b = uf_find(parent, b);
-    if (a == b) return;
-    if (rnk[a] < rnk[b]) { uint8_t t = a; a = b; b = t; }
-    parent[b] = a;
-    if (rnk[a] == rnk[b]) rnk[a]++;
-}
-
-/* --- main function ------------------------------------------------- */
-
-static void isolate_ground_blob(uint8_t *mask, int w, int h)
-{
-    /* --- union-find state ----------------------------------------- */
-    uint8_t  parent[MAX_CC_LABELS];
-    uint8_t  rnk[MAX_CC_LABELS];
-    uint32_t area[MAX_CC_LABELS];
-    uint16_t x_min[MAX_CC_LABELS], x_max[MAX_CC_LABELS];
-
-    memset(area,  0, sizeof(area));
-    memset(x_min, 0xFF, sizeof(x_min));   /* initialise to max uint16 */
-    memset(x_max, 0,    sizeof(x_max));
-
-    for (int i = 0; i < MAX_CC_LABELS; i++) { parent[i] = (uint8_t)i; rnk[i] = 0; }
-
-    uint8_t  next_label = 1;             /* label 0 = background     */
-    uint8_t *lmap       = cc_label_map;  /* file-scope static buffer  */
-    memset(lmap, 0, (uint32_t)w * (uint32_t)h);
-
-    /* ----------------------------------------------------------------
-     * PASS 1: assign provisional labels, record unions.
-     * For each foreground pixel, inspect the four already-scanned
-     * 8-connected neighbours: NW, N, NE, W.
-     * ---------------------------------------------------------------- */
     for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            if (mask[y * w + x] == 0) { lmap[y * w + x] = 0; continue; }
-
-            uint8_t nbr[4];
-            int     nn = 0;
-
-            if (y > 0 && x > 0  && lmap[(y-1)*w+(x-1)]) nbr[nn++] = lmap[(y-1)*w+(x-1)];
-            if (y > 0           && lmap[(y-1)*w+ x    ]) nbr[nn++] = lmap[(y-1)*w+ x    ];
-            if (y > 0 && x<w-1  && lmap[(y-1)*w+(x+1)]) nbr[nn++] = lmap[(y-1)*w+(x+1)];
-            if (           x > 0 && lmap[ y   *w+(x-1)]) nbr[nn++] = lmap[ y   *w+(x-1)];
-
-            if (nn == 0) {
-                /* Isolated foreground pixel → new label */
-                if (next_label < MAX_CC_LABELS) {
-                    lmap[y * w + x] = next_label++;
-                } else {
-                    /* Label space exhausted: fold into label 1.
-                     * This is a graceful fallback; in practice
-                     * MAX_CC_LABELS=128 is never reached. */
-                    lmap[y * w + x] = 1;
-                }
-            } else {
-                /* Assign one neighbour's label, union the rest */
-                lmap[y * w + x] = nbr[0];
-                for (int k = 1; k < nn; k++) {
-                    uf_union(parent, rnk, nbr[0], nbr[k]);
-                }
-            }
-        }
+        int l = y*w;
+        if (!mask[l] && !work_visited[l]) { work_visited[l] = 1; ff_queue[qt++] = l; }
+        int r = y*w+(w-1);
+        if (!mask[r] && !work_visited[r]) { work_visited[r] = 1; ff_queue[qt++] = r; }
     }
-
-    /* ----------------------------------------------------------------
-     * PASS 2: resolve provisional labels to roots, accumulate stats.
-     * Only x-extents (bbox_width) and area are needed for smoothness.
-     * ---------------------------------------------------------------- */
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            uint8_t L = lmap[y * w + x];
-            if (L == 0) continue;
-
-            uint8_t root     = uf_find(parent, L);
-            lmap[y * w + x]  = root;
-            area[root]++;
-
-            if ((uint16_t)x < x_min[root]) x_min[root] = (uint16_t)x;
-            if ((uint16_t)x > x_max[root]) x_max[root] = (uint16_t)x;
-        }
+    while (qh < qt) {
+        int i = ff_queue[qh++]; int cy = i / w, cx = i % w;
+        if (cy > 0     && !work_visited[i-w] && !mask[i-w]) { work_visited[i-w] = 1; ff_queue[qt++] = i-w; }
+        if (cy < h - 1 && !work_visited[i+w] && !mask[i+w]) { work_visited[i+w] = 1; ff_queue[qt++] = i+w; }
+        if (cx > 0     && !work_visited[i-1] && !mask[i-1]) { work_visited[i-1] = 1; ff_queue[qt++] = i-1; }
+        if (cx < w - 1 && !work_visited[i+1] && !mask[i+1]) { work_visited[i+1] = 1; ff_queue[qt++] = i+1; }
     }
+    for (int i = 0; i < total; i++)
+        if (!mask[i] && !work_visited[i]) mask[i] = 255;
+}
 
-    /* ----------------------------------------------------------------
-     * FILTERING: for each root label, decide keep / discard.
-     * A root is identified by parent[L] == L.
-     * ---------------------------------------------------------------- */
-    uint8_t keep[MAX_CC_LABELS];
-    memset(keep, 0, sizeof(keep));
-
-    for (uint8_t L = 1; L < next_label; L++) {
-        if (uf_find(parent, L) != L) continue;   /* not a root, skip */
-        if (area[L] < BLOB_AREA_THRESHOLD)        continue;   /* too small     */
-
-        /* Compute 4-connected perimeter:
-         * for each blob pixel, count exposed edges
-         * (border of image treated as non-blob). */
-        uint32_t perim = 0;
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                if (lmap[y * w + x] != L) continue;
-                if (x == 0   || lmap[ y    * w + (x-1)] != L) perim++;
-                if (x == w-1 || lmap[ y    * w + (x+1)] != L) perim++;
-                if (y == 0   || lmap[(y-1) * w +  x   ] != L) perim++;
-                if (y == h-1 || lmap[(y+1) * w +  x   ] != L) perim++;
-            }
-        }
-
-        /* is_smooth_blob():
-         *   avg_height       = area / bbox_width
-         *   equiv_rect_perim = 2 * (avg_height + bbox_width)
-         *   smooth if perim / equiv_rect_perim < SMOOTH_PERIM_RATIO
-         */
-        uint16_t bbox_width = x_max[L] - x_min[L] + 1;
-        if (bbox_width == 0) continue;
-
-        float avg_height       = (float)area[L] / (float)bbox_width;
-        float equiv_rect_perim = 2.0f * (avg_height + (float)bbox_width);
-        float ratio            = (float)perim / equiv_rect_perim;
-
-        if (ratio < SMOOTH_PERIM_RATIO) {
-            keep[L] = 1;
-        }
-    }
-
-    /* ----------------------------------------------------------------
-     * APPLY: zero-out pixels belonging to discarded blobs.
-     * ---------------------------------------------------------------- */
-    for (int i = 0; i < w * h; i++) {
-        uint8_t L = lmap[i];
-        if (L == 0 || !keep[L]) mask[i] = 0;
-        /* else mask[i] remains 255 */
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  5. BOUNDARY SCAN + 1-D MEDIAN
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static void insertion_sort_f(float *a, int n) {
+    for (int i = 1; i < n; i++) { float k = a[i]; int j = i-1; while (j >= 0 && a[j] > k) { a[j+1] = a[j]; j--; } a[j+1] = k; }
+}
+static void median_filter_1d(int *data, int n, int ksize) {
+    if (ksize < 3 || n <= ksize) return;
+    int half = ksize / 2; float win[25];
+    static int mc[MAX_IMAGE_HEIGHT]; if (n > MAX_IMAGE_HEIGHT) n = MAX_IMAGE_HEIGHT;
+    memcpy(mc, data, n * sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int wn = 0, lo = (i-half < 0) ? 0 : i-half, hi = (i+half >= n) ? n-1 : i+half;
+        for (int j = lo; j <= hi; j++) win[wn++] = (float)mc[j];
+        insertion_sort_f(win, wn);
+        data[i] = (int)win[wn / 2];
     }
 }
 
-
-/* ================================================================== */
-/* SECTION 12 – get_obstacle_info (public)                             */
-/* ================================================================== */
-
-/*
- * Full pipeline: ground mask → blob isolation → hole filling →
- *                boundary finding → obstacle detection.
- *
- * Signature is UNCHANGED from the previous version.
- * The only behavioural change is that the mask is now cleaned by
- * isolate_ground_blob() + fill_holes() before boundary detection,
- * which mirrors the Python pipeline exactly.
- */
-uint8_t get_obstacle_info(struct image_t           *input,
-                        float                    *ground_baseline,
-                        int                      *baseline_inited,
-                        float                     oa_color_count_frac,
-                        int                       median_ksize,
-                        int                       min_width,
-                        int                       min_ground_pixels,
-                        int                       max_gap,
-                        int                       smooth_kernel,
-                        int                       max_col_gap,
-                        int                       use_sim,
-                        struct obstacle_region_t *obstacles_out,
-                        int                      *boundary_rows_out,
-                        int                      *ground_found_out,
-                        float                    *green_frac_out)
+void find_ground_boundary(const uint8_t mask_flipped[], int w, int h,
+                          int boundary_out[], int mgp, int mg, int sk)
 {
-    int W = input->w;
-    int H = input->h;
+    int nr = h, rl = w;
+    for (int r = 0; r < nr; r++) boundary_out[r] = rl;
+    for (int r = 0; r < nr; r++) {
+        const uint8_t *row = &mask_flipped[r * rl];
+        int any = 0;
+        for (int c = 0; c < rl; c++) if (row[c]) { any = 1; break; }
+        if (!any) continue;
+        int gv = 1;
+        for (int c = rl - mgp; c < rl; c++) { if (c < 0) continue; if (!row[c]) { gv = 0; break; } }
+        if (!gv) {
+            int mr = 0, cr = 0;
+            for (int c = 0; c < rl; c++) { if (row[c]) { cr++; if (cr > mr) mr = cr; } else cr = 0; }
+            if (mr < mg) continue;
+        }
+        int *gp = (int *)ff_queue; int gn = 0;
+        for (int c = rl - 1; c >= 0; c--) if (row[c]) gp[gn++] = c;
+        if (gn <= 1) { if (gn == 1) boundary_out[r] = gp[0]; continue; }
+        int fg = -1;
+        for (int i = 0; i < gn - 1; i++) if (gp[i] - gp[i+1] - 1 > mg) { fg = i; break; }
+        if (fg < 0) { boundary_out[r] = gp[gn - 1]; continue; }
+        int pending = gp[fg], ac = gn - (fg + 1);
+        if (ac >= mg) {
+            int *af = &gp[fg+1]; int mr2 = 1, cr2 = 1;
+            for (int i = 1; i < ac; i++) { if (af[i-1]-af[i]-1==0) { cr2++; if(cr2>mr2) mr2=cr2; } else cr2=1; }
+            if (mr2 >= mg) { boundary_out[r] = gp[gn - 1]; continue; }
+        }
+        boundary_out[r] = pending;
+    }
+    int vc = 0;
+    for (int r = 0; r < nr; r++) if (boundary_out[r] < rl) vc++;
+    if (vc > sk) median_filter_1d(boundary_out, nr, sk);
+}
 
-    /* ----------------------------------------------------------------
-     * Step 1 – raw ground mask (YUV classify + optional median blur)
-     * ---------------------------------------------------------------- */
-    struct image_t mask;
-    image_create(&mask, W, H, IMAGE_GRAYSCALE);
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  6-8. OBSTACLE REGION MERGE + BASELINE UPDATE
+ * ══════════════════════════════════════════════════════════════════════════════ */
+static int merge_obstacle_cols(const uint8_t *om, int nc, int mw, int mcg,
+                               struct obstacle_region_t out[], int mx)
+{
+    static int ocb[MAX_IMAGE_HEIGHT]; int no = 0;
+    for (int i = 0; i < nc && no < MAX_IMAGE_HEIGHT; i++) if (om[i]) ocb[no++] = i;
+    if (no == 0) return 0;
+    int cnt = 0, s = ocb[0], e = ocb[0];
+    for (int i = 1; i < no; i++) {
+        if (ocb[i] - e <= mcg) e = ocb[i];
+        else { int w = e-s+1; if (w >= mw && cnt < mx) { out[cnt].start=s; out[cnt].width=w; cnt++; } s=ocb[i]; e=ocb[i]; }
+    }
+    { int w = e-s+1; if (w >= mw && cnt < mx) { out[cnt].start=s; out[cnt].width=w; cnt++; } }
+    return cnt;
+}
 
-    float green_frac   = 0.0f;
-    int   apply_median = (median_ksize >= 3 && median_ksize % 2 == 1);
-    int   ground_found = detect_green_ground_ml(input, &mask,
-                                                oa_color_count_frac,
-                                                apply_median,
-                                                use_sim,
-                                                &green_frac);
+uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
+                          int mw, int ot, int ngb, int mcg,
+                          struct obstacle_region_t oo[])
+{
+    float alpha = DEFAULT_BASELINE_ALPHA;
+    if (!(*bi)) {
+        for (int i = 0; i < w; i++) gb[i] = (br[i] < h) ? (float)br[i] : (float)ngb;
+        *bi = 1; return 0;
+    }
+    static uint8_t om[MAX_IMAGE_HEIGHT], nom[MAX_IMAGE_HEIGHT];
+    memset(om, 0, w); memset(nom, 0, w);
+    for (int i = 0; i < w; i++) {
+        int v = br[i] < h;
+        if (v) { float d = (float)br[i] - gb[i]; if (d > (float)ot) om[i] = 1; else nom[i] = 1; }
+        else om[i] = 1;
+    }
+    struct obstacle_region_t fl[MAX_OBSTACLE_REGIONS];
+    int nf = merge_obstacle_cols(om, w, mw, mcg, fl, MAX_OBSTACLE_REGIONS);
+    for (int i = 0; i < w; i++)
+        if (nom[i]) gb[i] = (1.0f - alpha) * gb[i] + alpha * (float)br[i];
+    float lg = (float)ngb;
+    for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
+    int no = 0;
+    for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
+        int s = fl[i].start, rw = fl[i].width, e = s + rw - 1;
+        int left = h - 1 - e; if (left < 0) left = 0;
+        oo[no].start = (uint16_t)left; oo[no].width = (uint16_t)rw; no++;
+    }
+    return (uint8_t)no;
+}
 
-<<<<<<< HEAD
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  9-15. PLANT DETECTION
+ * ══════════════════════════════════════════════════════════════════════════════ */
+void detect_all_green_lax(struct image_t *img, int sn, int sd, int bk,
+                          uint8_t mo[], int *pwo, int *pho)
+{
+    int w = img->w, h = img->h;
+    const uint8_t *buf = (const uint8_t *)img->buf;
+    int pw = (w * sn) / sd, ph = (h * sn) / sd;
+    if (pw < 1) pw = 1; if (ph < 1) ph = 1;
+    if (pw > MAX_PLANT_WIDTH) pw = MAX_PLANT_WIDTH;
+    if (ph > MAX_PLANT_HEIGHT) ph = MAX_PLANT_HEIGHT;
+    *pwo = pw; *pho = ph;
+
+    for (int py = 0; py < ph; py++) {
+        int sy = (py * sd) / sn; if (sy >= h) sy = h - 1;
+        for (int px = 0; px < pw; px++) {
+            int sx = (px * sd) / sn; if (sx >= w) sx = w - 1;
+            uint8_t Y = yuv422_Y(buf, w, sx, sy);
+            uint8_t U = yuv422_U(buf, w, sx, sy);
+            uint8_t V = yuv422_V(buf, w, sx, sy);
+            plant_green_small[py * pw + px] = (U <= LAX_GREEN_U_MAX && V <= LAX_GREEN_V_MAX &&
+                                                Y >= LAX_GREEN_Y_MIN && Y <= LAX_GREEN_Y_MAX) ? 255 : 0;
+        }
+    }
+    int lt = pw / 3;
+    for (int py = 0; py < ph; py++) for (int px = 0; px < lt; px++) plant_green_small[py * pw + px] = 0;
+
+    if (bk >= 3) {
+        int half = bk / 2;
+        for (int py = 0; py < ph; py++)
+            for (int px = 0; px < pw; px++) {
+                int sum = 0, cnt = 0;
+                int y0 = (py-half < 0) ? 0 : py-half, y1 = (py+half >= ph) ? ph-1 : py+half;
+                int x0 = (px-half < 0) ? 0 : px-half, x1 = (px+half >= pw) ? pw-1 : px+half;
+                for (int ky = y0; ky <= y1; ky++) for (int kx = x0; kx <= x1; kx++) { sum += plant_green_small[ky*pw+kx]; cnt++; }
+                plant_blur_buf[py * pw + px] = (sum / cnt > 127) ? 255 : 0;
+            }
+        memcpy(mo, plant_blur_buf, pw * ph);
+    } else memcpy(mo, plant_green_small, pw * ph);
+}
+
+static void downsample_nn(const uint8_t *s, int sw, int sh, uint8_t *d, int dw, int dh)
+{ for (int y = 0; y < dh; y++) { int sy = y*sh/dh; if(sy>=sh)sy=sh-1; for (int x = 0; x < dw; x++) { int sx = x*sw/dw; if(sx>=sw)sx=sw-1; d[y*dw+x] = s[sy*sw+sx]; } } }
+
+static void upsample_nn(const uint8_t *s, int sw, int sh, uint8_t *d, int dw, int dh)
+{ for (int y = 0; y < dh; y++) { int sy = y*sh/dh; if(sy>=sh)sy=sh-1; for (int x = 0; x < dw; x++) { int sx = x*sw/dw; if(sx>=sw)sx=sw-1; d[y*dw+x] = s[sy*sw+sx]; } } }
+
+uint8_t detect_plant_regions(const uint8_t pm[], int w, int h, int mw, int mpc, int mcg,
+                             struct obstacle_region_t po[])
+{
+    static uint8_t am[MAX_IMAGE_HEIGHT]; memset(am, 0, h);
+    for (int r = 0; r < h; r++) {
+        int mr = 0, cr = 0;
+        for (int c = 0; c < w; c++) { int fc = w-1-c; if (pm[r*w+fc]) { cr++; if (cr > mr) mr = cr; } else cr = 0; }
+        if (mr > mpc) am[r] = 1;
+    }
+    return (uint8_t)merge_obstacle_cols(am, h, mw, mcg, po, MAX_PLANT_REGIONS);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  MAIN PIPELINE
+ * ══════════════════════════════════════════════════════════════════════════════ */
+uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
+                          float oacf, int mk, int mw,
+                          struct obstacle_region_t oo[],
+                          struct obstacle_region_t po[], uint8_t *pco,
+                          int bro[], int *gfo, float *gfro)
+{
+    int w = img->w, h = img->h;
+    if (w > MAX_IMAGE_WIDTH) w = MAX_IMAGE_WIDTH;
+    if (h > MAX_IMAGE_HEIGHT) h = MAX_IMAGE_HEIGHT;
+
+    float gf = 0.0f;
+    detect_green_ground_ml(img, work_mask, mk, &gf);
+    if (gfro) *gfro = gf;
+    int ground = (gf > oacf) ? 1 : 0;
+    if (gfo) *gfo = ground;
+/*
+
+    // ── MASK PRINTER ──────────────────────────────────────────────────────
     {
-        // MASK PRINTER
-        uint8_t *src      = (uint8_t *)input->buf;
-        uint8_t *mask_buf = (uint8_t *)mask.buf;
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x += 2) {
-                uint8_t *p  = &src[y * 2 * W + 2 * x];
-                uint8_t  g0 = mask_buf[y * W + x];
-                uint8_t  g1 = mask_buf[y * W + x + 1];
+        uint8_t *src = (uint8_t *)img->buf;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x += 2) {
+                uint8_t *p  = &src[y * 2 * w + 2 * x];
+                uint8_t  g0 = work_mask[y * w + x];
+                uint8_t  g1 = work_mask[y * w + x + 1];
                 p[0] = 128;
                 p[2] = 128;
                 p[1] = g0 ? 255 : 0;
@@ -854,8 +613,11 @@ uint8_t get_obstacle_info(struct image_t           *input,
             }
         }
     }
+    // ── END MASK PRINTER ──────────────────────────────────────────────────
 
-    // ── DRAW GND% TEXT ────────────────────────────────────────────────────
+    */
+
+    // ── TEXT OVERLAY ──────────────────────────────────────────────────────
     static const uint8_t font3x5[20][5] = {
         {0x7,0x5,0x5,0x5,0x7}, // 0
         {0x2,0x2,0x2,0x2,0x2}, // 1
@@ -887,8 +649,8 @@ uint8_t get_obstacle_info(struct image_t           *input,
                 if (_bits & (0x4 >> _c)) { \
                     int _px = (cx) + _c; \
                     int _py = (cy) + _r; \
-                    if (_px < W && _py < H) { \
-                        uint8_t *_p = &((uint8_t *)input->buf)[_py * 2 * W + (_px & ~1) * 2]; \
+                    if (_px < w && _py < h) { \
+                        uint8_t *_p = &((uint8_t *)img->buf)[_py * 2 * w + (_px & ~1) * 2]; \
                         _p[1 + (_px & 1) * 2] = 255; \
                     } \
                 } \
@@ -899,17 +661,17 @@ uint8_t get_obstacle_info(struct image_t           *input,
     #define DRAW_NUM(cx, cy, num) \
     do { \
         int _n = (num); \
-        if (_n >= 100) { DRAW_CHAR((cx), (cy), _n / 100);      (cx) += 4; } \
+        if (_n >= 100) { DRAW_CHAR((cx), (cy), _n / 100);       (cx) += 4; } \
         if (_n >= 10)  { DRAW_CHAR((cx), (cy), (_n / 10) % 10); (cx) += 4; } \
         DRAW_CHAR((cx), (cy), _n % 10); (cx) += 4; \
     } while(0)
 
-    // Blacken top 10 rows as background for text
+    // Blacken top 10 rows
     {
-        uint8_t *src = (uint8_t *)input->buf;
+        uint8_t *src = (uint8_t *)img->buf;
         for (int y = 0; y < 10; y++) {
-            for (int x = 0; x < W; x += 2) {
-                uint8_t *p = &src[y * 2 * W + 2 * x];
+            for (int x = 0; x < w; x += 2) {
+                uint8_t *p = &src[y * 2 * w + 2 * x];
                 p[0] = 128; p[1] = 0; p[2] = 128; p[3] = 0;
             }
         }
@@ -918,124 +680,57 @@ uint8_t get_obstacle_info(struct image_t           *input,
     // Draw "GND:XX%"
     {
         int cx = 2, cy = 2;
-        int pct = (int)(green_frac * 100.0f);
+        int pct = (int)(gf * 100.0f);
         DRAW_CHAR(cx, cy, 10); cx += 4;  // G
         DRAW_CHAR(cx, cy, 11); cx += 4;  // N
         DRAW_CHAR(cx, cy, 12); cx += 4;  // D
         DRAW_CHAR(cx, cy, 19); cx += 4;  // :
         DRAW_NUM(cx, cy, pct);
         DRAW_CHAR(cx, cy, 16); cx += 4;  // %
+        
     }
-    // ── END GND TEXT ───────────────────────────────────────────────────────
-
-    
-
-    if (ground_found_out != NULL) { *ground_found_out = ground_found; }
-    if (green_frac_out   != NULL) { *green_frac_out   = green_frac;   }
-=======
-    if (ground_found_out != NULL) *ground_found_out = ground_found;
-    if (green_frac_out   != NULL) *green_frac_out   = green_frac;
->>>>>>> e095c075637d3fb9447f345f4a24e519d09cb306
-
-    if (!ground_found) {
-        image_free(&mask);
-        return 0;
+    // ── END TEXT BLOCK 1 ──────────────────────────────────────────────────
+    uint8_t no = 0;
+    if (ground) {
+        isolate_ground_blob(work_mask, w, h, DEFAULT_BLOB_AREA_THRESH);
+        fill_holes_mask(work_mask, w, h);
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) work_flipped[y*w+x] = work_mask[y*w+(w-1-x)];
+        static int bl[MAX_IMAGE_HEIGHT];
+        find_ground_boundary(work_flipped, w, h, bl, DEFAULT_MIN_GROUND_PX, DEFAULT_MAX_GAP, DEFAULT_SMOOTH_KERNEL);
+        if (bro) memcpy(bro, bl, h * sizeof(int));
+        no = update_and_detect(bl, w, h, gb, bi, mw, DEFAULT_OBSTACLE_THRESH, DEFAULT_NO_GROUND_BASE, DEFAULT_MAX_COL_GAP, oo);
     }
 
-    /* ----------------------------------------------------------------
-     * Step 2 – clean the mask: remove small / spiky blobs, fill holes.
-     *   Mirrors Python:
-     *     clean_mask = cds.isolate_ground_blob(binary_img=mask)
-     *     clean_mask = cds.fill_holes(clean_mask)
-     * ---------------------------------------------------------------- */
-    uint8_t *mask_buf = (uint8_t *)mask.buf;
-
-    isolate_ground_blob(mask_buf, W, H);
-    fill_holes(mask_buf, W, H);
-
-    /* ----------------------------------------------------------------
-     * Step 3 – debug mask printer.
-     * Overwrites the source YUV buffer so the drone video stream shows
-     * the CLEAN ground mask (white = ground, black = not).
-     * Set TEAM10_DEBUG_MASK to 0 to disable in production.
-     * ---------------------------------------------------------------- */
-#define TEAM10_DEBUG_MASK 1
-#if TEAM10_DEBUG_MASK
-    {
-        uint8_t *src = (uint8_t *)input->buf;
-        for (int y = 0; y < H; y++) {
-            for (int x = 0; x < W; x += 2) {
-                uint8_t *p  = &src[y * 2 * W + 2 * x];
-                uint8_t  g0 = mask_buf[y * W + x];
-                uint8_t  g1 = mask_buf[y * W + x + 1];
-                p[0] = 128;           /* U – neutral chroma */
-                p[2] = 128;           /* V – neutral chroma */
-                p[1] = g0 ? 255 : 0; /* Y0 */
-                p[3] = g1 ? 255 : 0; /* Y1 */
-            }
+    if (po != NULL) {
+        int pw = 0, ph = 0;
+        detect_all_green_lax(img, DEFAULT_PLANT_SCALE_NUM, DEFAULT_PLANT_SCALE_DEN,
+                             DEFAULT_PLANT_BLUR_KSIZE, plant_mask_small, &pw, &ph);
+        if (ground) downsample_nn(work_mask, w, h, plant_clean_small, pw, ph);
+        else memset(plant_clean_small, 0, pw * ph);
+        for (int i = 0; i < pw * ph; i++) {
+            int v = (int)plant_mask_small[i] - (int)plant_clean_small[i];
+            plant_mask_small[i] = (v > 0) ? (uint8_t)v : 0;
         }
-    }
-#endif
+        upsample_nn(plant_mask_small, pw, ph, plant_mask_full, w, h);
+        uint8_t np = detect_plant_regions(plant_mask_full, w, h,
+                                          DEFAULT_PLANT_MIN_WIDTH, DEFAULT_PLANT_MIN_PX_COL,
+                                          DEFAULT_PLANT_MAX_COL_GAP, po);
+        if (pco) *pco = np;
+    } else { if (pco) *pco = 0; }
 
-    /* ----------------------------------------------------------------
-     * Step 4 – flip mask horizontally (ground convention: left side)
-     * ---------------------------------------------------------------- */
-    struct image_t mask_flipped;
-    image_create(&mask_flipped, W, H, IMAGE_GRAYSCALE);
-    flip_horizontal(&mask, &mask_flipped);
-    image_free(&mask);
-
-    /* ----------------------------------------------------------------
-     * Step 5 – find ground boundary per column (in flipped coords)
-     * ---------------------------------------------------------------- */
-    find_ground_boundary(&mask_flipped,
-                         boundary_rows_out,
-                         min_ground_pixels,
-                         max_gap,
-                         smooth_kernel);
-    image_free(&mask_flipped);
-
-    /* ----------------------------------------------------------------
-     * Step 6 – update EMA baseline and detect obstacle regions
-     *          (still in flipped coordinates)
-     * ---------------------------------------------------------------- */
-    struct obstacle_region_t raw_regions[MAX_OBSTACLE_REGIONS];
-    uint8_t n_regions = update_and_detect(boundary_rows_out,
-                                        W, H,
-                                        ground_baseline,
-                                        baseline_inited,
-                                        min_width,
-                                        max_col_gap,
-                                        raw_regions);
-
-    /* ----------------------------------------------------------------
-     * Step 7 – convert flipped → original image coordinates.
-     *
-     * Flipped column c  →  original column (W - 1 - c).
-     * Region [s, e] in flipped space:
-     *   original left  = W - 1 - e
-     *   original right = W - 1 - s
-     *   width          = e - s + 1  (unchanged)
-     * ---------------------------------------------------------------- */
-    for (int i = 0; i < n_regions; i++) {
-        obstacles_out[i].start = (uint16_t)(W - 1 - (int)raw_regions[i].end);
-        obstacles_out[i].end   = (uint16_t)(W - 1 - (int)raw_regions[i].start);
-        obstacles_out[i].width = raw_regions[i].width;
-    }
-
-    // ── DRAW OBS WIDTHS TEXT ──────────────────────────────────────────────
+    // ── DRAW OBS WIDTHS ───────────────────────────────────────────────────
     {
-        int cx = 60, cy = 2;
+        int cx = 64, cy = 2;
         DRAW_CHAR(cx, cy, 13); cx += 4;  // O
         DRAW_CHAR(cx, cy, 14); cx += 4;  // B
         DRAW_CHAR(cx, cy, 15); cx += 4;  // S
         DRAW_CHAR(cx, cy, 19); cx += 4;  // :
 
-        if (n_regions == 0) {
+        if (no == 0) {
             DRAW_CHAR(cx, cy, 18);            // -
         } else {
-            for (int i = 0; i < n_regions; i++) {
-                DRAW_NUM(cx, cy, obstacles_out[i].width);
+            for (int i = 0; i < no; i++) {
+                DRAW_NUM(cx, cy, oo[i].width);
                 cx += 6;
             }
         }
@@ -1043,8 +738,53 @@ uint8_t get_obstacle_info(struct image_t           *input,
 
     #undef DRAW_CHAR
     #undef DRAW_NUM
-    // ── END BLOCK OBS WIDTH TEXT ───────────────────────────────────────────────────────
+    // ── END TEXT OVERLAY ──────────────────────────────────────────────────
+    
+    /*
+    // ── TOP DETECTION BAR ─────────────────────────────────────────────────
+    {
+        uint8_t *src = (uint8_t *)img->buf;
+
+        // Build y→obstacle lookup using oo[].start and oo[].width
+        // (these are row indices in the buffer = x positions in the viewer)
+        static uint8_t is_obs_y[MAX_IMAGE_HEIGHT];
+        memset(is_obs_y, 0, h);
+        for (int i = 0; i < no; i++) {
+            int s = h - 1 - ((int)oo[i].start + (int)oo[i].width - 1);
+            int e = h - 1 - (int)oo[i].start;
+            if (s < 0) s = 0;
+            if (e >= h) e = h - 1;
+            for (int r = s; r <= e; r++) is_obs_y[r] = 1;
+        }
+
+        // Paint last 10 columns of buffer = top bar in viewer
+        // Red where obstacle detected (is_obs_y[y]==1), black elsewhere
+        for (int y = 0; y < h; y++) {
+            for (int x = w - 10; x < w; x += 2) {
+                uint8_t *p = &src[y * 2 * w + 2 * x];
+                if (is_obs_y[y]) {
+                    p[0] = 85;   // U → red
+                    p[1] = 76;   // Y0
+                    p[2] = 255;  // V
+                    p[3] = 76;   // Y1
+                } else {
+                    p[0] = 128;  // U → black
+                    p[1] = 0;    // Y0
+                    p[2] = 128;  // V
+                    p[3] = 0;    // Y1
+                }
+            }
+        }
+    }
+    // ── END DETECTION BAR ─────────────────────────────────────────────────
+    */
 
 
-    return n_regions;
+    return no;
 }
+
+/* ── DEBUG ────────────────────────────────────────────────────────────────── */
+int dump_mask_to_file(const char *p, const uint8_t m[], int w, int h)
+{ FILE *f = fopen(p, "wb"); if (!f) return -1; fwrite(m, 1, w*h, f); fclose(f); return 0; }
+int dump_obstacles_to_file(const char *p, const struct obstacle_region_t o[], int c)
+{ FILE *f = fopen(p, "w"); if (!f) return -1; fprintf(f, "%d\n", c); for (int i = 0; i < c; i++) fprintf(f, "%d %d\n", o[i].start, o[i].width); fclose(f); return 0; }
