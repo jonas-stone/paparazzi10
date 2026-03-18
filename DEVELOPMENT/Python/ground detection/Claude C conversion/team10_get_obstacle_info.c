@@ -1,6 +1,7 @@
 /*
  * team10_get_obstacle_info.c — Paparazzi build.
- * Complete pipeline with is_smooth_blob (perimeter + fractal dimension).
+ * Complete pipeline with is_smooth_blob (perimeter ratio; fractal dim disabled).
+ * Standardized output: both obstacles and plants use (start_row, width) format.
  * Same algorithm as _standalone.c, with real Paparazzi includes.
  */
 
@@ -50,7 +51,6 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
-/* Uncomment ONE of these: */
 // #define GROUND_TREE_REAL
 #define GROUND_TREE_SIM
 
@@ -342,11 +342,11 @@ int is_smooth_blob(const int16_t *labels, int w, int h,
     if (perim_ratio < SMOOTH_PERIMETER_RATIO_THRESH)
         return 1;  /* smooth */
 
-    /* fractal dimension check (expensive — only if perimeter ratio failed) */
+    /* fractal dimension check (expensive — disabled for performance)
     float fd = compute_fractal_dimension(labels, w, h, lbl);
 
     if (fd < SMOOTH_FRACTAL_DIM_THRESH)
-        return 1;  /* smooth */
+        return 1;   smooth */
 
     return 0;  /* both checks failed → spiky, remove this blob */
 }
@@ -511,9 +511,9 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
     int no = 0;
     for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
-        int s = fl[i].start, rw = fl[i].width, e = s + rw - 1;
-        int left = h - 1 - e; if (left < 0) left = 0;
-        oo[no].start = (uint16_t)left; oo[no].width = (uint16_t)rw; no++;
+        oo[no].start = (uint16_t)fl[i].start;
+        oo[no].width = (uint16_t)fl[i].width;
+        no++;
     }
     return (uint8_t)no;
 }
