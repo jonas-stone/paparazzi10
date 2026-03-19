@@ -48,7 +48,7 @@
 #define DEFAULT_SMOOTH_KERNEL     5
 #define DEFAULT_OBSTACLE_THRESH   50
 #define DEFAULT_NO_GROUND_BASE    235
-#define DEFAULT_BLOB_AREA_THRESH  1000
+#define DEFAULT_BLOB_AREA_THRESH  200
 #define DEFAULT_BASELINE_ALPHA    0.6f
 
 /* ── smooth blob thresholds ────────────────────────────────────────────────── */

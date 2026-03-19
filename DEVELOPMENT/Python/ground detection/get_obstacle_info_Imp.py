@@ -440,7 +440,7 @@ if __name__ == "__main__":
     import solidity_detection as sdd
 
     # ── run mode ─────────────────────────────────────────────
-    MODE = 2
+    MODE = 1
     # 1 = interactive navigation
     # 2 = single image
 

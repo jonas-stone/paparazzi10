@@ -111,10 +111,18 @@ void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[],
 {
     int w = img->w, h = img->h;
     const uint8_t *buf = (const uint8_t *)img->buf;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
+    
+    // Calculate the starting row (halfway down the screen)
+    int max_x = w / 2; 
+    // Explicitly paint the entire top half of the working mask black (0)
+    memset(work_mask2, 0, w * h);
+    // Loop through all rows (y), but ONLY loop halfway across the columns (x)
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < max_x; x++) {
             work_mask2[y * w + x] = is_ground_pixel(
                 yuv422_Y(buf, w, x, y), yuv422_U(buf, w, x, y), yuv422_V(buf, w, x, y));
+        }
+    }
     if (median_ksize >= 3 && (median_ksize & 1))
         median_blur_binary(work_mask2, mask_out, w, h, median_ksize);
     else
@@ -507,6 +515,8 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     int nf = merge_obstacle_cols(om, w, mw, mcg, fl, MAX_OBSTACLE_REGIONS);
     for (int i = 0; i < w; i++)
         if (nom[i]) gb[i] = (1.0f - alpha) * gb[i] + alpha * (float)br[i];
+    //float lg = (float)ngb;
+    //for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
     /* Two-pass propagation: left-to-right, then right-to-left, take min */
     float lg = (float)ngb;
     for (int i = 0; i < w; i++) {
@@ -541,24 +551,26 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
         int s = fl[i].start;
         int e = s + fl[i].width - 1;
         
+        // ── SIMPLIFIED HEIGHT LOGIC ──
         int max_br = 0; 
-        int valid_points = 0;
+        int touches_bottom = 0; // Flag to track if ground vanishes
         
         for (int r = s; r <= e; r++) {
             if (r < w) {
-                // br[r] == h means "no ground found".
-                if (br[r] < h) {
+                if (br[r] >= h) {
+                    // No ground found in this specific column
+                    touches_bottom = 1; 
+                } else {
+                    // Track valid points just in case it DOESN'T touch the bottom
                     if (br[r] > max_br) {
                         max_br = br[r];
                     }
-                    valid_points++;
                 }
             }
         }
         
-        // NEW LOGIC: If the entire obstacle blocked the ground line (no valid points), 
-        // immediately set it to the default low baseline (ngb).
-        if (valid_points == 0) {
+        // The Simple Rule: If it loses the ground ANYWHERE, or has no valid points, set to default.
+        if (touches_bottom || max_br == 0) {
             max_br = ngb;
         }
         

@@ -70,7 +70,7 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
 #define GROUND_TREE_REAL
-// #define GROUND_TREE_SIM
+//#define GROUND_TREE_SIM
 
 /* --- DECISION TREE --- */
 uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
@@ -568,24 +568,26 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
         int s = fl[i].start;
         int e = s + fl[i].width - 1;
         
+        // ── SIMPLIFIED HEIGHT LOGIC ──
         int max_br = 0; 
-        int valid_points = 0;
+        int touches_bottom = 0; // Flag to track if ground vanishes
         
         for (int r = s; r <= e; r++) {
             if (r < w) {
-                // br[r] == h means "no ground found".
-                if (br[r] < h) {
+                if (br[r] >= h) {
+                    // No ground found in this specific column
+                    touches_bottom = 1; 
+                } else {
+                    // Track valid points just in case it DOESN'T touch the bottom
                     if (br[r] > max_br) {
                         max_br = br[r];
                     }
-                    valid_points++;
                 }
             }
         }
         
-        // NEW LOGIC: If the entire obstacle blocked the ground line (no valid points), 
-        // immediately set it to the default low baseline (ngb).
-        if (valid_points == 0) {
+        // The Simple Rule: If it loses the ground ANYWHERE, or has no valid points, set to default.
+        if (touches_bottom || max_br == 0) {
             max_br = ngb;
         }
         
