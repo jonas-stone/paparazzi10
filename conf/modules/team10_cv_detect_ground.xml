@@ -61,6 +61,7 @@
   <makefile target="ap|nps">
     <file name="team10_ground_detection.c"/>
     <file name="team10_get_obstacle_info.c"/>
+    <file name="team10_rtp_utilities.c"/>
   </makefile>
 </module>
 
