@@ -212,12 +212,10 @@ void draw_safe_direction_bar(struct image_t *img, int w, int h,
         for (int y = y_start; y < y_end; y++) {
             for (int x = w - 2; x < w; x += 2) {
                 uint8_t *p = &src[y * 2 * w + 2 * x];
-                if (has_obstacle) {
-                    p[0] = 128; p[1] = 0;   p[2] = 128; p[3] = 0;   // black
-                } else if (col == best) {
-                    p[0] = 128; p[1] = 255; p[2] = 0;   p[3] = 255; // yellow
-                } else {
+                if (col == best) {
                     p[0] = 44;  p[1] = 150; p[2] = 21;  p[3] = 150; // green
+                } else {
+                    p[0] = 128; p[1] = 0;   p[2] = 128; p[3] = 0;   // black
                 }
             }
         }
