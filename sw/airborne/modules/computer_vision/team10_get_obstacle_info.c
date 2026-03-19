@@ -13,7 +13,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
-#include "team10_rtp_utilities.h"
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  STATIC WORK BUFFERS
