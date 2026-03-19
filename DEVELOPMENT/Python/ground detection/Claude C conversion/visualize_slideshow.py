@@ -55,6 +55,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 lib_path = os.path.join(SCRIPT_DIR, 'libobstacle.so')
 c_wrapper_path = os.path.join(SCRIPT_DIR, 'c_wrapper.c')
 
+if os.path.exists(lib_path):
+    print(f"🗑️  Found old C binary, deleting to force fresh recompile...")
+    try:
+        os.remove(lib_path)
+    except OSError as e:
+        print(f"⚠️  Warning: Could not delete {lib_path}. Close any other scripts using it. ({e})")
 # Auto-compile if the library doesn't exist
 if not os.path.exists(lib_path):
     print(f"⚙️  {lib_path} not found! Compiling automatically...")
@@ -310,7 +316,7 @@ def main():
                         f"obs={num_obs} plt={num_plants}",
                         (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-            combined = np.vstack([hdr, top, bot])
+            combined = np.vstack([hdr, top, bot]) 
             last_combined = combined
             needs_processing = False
 

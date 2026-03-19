@@ -128,10 +128,18 @@ void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[],
 {
     int w = img->w, h = img->h;
     const uint8_t *buf = (const uint8_t *)img->buf;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
+    
+    // Calculate the starting row (halfway down the screen)
+    int max_x = w / 2; 
+    // Explicitly paint the entire top half of the working mask black (0)
+    memset(work_mask2, 0, w * h);
+    // Loop through all rows (y), but ONLY loop halfway across the columns (x)
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < max_x; x++) {
             work_mask2[y * w + x] = is_ground_pixel(
                 yuv422_Y(buf, w, x, y), yuv422_U(buf, w, x, y), yuv422_V(buf, w, x, y));
+        }
+    }
     if (median_ksize >= 3 && (median_ksize & 1))
         median_blur_binary(work_mask2, mask_out, w, h, median_ksize);
     else
