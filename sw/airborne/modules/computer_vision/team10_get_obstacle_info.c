@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <team10_rtp_utilities.h>
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  STATIC WORK BUFFERS
@@ -686,6 +687,11 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
                                           DEFAULT_PLANT_MAX_COL_GAP, po);
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
+
+    draw_mask_printer(img, work_mask, w, h);   
+    draw_toolbar_vertical(img, w, h, gf, no, oo);
+    draw_safe_direction_bar(img, w, h, no, oo);    
+    draw_obstacle_detection_bar(img, w, h, no, oo);
 
     return no;
 }
