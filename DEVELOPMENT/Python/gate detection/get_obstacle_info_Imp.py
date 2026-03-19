@@ -440,12 +440,12 @@ if __name__ == "__main__":
     import solidity_detection as sdd
 
     # ── run mode ─────────────────────────────────────────────
-    MODE = 2
+    MODE = 1
     # 1 = interactive navigation
     # 2 = single image
 
     SINGLE_IMAGE_PATH = "DEVELOPMENT/downloads from drone/20260306-095826/1352900896.jpg"
-    FRAME_DELAY = 50
+    FRAME_DELAY = 1
 
     cv2.destroyAllWindows()
 
