@@ -126,6 +126,10 @@ void ground_obstacle_avoidance_periodic(void)
        total_obstacle_width,
        obstacle_width_threshold,
        obstacle_width_threshold * MAX_IMAGE_WIDTH);
+  
+  for (int i = 0; i < obstacle_count; i++) {
+    printf("obstacle[%d].start: %.2f\n", i, obstacles[i].start);
+  }
 
   // update our confidence level
   if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
