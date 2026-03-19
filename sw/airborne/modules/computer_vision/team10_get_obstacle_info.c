@@ -642,3 +642,427 @@ int dump_mask_to_file(const char *p, const uint8_t m[], int w, int h)
 { FILE *f = fopen(p, "wb"); if (!f) return -1; fwrite(m, 1, w*h, f); fclose(f); return 0; }
 int dump_obstacles_to_file(const char *p, const struct obstacle_region_t o[], int c)
 { FILE *f = fopen(p, "w"); if (!f) return -1; fprintf(f, "%d\n", c); for (int i = 0; i < c; i++) fprintf(f, "%d %d\n", o[i].start, o[i].width); fclose(f); return 0; }
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  GATE DETECTION
+ *
+ *  Direct C port of gate_detection.py.
+ *
+ *  Coordinate note
+ *  ---------------
+ *  The image arrives as portrait YUV422 with the floor on the LEFT.
+ *  Two real-world vertical pillars therefore appear as two blobs separated
+ *  along the IMAGE Y-axis (|dy| > |dx|).
+ *  The output centre coordinate is the X pixel of the midpoint, i.e. the
+ *  distance from the left edge of the raw image — which equals the distance
+ *  from the top when the image is rotated 90° CCW for display.
+ *
+ *  Blue mask
+ *  ---------
+ *  Uses the existing yuv422_Y/U/V accessors and a simple threshold on the
+ *  YUV channels.  A 5×5 morphological open+close is applied via a raster
+ *  scan (same logic as median_blur_binary) to suppress noise.
+ *
+ *  Checker confirmation
+ *  --------------------
+ *  For each blue blob the band of pixels on its LEFT face (floor side, low x)
+ *  is extracted.  The score is the fraction of columns whose grayscale
+ *  max-min range exceeds GATE_CHECKER_CONTRAST.  A checker pattern scores
+ *  high (every column crosses dark and bright squares); a uniform dark wall
+ *  scores 0.
+ *
+ *  Parallelism check
+ *  -----------------
+ *  1. |dy| > |dx|  — blobs are vertically separated in image coords
+ *  2. Similar aspect ratio (w/h within GATE_MAX_ASPECT_DIFF_PCT %)
+ *  3. Similar area (within GATE_MAX_AREA_DIFF_PCT %)
+ *  4. Centroid-join vector is within GATE_MAX_SKEW_DEG10/10 degrees of
+ *     perpendicular to the blobs' average long axis
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Static work buffers used only by detect_gate ─────────────────────────── */
+static uint8_t  gate_blue_mask[MAX_PIXELS];          /* binary blue mask       */
+static uint8_t  gate_eroded[MAX_PIXELS];             /* morphological scratch  */
+static int16_t  gate_cc_labels[MAX_PIXELS];          /* CC labels for blue     */
+
+/* Per-blob descriptor — keeps only what we need */
+typedef struct {
+    int x_min, y_min, x_max, y_max;   /* bounding box                */
+    int cx, cy;                        /* centroid (integer)          */
+    int area;                          /* pixel count                 */
+    int aspect_num, aspect_den;        /* aspect = width/height as ratio */
+} gate_blob_t;
+
+static gate_blob_t gate_blobs[GATE_MAX_BLOBS];
+
+/* ── Local union-find (separate from the obstacle pipeline's uf_parent) ───── */
+static int16_t gate_uf[MAX_CC_LABELS];
+static int32_t gate_area[MAX_CC_LABELS];
+static int16_t gate_x0[MAX_CC_LABELS], gate_x1[MAX_CC_LABELS];
+static int16_t gate_y0[MAX_CC_LABELS], gate_y1[MAX_CC_LABELS];
+static int32_t gate_cx_sum[MAX_CC_LABELS], gate_cy_sum[MAX_CC_LABELS];
+
+static int16_t gate_uf_find(int16_t x) {
+    while (gate_uf[x] != x) { gate_uf[x] = gate_uf[gate_uf[x]]; x = gate_uf[x]; }
+    return x;
+}
+static void gate_uf_union(int16_t a, int16_t b) {
+    a = gate_uf_find(a); b = gate_uf_find(b);
+    if (a != b) { if (a < b) gate_uf[b] = a; else gate_uf[a] = b; }
+}
+
+/* ── Step 1: build binary blue mask ──────────────────────────────────────── */
+static void gate_make_blue_mask(const struct image_t *img, uint8_t *out_mask)
+{
+    int w = img->w, h = img->h;
+    const uint8_t *buf = (const uint8_t *)img->buf;
+    int total = w * h;
+
+    /* threshold */
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            uint8_t Y = yuv422_Y(buf, w, x, y);
+            uint8_t U = yuv422_U(buf, w, x, y);
+            uint8_t V = yuv422_V(buf, w, x, y);
+            int idx = y * w + x;
+            /* U_MAX=255 and V_MIN=0 are always true for uint8_t — omitted */
+            out_mask[idx] = (Y <= (uint8_t)GATE_BLUE_Y_MAX &&
+                             U >= (uint8_t)GATE_BLUE_U_MIN &&
+                             V <= (uint8_t)GATE_BLUE_V_MAX) ? 255 : 0;
+        }
+    }
+
+    /* morphological open (erode then dilate) with 5×5 rect kernel:
+       reuse gate_eroded as scratch.  We implement erode/dilate as a
+       simple box majority-vote (threshold = kernel_area, i.e. ALL pixels
+       must be set for erode, ANY pixel for dilate). */
+    int k = 5, half = 2;
+
+    /* erode: all 5×5 neighbours must be set */
+    memset(gate_eroded, 0, total);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (!out_mask[y * w + x]) continue;
+            int ok = 1;
+            int y0 = (y - half < 0) ? 0 : y - half;
+            int y1 = (y + half >= h) ? h - 1 : y + half;
+            int x0 = (x - half < 0) ? 0 : x - half;
+            int x1 = (x + half >= w) ? w - 1 : x + half;
+            for (int ky = y0; ky <= y1 && ok; ky++)
+                for (int kx = x0; kx <= x1 && ok; kx++)
+                    if (!out_mask[ky * w + kx]) ok = 0;
+            gate_eroded[y * w + x] = ok ? 255 : 0;
+        }
+    }
+
+    /* dilate: any 5×5 neighbour set → set output */
+    memset(out_mask, 0, total);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int y0 = (y - half < 0) ? 0 : y - half;
+            int y1 = (y + half >= h) ? h - 1 : y + half;
+            int x0 = (x - half < 0) ? 0 : x - half;
+            int x1 = (x + half >= w) ? w - 1 : x + half;
+            int found = 0;
+            for (int ky = y0; ky <= y1 && !found; ky++)
+                for (int kx = x0; kx <= x1 && !found; kx++)
+                    if (gate_eroded[ky * w + kx]) found = 1;
+            out_mask[y * w + x] = found ? 255 : 0;
+        }
+    }
+
+    /* morphological close (dilate then erode): reuse same scheme */
+    /* dilate first */
+    memset(gate_eroded, 0, total);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int y0 = (y - half < 0) ? 0 : y - half;
+            int y1 = (y + half >= h) ? h - 1 : y + half;
+            int x0 = (x - half < 0) ? 0 : x - half;
+            int x1 = (x + half >= w) ? w - 1 : x + half;
+            int found = 0;
+            for (int ky = y0; ky <= y1 && !found; ky++)
+                for (int kx = x0; kx <= x1 && !found; kx++)
+                    if (out_mask[ky * w + kx]) found = 1;
+            gate_eroded[y * w + x] = found ? 255 : 0;
+        }
+    }
+    /* then erode */
+    memset(out_mask, 0, total);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (!gate_eroded[y * w + x]) continue;
+            int ok = 1;
+            int y0 = (y - half < 0) ? 0 : y - half;
+            int y1 = (y + half >= h) ? h - 1 : y + half;
+            int x0 = (x - half < 0) ? 0 : x - half;
+            int x1 = (x + half >= w) ? w - 1 : x + half;
+            for (int ky = y0; ky <= y1 && ok; ky++)
+                for (int kx = x0; kx <= x1 && ok; kx++)
+                    if (!gate_eroded[ky * w + kx]) ok = 0;
+            out_mask[y * w + x] = ok ? 255 : 0;
+        }
+    }
+    (void)k;
+}
+
+/* ── Step 2: extract blobs from blue mask ─────────────────────────────────── */
+static int gate_extract_blobs(const uint8_t *mask, int w, int h,
+                               gate_blob_t blobs[], int max_blobs)
+{
+    int total    = w * h;
+    int min_area = w * h * GATE_BLOB_MIN_AREA_NUM / GATE_BLOB_MIN_AREA_DEN;
+    if (min_area < 1) min_area = 1;
+
+    /* connected components */
+    int16_t next_lbl = 1;
+    for (int i = 0; i < MAX_CC_LABELS; i++) gate_uf[i] = (int16_t)i;
+    memset(gate_cc_labels, 0, total * sizeof(int16_t));
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int idx = y * w + x;
+            if (!mask[idx]) continue;
+            int16_t nb[4]; int nn = 0;
+            if (y > 0 && x > 0     && gate_cc_labels[(y-1)*w+(x-1)]) nb[nn++] = gate_cc_labels[(y-1)*w+(x-1)];
+            if (y > 0               && gate_cc_labels[(y-1)*w+x])     nb[nn++] = gate_cc_labels[(y-1)*w+x];
+            if (y > 0 && x < w - 1 && gate_cc_labels[(y-1)*w+(x+1)]) nb[nn++] = gate_cc_labels[(y-1)*w+(x+1)];
+            if (x > 0               && gate_cc_labels[y*w+(x-1)])     nb[nn++] = gate_cc_labels[y*w+(x-1)];
+            if (nn == 0) {
+                if (next_lbl < MAX_CC_LABELS) gate_cc_labels[idx] = next_lbl++;
+            } else {
+                int16_t m = gate_uf_find(nb[0]);
+                for (int i = 1; i < nn; i++) {
+                    int16_t r = gate_uf_find(nb[i]);
+                    if (r < m) m = r;
+                }
+                gate_cc_labels[idx] = m;
+                for (int i = 0; i < nn; i++) gate_uf_union(m, nb[i]);
+            }
+        }
+    }
+    for (int i = 0; i < total; i++)
+        if (gate_cc_labels[i]) gate_cc_labels[i] = gate_uf_find(gate_cc_labels[i]);
+
+    /* stats per label */
+    int max_lbl = 0;
+    for (int i = 0; i < total; i++) if (gate_cc_labels[i] > max_lbl) max_lbl = gate_cc_labels[i];
+    if (max_lbl >= MAX_CC_LABELS) max_lbl = MAX_CC_LABELS - 1;
+
+    for (int l = 0; l <= max_lbl; l++) {
+        gate_area[l] = 0;
+        gate_cx_sum[l] = 0; gate_cy_sum[l] = 0;
+        gate_x0[l] = (int16_t)(w - 1); gate_x1[l] = 0;
+        gate_y0[l] = (int16_t)(h - 1); gate_y1[l] = 0;
+    }
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int16_t l = gate_cc_labels[y * w + x];
+            if (l <= 0 || l > max_lbl) continue;
+            gate_area[l]++;
+            gate_cx_sum[l] += x;
+            gate_cy_sum[l] += y;
+            if (x < gate_x0[l]) gate_x0[l] = (int16_t)x;
+            if (x > gate_x1[l]) gate_x1[l] = (int16_t)x;
+            if (y < gate_y0[l]) gate_y0[l] = (int16_t)y;
+            if (y > gate_y1[l]) gate_y1[l] = (int16_t)y;
+        }
+    }
+
+    /* fill blobs array */
+    int nb = 0;
+    for (int l = 1; l <= max_lbl && nb < max_blobs; l++) {
+        int area = (int)gate_area[l];
+        if (area < min_area) continue;
+
+        int bw = (int)(gate_x1[l] - gate_x0[l] + 1);
+        int bh = (int)(gate_y1[l] - gate_y0[l] + 1);
+        if (bw < GATE_BLOB_MIN_DIM || bh < GATE_BLOB_MIN_DIM) continue;
+
+        blobs[nb].x_min      = gate_x0[l];
+        blobs[nb].y_min      = gate_y0[l];
+        blobs[nb].x_max      = gate_x1[l] + 1;  /* exclusive */
+        blobs[nb].y_max      = gate_y1[l] + 1;
+        blobs[nb].cx         = (area > 0) ? (int)(gate_cx_sum[l] / area) : (gate_x0[l] + gate_x1[l]) / 2;
+        blobs[nb].cy         = (area > 0) ? (int)(gate_cy_sum[l] / area) : (gate_y0[l] + gate_y1[l]) / 2;
+        blobs[nb].area       = area;
+        blobs[nb].aspect_num = bw;    /* aspect = bw / bh — stored as ratio */
+        blobs[nb].aspect_den = bh;
+        nb++;
+    }
+    return nb;
+}
+
+/* ── Step 3: checker score for the LEFT band of a blob ──────────────────────
+ *
+ * The checker pattern sits on the LEFT face of each blue bar (lower x values
+ * = floor side in the portrait/rotated image).
+ *
+ * We read Y (luma) values directly from the YUV422 buffer for each column in
+ * the search band, track per-column min and max, and count how many columns
+ * have range > GATE_CHECKER_CONTRAST.  Score = count * 100 / n_cols.
+ * Returns score in percent (0-100).
+ * ─────────────────────────────────────────────────────────────────────────── */
+static int gate_checker_score(const struct image_t *img, const gate_blob_t *b)
+{
+    int img_w = img->w, img_h = img->h;
+    const uint8_t *buf = (const uint8_t *)img->buf;
+
+    int bw     = b->x_max - b->x_min;
+    int bh     = b->y_max - b->y_min;
+    int band_w = bw * GATE_CHECKER_BAND_NUM / GATE_CHECKER_BAND_DEN;
+    if (band_w < 4) band_w = 4;
+
+    /* band to the LEFT of the blob: cols [x_min - band_w, x_min) */
+    int rx0 = b->x_min - band_w;
+    int rx1 = b->x_min;
+    int ry0 = b->y_min;
+    int ry1 = b->y_max;
+
+    if (rx0 < 0) rx0 = 0;
+    if (rx1 > img_w) rx1 = img_w;
+    if (ry0 < 0) ry0 = 0;
+    if (ry1 > img_h) ry1 = img_h;
+
+    int n_cols = rx1 - rx0;
+    int n_rows = ry1 - ry0;
+    if (n_cols <= 0 || n_rows <= 0) return 0;
+
+    int high_contrast_cols = 0;
+    for (int x = rx0; x < rx1; x++) {
+        uint8_t col_min = 255, col_max = 0;
+        for (int y = ry0; y < ry1; y++) {
+            uint8_t Y = yuv422_Y(buf, img_w, x, y);
+            if (Y < col_min) col_min = Y;
+            if (Y > col_max) col_max = Y;
+        }
+        if ((int)(col_max - col_min) > GATE_CHECKER_CONTRAST)
+            high_contrast_cols++;
+    }
+
+    return high_contrast_cols * 100 / n_cols;  /* 0-100 */
+}
+
+/* ── Step 4: parallelism check ──────────────────────────────────────────────
+ *
+ * Returns 1 if two blobs look like a valid gate pair.
+ *
+ * Uses only integer arithmetic. The skew angle is approximated via the dot
+ * product: dot(join_unit, long_axis) = cos(angle_between).
+ * We need angle_between close to 90°, i.e. |dot| close to 0.
+ * |dot| = |cos(angle)| = |sin(skew)| ≈ skew (radians) for small skew.
+ * Threshold: sin(max_skew) where max_skew = GATE_MAX_SKEW_DEG10/10 degrees.
+ * sin(10°) ≈ 0.174 — we use fixed-point: threshold = 174, scale = 1000.
+ * ─────────────────────────────────────────────────────────────────────────── */
+static int gate_blobs_parallel(const gate_blob_t *b1, const gate_blob_t *b2)
+{
+    /* 0. Vertical separation: |dy| > |dx| */
+    int dx = b2->cx - b1->cx;
+    int dy = b2->cy - b1->cy;
+    int adx = dx < 0 ? -dx : dx;
+    int ady = dy < 0 ? -dy : dy;
+    if (ady <= adx) return 0;
+
+    /* 1. Similar aspect ratio (bw/bh)
+          |ar1 - ar2| / max(ar1, ar2) <= GATE_MAX_ASPECT_DIFF_PCT / 100
+          Using cross-multiplication to avoid division:
+          |bw1*bh2 - bw2*bh1| * 100 <= max(bw1*bh2, bw2*bh1) * pct        */
+    int bw1 = b1->aspect_num, bh1 = b1->aspect_den;
+    int bw2 = b2->aspect_num, bh2 = b2->aspect_den;
+    if (bh1 <= 0 || bh2 <= 0) return 0;
+    int cross1 = bw1 * bh2;
+    int cross2 = bw2 * bh1;
+    int diff   = cross1 - cross2; if (diff < 0) diff = -diff;
+    int mx     = cross1 > cross2 ? cross1 : cross2;
+    if (diff * 100 > mx * GATE_MAX_ASPECT_DIFF_PCT) return 0;
+
+    /* 2. Similar area */
+    int a1 = b1->area, a2 = b2->area;
+    int adiff = a1 - a2; if (adiff < 0) adiff = -adiff;
+    int amax  = a1 > a2 ? a1 : a2;
+    if (amax <= 0) return 0;
+    if (adiff * 100 > amax * GATE_MAX_AREA_DIFF_PCT) return 0;
+
+    /* 3. Centroid join ≈ perpendicular to long axis.
+          avg_w = average blob width, avg_h = average blob height
+          if avg_w >= avg_h → bars are horizontal → long axis = (1, 0)
+            → join must be mostly vertical → |dx| / |join| should be small
+          if avg_h > avg_w  → bars are vertical  → long axis = (0, 1)
+            → join must be mostly horizontal → |dy| / |join| should be small
+
+          |dot(join_unit, long_axis)| = sin(skew)
+          Threshold: sin(max_skew_deg) * |join|
+          sin(10°) * 1000 ≈ 174 → use fixed-point scale 1000               */
+    int avg_w = ((b1->x_max - b1->x_min) + (b2->x_max - b2->x_min)) / 2;
+    int avg_h = ((b1->y_max - b1->y_min) + (b2->y_max - b2->y_min)) / 2;
+
+    /* |dot(join, long_axis)| — the component of join along the long axis   */
+    int dot_abs = (avg_w >= avg_h) ? adx : ady;
+
+    /* |join|^2 = dx^2 + dy^2; we compare dot_abs^2 / join^2 <= sin^2(skew)
+       Cross-multiply: dot_abs^2 * 1000000 <= join^2 * sin2_thresh
+       sin(10°)^2 ≈ 0.03015 → sin2_thresh = 30150 / 1000000              */
+    /* Simpler: compare dot_abs * 1000 / join <= sin_thresh_1000
+       where sin_thresh_1000 = sin(GATE_MAX_SKEW_DEG10/10 degrees) * 1000
+       For 10°: 174.  Avoid sqrt by squaring both sides:
+       dot_abs^2 * 1000000 <= (dx^2+dy^2) * 174^2 = * 30276             */
+    int join2   = dx * dx + dy * dy;
+    int dot2    = dot_abs * dot_abs;
+    /* sin_thresh^2 * 1000000, sin(10°)^2 * 1000000 = 30154 */
+    int sin2_scaled = 30154;  /* sin²(10°) × 1 000 000 */
+    if (dot2 * 1000000 > join2 * sin2_scaled) return 0;
+
+    return 1;
+}
+
+/* ── Main gate detection function ─────────────────────────────────────────── */
+void detect_gate(struct image_t *img, int result[2])
+{
+    result[0] = 0;
+    result[1] = 0;
+
+    int w = img->w, h = img->h;
+    if (w > MAX_IMAGE_WIDTH)  w = MAX_IMAGE_WIDTH;
+    if (h > MAX_IMAGE_HEIGHT) h = MAX_IMAGE_HEIGHT;
+
+    /* Step 1 — blue mask */
+    gate_make_blue_mask(img, gate_blue_mask);
+
+    /* Step 2 — blobs */
+    int n_blobs = gate_extract_blobs(gate_blue_mask, w, h,
+                                     gate_blobs, GATE_MAX_BLOBS);
+    if (n_blobs < 2) return;
+
+    /* Step 3 + 4 — find best parallel pair with checker on both blobs */
+    int best_area  = -1;
+    int best_mid_x = 0;
+    int gate_found = 0;
+
+    for (int i = 0; i < n_blobs; i++) {
+        for (int j = i + 1; j < n_blobs; j++) {
+            const gate_blob_t *b1 = &gate_blobs[i];
+            const gate_blob_t *b2 = &gate_blobs[j];
+
+            if (!gate_blobs_parallel(b1, b2)) continue;
+
+            /* Checker confirmation on both blobs */
+            int score1 = gate_checker_score(img, b1);
+            int score2 = gate_checker_score(img, b2);
+            if (score1 < GATE_CHECKER_MIN_FRAC_PCT) continue;
+            if (score2 < GATE_CHECKER_MIN_FRAC_PCT) continue;
+
+            /* Best = largest combined area */
+            int combined = b1->area + b2->area;
+            if (combined > best_area) {
+                best_area  = combined;
+                best_mid_x = (b1->cx + b2->cx) / 2;
+                gate_found = 1;
+            }
+        }
+    }
+
+    if (gate_found) {
+        result[0] = 1;
+        result[1] = best_mid_x;
+    }
+}

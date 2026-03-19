@@ -120,3 +120,93 @@ int dump_mask_to_file(const char *path, const uint8_t mask[], int w, int h);
 int dump_obstacles_to_file(const char *path, const struct obstacle_region_t obs[], int count);
 
 #endif
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  GATE DETECTION API
+ * ══════════════════════════════════════════════════════════════════════════════
+ *
+ * detect_gate() scans the image for two parallel, similarly-sized blue blobs
+ * that correspond to the TU Delft gate pillars, confirms each with a checker
+ * pattern check, and returns the gate centre.
+ *
+ * Output array layout:
+ *   result[0] : 0 = no gate, 1 = gate detected
+ *   result[1] : pixel distance from the LEFT edge of the image to the gate
+ *               centre X coordinate (= distance from the TOP edge when the
+ *               image is displayed upright after 90° CCW rotation)
+ *
+ * The image is assumed to be in the same YUV422 (UYVY) format used throughout
+ * this module, and to be portrait/rotated (floor on the LEFT side).
+ */
+
+/* ── YUV thresholds for TU Delft blue ─────────────────────────────────────── */
+#ifndef GATE_BLUE_Y_MIN
+#define GATE_BLUE_Y_MIN     0
+#endif
+#ifndef GATE_BLUE_Y_MAX
+#define GATE_BLUE_Y_MAX   220
+#endif
+#ifndef GATE_BLUE_U_MIN
+#define GATE_BLUE_U_MIN   122   /* blue drives Cb well above 128 */
+#endif
+#ifndef GATE_BLUE_U_MAX
+#define GATE_BLUE_U_MAX   255
+#endif
+#ifndef GATE_BLUE_V_MIN
+#define GATE_BLUE_V_MIN     0
+#endif
+#ifndef GATE_BLUE_V_MAX
+#define GATE_BLUE_V_MAX   123   /* blue keeps Cr well below 128  */
+#endif
+
+/* ── Blob filtering ─────────────────────────────────────────────────────────── */
+/* Minimum blob area as a fraction of total image pixels, in units of 1/100000 */
+/* Default 0.003 * 100000 = 300 → area >= w*h*300/100000                       */
+#ifndef GATE_BLOB_MIN_AREA_NUM
+#define GATE_BLOB_MIN_AREA_NUM    3
+#endif
+#ifndef GATE_BLOB_MIN_AREA_DEN
+#define GATE_BLOB_MIN_AREA_DEN 1000
+#endif
+#ifndef GATE_BLOB_MIN_DIM
+#define GATE_BLOB_MIN_DIM        10   /* px — kills thin noise lines           */
+#endif
+
+/* ── Parallelism thresholds ─────────────────────────────────────────────────── */
+/* Max relative aspect-ratio difference, in units of 1/100 (50 = 50%)          */
+#ifndef GATE_MAX_ASPECT_DIFF_PCT
+#define GATE_MAX_ASPECT_DIFF_PCT  50
+#endif
+/* Max relative area difference, in units of 1/100 (60 = 60%)                  */
+#ifndef GATE_MAX_AREA_DIFF_PCT
+#define GATE_MAX_AREA_DIFF_PCT    60
+#endif
+/* Max skew of centroid-join from perpendicular, in degrees * 10 (100 = 10°)   */
+#ifndef GATE_MAX_SKEW_DEG10
+#define GATE_MAX_SKEW_DEG10      100
+#endif
+
+/* ── Checker confirmation ─────────────────────────────────────────────────── */
+/* Search band width = blob_width * GATE_CHECKER_BAND_NUM / GATE_CHECKER_BAND_DEN */
+#ifndef GATE_CHECKER_BAND_NUM
+#define GATE_CHECKER_BAND_NUM   4
+#endif
+#ifndef GATE_CHECKER_BAND_DEN
+#define GATE_CHECKER_BAND_DEN   5
+#endif
+/* Minimum grayscale range (max-min) in a column to count as "high contrast"   */
+#ifndef GATE_CHECKER_CONTRAST
+#define GATE_CHECKER_CONTRAST  120
+#endif
+/* Min fraction of columns passing contrast test, in units of 1/100 (35 = 35%) */
+#ifndef GATE_CHECKER_MIN_FRAC_PCT
+#define GATE_CHECKER_MIN_FRAC_PCT  35
+#endif
+
+/* Maximum number of blue blobs tracked during gate detection                  */
+#ifndef GATE_MAX_BLOBS
+#define GATE_MAX_BLOBS  16
+#endif
+
+/* ── Public function ─────────────────────────────────────────────────────── */
+void detect_gate(struct image_t *img, int result[2]);
