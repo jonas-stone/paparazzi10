@@ -179,66 +179,66 @@ def update_and_detect(boundary_row, h, ground_baseline,
 
 # ── colour classifiers ────────────────────────────────────────────────────────
 
-# def is_ground(Y, U, V):
-#     if U <= 115.50:
-#         if V <= 145.00:
-#             if Y <= 85.50:
-#                 if Y <= 78.50:
-#                     return 0
-#                 else:
-#                     return 0
-#             else:
-#                 if U <= 92.50:
-#                     return 0
-#                 else:
-#                     return 255
-#         else:
-#             if V <= 152.50:
-#                 if Y <= 177.00:
-#                     return 255
-#                 else:
-#                     return 0
-#             else:
-#                 return 0
-#     else:
-#         if U <= 121.50:
-#             if V <= 137.50:
-#                 if Y <= 87.50:
-#                     return 0
-#                 else:
-#                     return 255
-#             else:
-#                 if U <= 116.50:
-#                     return 0
-#                 else:
-#                     return 0
-#         else:
-#             if U <= 122.50:
-#                 if V <= 126.00:
-#                     return 0
-#                 else:
-#                     return 0
-#             else:
-#                 if Y <= 62.50:
-#                     return 0
-#                 else:
-#                     return 0
-
-
 def is_ground(Y, U, V):
-    if U <= 96.50:
-        if Y <= 102.50:
-            return 255
+    if U <= 115.50:
+        if V <= 145.00:
+            if Y <= 85.50:
+                if Y <= 78.50:
+                    return 0
+                else:
+                    return 0
+            else:
+                if U <= 92.50:
+                    return 0
+                else:
+                    return 255
         else:
-            return 0
-    else:
-        if U <= 97.50:
-            if V <= 126.00:
-                return 255
+            if V <= 152.50:
+                if Y <= 177.00:
+                    return 255
+                else:
+                    return 0
             else:
                 return 0
+    else:
+        if U <= 121.50:
+            if V <= 137.50:
+                if Y <= 87.50:
+                    return 0
+                else:
+                    return 255
+            else:
+                if U <= 116.50:
+                    return 0
+                else:
+                    return 0
         else:
-            return 0
+            if U <= 122.50:
+                if V <= 126.00:
+                    return 0
+                else:
+                    return 0
+            else:
+                if Y <= 62.50:
+                    return 0
+                else:
+                    return 0
+
+
+# def is_ground(Y, U, V):
+#     if U <= 96.50:
+#         if Y <= 102.50:
+#             return 255
+#         else:
+#             return 0
+#     else:
+#         if U <= 97.50:
+#             if V <= 126.00:
+#                 return 255
+#             else:
+#                 return 0
+#         else:
+#             return 0
 
 
 vectorized_is_ground     = np.vectorize(is_ground)
@@ -444,7 +444,16 @@ if __name__ == "__main__":
     # 1 = interactive navigation
     # 2 = single image
 
-    SINGLE_IMAGE_PATH = "DEVELOPMENT/downloads from drone/20260306-095826/1352900896.jpg"
+    # SINGLE_IMAGE_PATH = "DEVELOPMENT/downloads from drone/20260306-095826/1352900896.jpg"
+    """ ALEX CHANGES FROM HERE """
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _project_root = os.path.abspath(os.path.join(_script_dir, "..", "..", ".."))
+
+    SINGLE_IMAGE_PATH = os.path.join(_project_root, "DEVELOPMENT", "downloads from drone", "20260306-095826",
+                                     "1352900896.jpg")
+    folder_path = os.path.join(_project_root, "DEVELOPMENT", "downloads from drone", "20260313-100130")
+    """ ALEX CHANGES TO HERE """
+
     FRAME_DELAY = 1
 
     cv2.destroyAllWindows()
@@ -455,7 +464,9 @@ if __name__ == "__main__":
         start_idx   = 0
     else:
         #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
-        folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
+        """ ALEX CHANGES FROM HERE """
+        # folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
+        """ ALEX CHANGES TO HERE """
         #folder_path = "DEVELOPMENT/downloads from drone/sim_images/"
         image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
 
