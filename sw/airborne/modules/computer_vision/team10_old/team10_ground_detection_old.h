@@ -31,13 +31,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ── Gate detection result (read from any module after ground_detection_periodic) ── */
-/* gate_detected : 1 if a gate was found in the most recent frame, 0 otherwise       */
-/* gate_center_x : pixel distance from the LEFT edge of the raw image to the gate    */
-/*                 centre (= distance from the TOP edge in the upright display view)  */
-extern uint8_t gate_detected;
-extern int     gate_center_x;
-
 // Module functions
 extern void ground_detection_init(void);
 extern void ground_detection_periodic(void);

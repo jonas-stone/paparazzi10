@@ -692,4 +692,8 @@
 #define TEAM10_GROUND_DETECTION_ID 1
 #endif
 
+#ifndef TEAM10_GATE_DETECTION_ID
+#define TEAM10_GATE_DETECTION_ID 1
+#endif
+
 #endif /* ABI_SENDER_IDS_H */
