@@ -686,7 +686,7 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
                                           DEFAULT_PLANT_MAX_COL_GAP, po);
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
-
+    
     return no;
 }
 
