@@ -78,6 +78,7 @@
 struct obstacle_region_t {
     uint16_t start;
     uint16_t width;
+    uint16_t baseline_height;
 };
 
 /* ══════════════════════════════════════════════════════════════════════════════
