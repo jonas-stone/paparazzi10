@@ -37,7 +37,7 @@ import solidity_detection as sdd
 # ★  USER CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
 
-FOLDER_PATH   = "../paparazzi10/DEVELOPMENT/downloads from drone/20260306-095826"   # path relative to this script
+FOLDER_PATH   = "../paparazzi10/DEVELOPMENT/downloads from drone/20260313-100130"   # path relative to this script
 SCALE_FACTOR  = 0.8        # main pipeline downscale
 FPS           = 30.0       # source footage frame rate (for TTC in seconds)
 
@@ -339,16 +339,60 @@ def detect_flow_features(gray):
 
 
 def compute_expansion(cx, cy, pts_prev, pts_next):
-    """Mean radial expansion: positive = approaching obstacle."""
-    components = []
-    for p, q in zip(pts_prev, pts_next):
-        px, py = p.ravel();  qx, qy = q.ravel()
-        dx, dy = px - cx, py - cy
-        n      = np.hypot(dx, dy)
-        if n < 1e-3:
-            continue
-        components.append(((qx - px) * dx + (qy - py) * dy) / n)
-    return float(np.mean(components)) if components else 0.0
+    """
+    Rotation-compensated radial expansion.
+
+    Strategy
+    --------
+    For each tracked point, the expected flow due to a pure in-plane rotation
+    of the camera is tangential to the circle centred on the image centre.
+    We estimate the global rotation rate (omega, rad/frame) via a least-squares
+    fit over all points, then subtract each point's predicted rotational flow
+    before projecting onto the radial direction.
+
+    Only the residual — pure forward/backward translation — contributes to the
+    returned expansion value, so yaw does not falsely trigger a TTC warning.
+    """
+    prev = pts_prev.reshape(-1, 2).astype(np.float64)
+    next_ = pts_next.reshape(-1, 2).astype(np.float64)
+
+    # Vectors from image centre to each previous point
+    dx = prev[:, 0] - cx
+    dy = prev[:, 1] - cy
+    r  = np.hypot(dx, dy)
+
+    valid = r > 1.0
+    if valid.sum() < 4:
+        return 0.0
+
+    dx, dy   = dx[valid], dy[valid]
+    r        = r[valid]
+    flow     = next_[valid] - prev[valid]   # shape (N, 2)
+
+    # Tangential unit vector (perpendicular to radial, CCW positive):
+    #   t = (-dy/r, dx/r)
+    tang_x = -dy / r
+    tang_y =  dx / r
+
+    # Project each flow vector onto the tangential direction
+    tang_flow = flow[:, 0] * tang_x + flow[:, 1] * tang_y   # shape (N,)
+
+    # Least-squares estimate of rotation rate omega (rad/frame)
+    # tang_flow ≈ omega * r  →  omega = sum(tang_flow * r) / sum(r^2)
+    omega = np.sum(tang_flow * r) / np.sum(r ** 2)
+
+    # Subtract predicted rotational flow from each point's flow vector
+    rot_flow_x = omega * (-dy)   # = omega * r * tang_x
+    rot_flow_y = omega * ( dx)   # = omega * r * tang_y
+    residual_x = flow[:, 0] - rot_flow_x
+    residual_y = flow[:, 1] - rot_flow_y
+
+    # Project residual onto the radial (outward) direction
+    radial_x = dx / r
+    radial_y = dy / r
+    radial_components = residual_x * radial_x + residual_y * radial_y
+
+    return float(np.mean(radial_components))
 
 
 def time_to_contact(expansion):
