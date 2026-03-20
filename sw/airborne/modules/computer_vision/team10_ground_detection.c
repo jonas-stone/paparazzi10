@@ -33,7 +33,7 @@ struct obstacle_region_t global_plants[MAX_PLANT_REGIONS];
 
 /* ── Gate state (protected by mutex, written by camera thread) ─────────── */
 uint8_t gate_detected  = 0;   /* 0 = no gate, 1 = gate present             */
-int     gate_center_x  = 0;   /* px from left edge of raw image to centre  */
+int gate_center_x  = 0;   /* px from left edge of raw image to centre  */
 
 static struct image_t *detect_obstacles_from_ground(struct image_t *img,
         uint8_t camera_id __attribute__((unused)))
