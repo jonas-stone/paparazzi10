@@ -1,6 +1,7 @@
 /*
  * team10_get_obstacle_info.c — Paparazzi build.
- * Complete pipeline with is_smooth_blob (perimeter + fractal dimension).
+ * Complete pipeline with is_smooth_blob (perimeter ratio; fractal dim disabled).
+ * Standardized output: both obstacles and plants use (start_row, width) format.
  * Same algorithm as _standalone.c, with real Paparazzi includes.
  */
 
@@ -12,7 +13,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
-#include "team10_rtp_utilities.h"
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  STATIC WORK BUFFERS
@@ -51,9 +51,8 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
-/* Uncomment ONE of these: */
-// #define GROUND_TREE_REAL
-#define GROUND_TREE_SIM
+#define GROUND_TREE_REAL
+//#define GROUND_TREE_SIM
 
 /* --- DECISION TREE --- */
 uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
@@ -112,10 +111,18 @@ void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[],
 {
     int w = img->w, h = img->h;
     const uint8_t *buf = (const uint8_t *)img->buf;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
+    
+    // Calculate the starting row (halfway down the screen)
+    int max_x = w / 2; 
+    // Explicitly paint the entire top half of the working mask black (0)
+    memset(work_mask2, 0, w * h);
+    // Loop through all rows (y), but ONLY loop halfway across the columns (x)
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < max_x; x++) {
             work_mask2[y * w + x] = is_ground_pixel(
                 yuv422_Y(buf, w, x, y), yuv422_U(buf, w, x, y), yuv422_V(buf, w, x, y));
+        }
+    }
     if (median_ksize >= 3 && (median_ksize & 1))
         median_blur_binary(work_mask2, mask_out, w, h, median_ksize);
     else
@@ -343,11 +350,11 @@ int is_smooth_blob(const int16_t *labels, int w, int h,
     if (perim_ratio < SMOOTH_PERIMETER_RATIO_THRESH)
         return 1;  /* smooth */
 
-    /* fractal dimension check (expensive — only if perimeter ratio failed) */
+    /* fractal dimension check (expensive — disabled for performance)
     float fd = compute_fractal_dimension(labels, w, h, lbl);
 
     if (fd < SMOOTH_FRACTAL_DIM_THRESH)
-        return 1;  /* smooth */
+        return 1;   smooth */
 
     return 0;  /* both checks failed → spiky, remove this blob */
 }
@@ -508,13 +515,67 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     int nf = merge_obstacle_cols(om, w, mw, mcg, fl, MAX_OBSTACLE_REGIONS);
     for (int i = 0; i < w; i++)
         if (nom[i]) gb[i] = (1.0f - alpha) * gb[i] + alpha * (float)br[i];
+    //float lg = (float)ngb;
+    //for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
+    /* Two-pass propagation: left-to-right, then right-to-left, take min */
     float lg = (float)ngb;
-    for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
+    for (int i = 0; i < w; i++) {
+        if (nom[i]) lg = gb[i];
+        else gb[i] = lg;  /* left neighbor's value */
+    }
+
+    /* Right-to-left pass */
+    float rg = (float)ngb;
+    for (int i = w - 1; i >= 0; i--) {
+        if (nom[i]) {
+            rg = gb[i];
+        } else {
+            /* If we haven't seen ANY valid ground to the right yet, 
+               force it to the default low baseline, ignoring the left anchor. */
+            if (rg == (float)ngb) {
+                gb[i] = (float)ngb;
+            } else {
+                /* Keep the MINIMUM (visually highest) of left-propagated and right-propagated */
+                if (rg < gb[i]) {
+                    gb[i] = rg;
+                }
+            }
+        }
+    }
     int no = 0;
     for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
-        int s = fl[i].start, rw = fl[i].width, e = s + rw - 1;
-        int left = h - 1 - e; if (left < 0) left = 0;
-        oo[no].start = (uint16_t)left; oo[no].width = (uint16_t)rw; no++;
+        if (fl[i].width < 5) continue;
+        oo[no].start = (uint16_t)fl[i].start;
+        oo[no].width = (uint16_t)fl[i].width;
+
+        int s = fl[i].start;
+        int e = s + fl[i].width - 1;
+        
+        // ── SIMPLIFIED HEIGHT LOGIC ──
+        int max_br = 0; 
+        int touches_bottom = 0; // Flag to track if ground vanishes
+        
+        for (int r = s; r <= e; r++) {
+            if (r < w) {
+                if (br[r] >= h) {
+                    // No ground found in this specific column
+                    touches_bottom = 1; 
+                } else {
+                    // Track valid points just in case it DOESN'T touch the bottom
+                    if (br[r] > max_br) {
+                        max_br = br[r];
+                    }
+                }
+            }
+        }
+        
+        // The Simple Rule: If it loses the ground ANYWHERE, or has no valid points, set to default.
+        if (touches_bottom || max_br == 0) {
+            max_br = ngb;
+        }
+        
+        oo[no].baseline_height = (uint16_t)max_br;
+        no++;
     }
     return (uint8_t)no;
 }
@@ -625,14 +686,6 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
                                           DEFAULT_PLANT_MAX_COL_GAP, po);
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
-
-    // RTP Utilities from the file team10_rtp_utils.c
-
-    //draw_mask_printer(img, work_mask, w, h);   
-    draw_toolbar_vertical(img, w, h, gf, no, oo);
-    draw_safe_direction_bar(img, w, h, no, oo);    
-    //draw_obstacle_detection_bar(img, w, h, no, oo);
-
     
     return no;
 }
