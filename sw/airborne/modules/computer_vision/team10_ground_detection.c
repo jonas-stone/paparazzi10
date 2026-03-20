@@ -58,6 +58,8 @@ static uint8_t  global_obstacle_count = 0;
 static uint8_t  global_plant_count    = 0;
 struct obstacle_region_t global_obstacles[MAX_OBSTACLE_REGIONS];
 struct obstacle_region_t global_plants[MAX_PLANT_REGIONS];
+static int16_t  global_boundary[MAX_IMAGE_HEIGHT];
+static uint16_t global_boundary_len = 0;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  YUV422 NEAREST-NEIGHBOUR DOWNSAMPLE
@@ -153,6 +155,7 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     }
 
     /* ── Copy to globals ──────────────────────────────────────────────────── */
+    uint16_t br_len = (uint16_t)dst_h;
     pthread_mutex_lock(&mutex);
     memcpy(global_obstacles, local_obstacles,
            MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
@@ -160,7 +163,12 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
            MAX_PLANT_REGIONS * sizeof(struct obstacle_region_t));
     global_obstacle_count = obstacle_count;
     global_plant_count    = plant_count;
-    obstacles_updated     = true;
+    // copy boundary rows
+    global_boundary_len = br_len;
+    for (uint16_t i = 0; i < br_len; i++) {
+        global_boundary[i] = (int16_t)((boundary_rows[i] * SCALE_DEN) / SCALE_NUM);
+    }
+    obstacles_updated = true;
 
     for (int i = 0; i < obstacle_count; i++)
         printf("Obstacle %d: start=%d width=%d\n",
@@ -194,7 +202,9 @@ void ground_detection_init(void)
 void ground_detection_periodic(void)
 {
     struct obstacle_region_t lo[MAX_OBSTACLE_REGIONS], lp[MAX_PLANT_REGIONS];
-    uint8_t oc, pc;
+    int16_t  br[MAX_IMAGE_HEIGHT];
+    uint8_t  oc, pc;
+    uint16_t bl;
 
     pthread_mutex_lock(&mutex);
     if (!obstacles_updated) {
@@ -203,11 +213,18 @@ void ground_detection_periodic(void)
     }
     oc = global_obstacle_count;
     pc = global_plant_count;
+    bl = global_boundary_len;
     memcpy(lo, global_obstacles, sizeof(lo));
-    memcpy(lp, global_plants, sizeof(lp));
+    memcpy(lp, global_plants,    sizeof(lp));
+    memcpy(br, global_boundary,  bl * sizeof(int16_t));
     obstacles_updated = false;
     pthread_mutex_unlock(&mutex);
 
-    /* All coordinates in native camera resolution (240×520 row-index space). */
-    AbiSendMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, lo, oc);
+    // NOW send everything: obstacles, plants, and boundary
+    AbiSendMsgTEAM10_GROUND_DETECTION(
+        TEAM10_GROUND_DETECTION_ID,
+        lo, oc,
+        lp, pc,
+        br, bl
+    );
 }

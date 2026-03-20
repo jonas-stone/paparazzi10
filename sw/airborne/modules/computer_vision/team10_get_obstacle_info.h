@@ -34,6 +34,8 @@
 #define MAX_CC_LABELS 512
 #endif
 
+
+
 /* ── detection type flags ──────────────────────────────────────────────────── */
 #define DET_OBSTACLE  0
 #define DET_PLANT     1
@@ -76,9 +78,10 @@
 
 /* ── region descriptor ─────────────────────────────────────────────────────── */
 struct obstacle_region_t {
-    uint16_t start;
-    uint16_t width;
-    uint16_t baseline_height;
+    int16_t  left_x;
+    int16_t  width;
+    int16_t  height;
+    uint8_t  det_type;
 };
 
 typedef struct {
