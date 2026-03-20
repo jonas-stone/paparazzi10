@@ -60,8 +60,8 @@ enum navigation_state_t {
 enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
 int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
 float heading_increment = 5.f;          // heading angle increment [deg]
-float maxDistance = 2.25;               // max waypoint displacement [m]
-
+float maxDistance = 0.5;//2.25;               // max waypoint displacement [m]
+float speed_multiplier = 0.05;
 // define script-level variables
 struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS]; 
 uint8_t   obstacle_count        = 0;
@@ -137,7 +137,7 @@ void ground_obstacle_avoidance_periodic(void)
   // bound obstacle_free_confidence
   Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
 
-  float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
+  float moveDistance = fminf(maxDistance, speed_multiplier * obstacle_free_confidence); // 0.2f * obstacle_free_confidence);
 
   switch (navigation_state){
     case SAFE:

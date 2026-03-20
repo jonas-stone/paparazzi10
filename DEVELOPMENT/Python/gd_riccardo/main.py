@@ -11,10 +11,12 @@ from glob import glob
 import numpy as np
 import cv2
 import os
-
+"""
+THIS IS BULLSHIT
+"""
 cv2.destroyAllWindows()
 
-folder_path = "TEAM-10-PROTOTYPING/downloads from drone/20260306-095826"
+folder_path = "DEVELOPMENT\\downloads from drone\\20260306-095826"
 image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))[50:]
 
 # same HSV bounds as before

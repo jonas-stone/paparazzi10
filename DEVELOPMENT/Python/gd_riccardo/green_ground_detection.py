@@ -1,6 +1,9 @@
 import cv2
 import numpy as np
 
+"""
+"""
+
 def find_ground_boundary(mask_rotated):
 
     """ 
