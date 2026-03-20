@@ -688,12 +688,6 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
 
-    // RTP Utilities from the file team10_rtp_utils.c
-
-    //draw_mask_printer(img, work_mask, w, h);   
-    draw_toolbar_vertical(img, w, h, gf, no, oo);
-    draw_safe_direction_bar(img, w, h, no, oo);    
-    //draw_obstacle_detection_bar(img, w, h, no, oo);
 
     
     return no;
