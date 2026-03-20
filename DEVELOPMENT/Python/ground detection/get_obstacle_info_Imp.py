@@ -179,66 +179,66 @@ def update_and_detect(boundary_row, h, ground_baseline,
 
 # ── colour classifiers ────────────────────────────────────────────────────────
 
-# def is_ground(Y, U, V):
-#     if U <= 115.50:
-#         if V <= 145.00:
-#             if Y <= 85.50:
-#                 if Y <= 78.50:
-#                     return 0
-#                 else:
-#                     return 0
-#             else:
-#                 if U <= 92.50:
-#                     return 0
-#                 else:
-#                     return 255
-#         else:
-#             if V <= 152.50:
-#                 if Y <= 177.00:
-#                     return 255
-#                 else:
-#                     return 0
-#             else:
-#                 return 0
-#     else:
-#         if U <= 121.50:
-#             if V <= 137.50:
-#                 if Y <= 87.50:
-#                     return 0
-#                 else:
-#                     return 255
-#             else:
-#                 if U <= 116.50:
-#                     return 0
-#                 else:
-#                     return 0
-#         else:
-#             if U <= 122.50:
-#                 if V <= 126.00:
-#                     return 0
-#                 else:
-#                     return 0
-#             else:
-#                 if Y <= 62.50:
-#                     return 0
-#                 else:
-#                     return 0
-
-
 def is_ground(Y, U, V):
-    if U <= 96.50:
-        if Y <= 102.50:
-            return 255
+    if U <= 115.50:
+        if V <= 145.00:
+            if Y <= 85.50:
+                if Y <= 78.50:
+                    return 0
+                else:
+                    return 0
+            else:
+                if U <= 92.50:
+                    return 0
+                else:
+                    return 255
         else:
-            return 0
-    else:
-        if U <= 97.50:
-            if V <= 126.00:
-                return 255
+            if V <= 152.50:
+                if Y <= 177.00:
+                    return 255
+                else:
+                    return 0
             else:
                 return 0
+    else:
+        if U <= 121.50:
+            if V <= 137.50:
+                if Y <= 87.50:
+                    return 0
+                else:
+                    return 255
+            else:
+                if U <= 116.50:
+                    return 0
+                else:
+                    return 0
         else:
-            return 0
+            if U <= 122.50:
+                if V <= 126.00:
+                    return 0
+                else:
+                    return 0
+            else:
+                if Y <= 62.50:
+                    return 0
+                else:
+                    return 0
+
+
+# def is_ground(Y, U, V):
+#     if U <= 96.50:
+#         if Y <= 102.50:
+#             return 255
+#         else:
+#             return 0
+#     else:
+#         if U <= 97.50:
+#             if V <= 126.00:
+#                 return 255
+#             else:
+#                 return 0
+#         else:
+#             return 0
 
 
 vectorized_is_ground     = np.vectorize(is_ground)
