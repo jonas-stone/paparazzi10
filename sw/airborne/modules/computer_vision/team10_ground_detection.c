@@ -17,7 +17,9 @@
  */
 #include "modules/computer_vision/team10_ground_detection.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
+#include "modules/computer_vision/team10_rtp_utilities.h"
 #include "modules/computer_vision/lib/vision/image.h"
+#include <team10_rtp_utilities.h>
 #include "modules/computer_vision/cv.h"
 #include "modules/core/abi.h"
 #include "std.h"
@@ -121,6 +123,7 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     struct obstacle_region_t local_plants[MAX_PLANT_REGIONS];
     uint8_t                  plant_count = 0;
 
+    obstacle_info_result_t result;
     uint8_t obstacle_count = get_obstacle_info(
             &scaled_img,
             ground_baseline,
@@ -133,7 +136,8 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
             &plant_count,
             boundary_rows,
             NULL,
-            NULL
+            NULL,
+            &result
     );
 
     /* ── Scale coordinates back to native resolution ──────────────────────── */
@@ -165,6 +169,11 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
         printf("Plant    %d: start=%d width=%d\n",
                i, global_plants[i].start, global_plants[i].width);
     pthread_mutex_unlock(&mutex);
+
+    draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
+    draw_toolbar_vertical(img, img->w, img->h, result.gf, obstacle_count, local_obstacles);
+    draw_safe_direction_bar(img, img->w, img->h, obstacle_count, local_obstacles);
+    draw_obstacle_detection_bar(img, img->w, img->h, obstacle_count, local_obstacles);
 
     return img;
 }

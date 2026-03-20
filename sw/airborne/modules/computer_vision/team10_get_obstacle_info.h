@@ -81,6 +81,12 @@ struct obstacle_region_t {
     uint16_t baseline_height;
 };
 
+typedef struct {
+    float    gf;
+    int      ground;
+    uint8_t *mask;
+} obstacle_info_result_t;
+
 /* ══════════════════════════════════════════════════════════════════════════════
  *  PUBLIC API
  * ══════════════════════════════════════════════════════════════════════════════ */
@@ -98,7 +104,8 @@ uint8_t get_obstacle_info(
         uint8_t                   *plant_count_out,
         int                        boundary_rows_out[],
         int                       *ground_found_out,
-        float                     *green_frac_out
+        float                     *green_frac_out,
+        obstacle_info_result_t    *result_out
 );
 
 /* ── exposed helpers for testing ───────────────────────────────────────────── */

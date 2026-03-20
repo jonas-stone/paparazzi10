@@ -52,8 +52,8 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
-#define GROUND_TREE_REAL
-//#define GROUND_TREE_SIM
+// #define GROUND_TREE_REAL
+#define GROUND_TREE_SIM
 
 /* --- DECISION TREE --- */
 uint8_t is_ground_pixel(uint8_t Y, uint8_t U, uint8_t V)
@@ -648,7 +648,7 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
                           float oacf, int mk, int mw,
                           struct obstacle_region_t oo[],
                           struct obstacle_region_t po[], uint8_t *pco,
-                          int bro[], int *gfo, float *gfro)
+                          int bro[], int *gfo, float *gfro, obstacle_info_result_t *result_out)
 {
     int w = img->w, h = img->h;
     if (w > MAX_IMAGE_WIDTH) w = MAX_IMAGE_WIDTH;
@@ -688,10 +688,11 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
 
-    draw_mask_printer(img, work_mask, w, h);   
-    draw_toolbar_vertical(img, w, h, gf, no, oo);
-    draw_safe_direction_bar(img, w, h, no, oo);    
-    draw_obstacle_detection_bar(img, w, h, no, oo);
+    if (result_out) {
+        result_out->gf     = gf;
+        result_out->ground = ground;
+        result_out->mask   = work_mask;
+    }
 
     return no;
 }
