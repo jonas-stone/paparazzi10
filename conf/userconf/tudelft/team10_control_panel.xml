@@ -49,7 +49,7 @@
     </session>
     <session name="Simulation - Gazebo">
       <program name="Simulator">
-        <arg flag="-a" constant="test"/> <!-- aircraft name: "test" -->
+        <arg flag="-a" constant="test"/>
         <arg flag="-t" constant="nps"/>
       </program>
       <program name="Data Link">
@@ -63,7 +63,7 @@
         <arg flag="--speech"/>
       </program>
       <program name="Joystick">
-        <arg flag="-ac" constant="test"/> <!-- aircraft name: "test" -->
+        <arg flag="-ac" constant="test"/>
         <arg flag="sm600.xml"/>
         <arg flag="-d 0"/>
       </program>
@@ -77,6 +77,44 @@
         <arg flag="port=5000"/>
         <arg flag="caps=application/x-rtp,payload=26"/>
         <arg flag="! rtpjpegdepay ! jpegdec ! videoflip method=counterclockwise ! autovideosink"/>
+      </program>
+    </session>
+    <session name="Testfly">
+      <program name="Data Link">
+        <arg flag="-udp"/>
+      </program>
+      <program name="UnifiedMoCap">
+        <arg flag="optitrack"/>
+        <arg flag="ivy"/>
+        <arg flag="--publish_frequency" constant="10"/>
+        <arg flag="--coordinate_system" constant="enu"/>
+        <arg flag="--coordinate_north" constant="far"/>
+        <arg flag="--craft_noses" constant="right"/>
+        <arg flag="--streaming_ids" constant="10"/>
+        <arg flag="--ac_id" constant="88"/>
+      </program>
+      <program name="Server"/>
+      <program name="PprzGCS">
+        <arg flag="--speech"/>
+      </program>
+      <program name="Joystick">
+        <arg flag="-ac" constant="test"/>
+        <arg flag="sm600.xml"/>
+        <arg flag="-d 0"/>
+      </program>
+      <program name="GST">
+        <arg flag="udpsrc"/>
+        <arg flag="port=5000"/>
+        <arg flag="caps=application/x-rtp,payload=26"/>
+        <arg flag="!"/>
+        <arg flag="rtpjpegdepay"/>
+        <arg flag="!"/>
+        <arg flag="jpegdec"/>
+        <arg flag="!"/>
+        <arg flag="videoflip"/>
+        <arg flag="method=counterclockwise"/>
+        <arg flag="!"/>
+        <arg flag="autovideosink"/>
       </program>
     </session>
   </section>
