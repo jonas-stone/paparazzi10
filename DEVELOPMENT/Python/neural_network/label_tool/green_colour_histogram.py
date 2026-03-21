@@ -1,5 +1,5 @@
 """
-SCRIPT FOR SELECTING ZONE WHERE DRONE SHOULD GO - LABELLING TOOL b
+SCRIPT FOR SELECTING ZONE WHERE DRONE SHOULD GO - LABELLING TOOL
 
 USES SOME FUNCTIONS PREVIOUSLY MADE BY JONAS AND RICCARDO BUT HAS COPIED THEM HERE FOR EASE OF USE
 
@@ -14,6 +14,7 @@ from glob import glob
 
 import cv2
 import numpy as np
+
 
 ########################################################################################################################
 # Inputs ###############################################################################################################
@@ -32,6 +33,8 @@ FRAME_DELAY = 1   # ms between cv2.waitKey polls
 N_PARTITIONS  = 7         # number of vertical partitions / Zones
 SPACING       = "biexp"   # "uniform" or "biexp"
 BIEXP_EXP     = 0.925     # lower = more centre-narrow, range (0.0, 1.0]
+MIN_BLOB_AREA  = 3000     # blobs smaller than this are discarded — tune to filter carpet/leakage
+DILATE_KERNEL  = 50      # pixels to close gaps — increase to bridge wider obstacles like pillars (0 = off)
 
 ########################################################################################################################
 # Functions ############################################################################################################
@@ -86,10 +89,63 @@ def is_ground(Y, U, V):
                     return 0
 
 
+def isolate_ground_blob(binary_img: np.ndarray):
+    """
+    1. Morphological CLOSE to bridge gaps (pillars, obstacles) between ground chunks
+    2. Remove blobs smaller than MIN_BLOB_AREA
+    Returns the closed mask (not masked back to original) so fill_holes
+    can see the full bridged region.
+    Tune DILATE_KERNEL to bridge wider gaps, MIN_BLOB_AREA to drop spurious blobs.
+    """
+    img = binary_img.astype(np.uint8)
+
+    if DILATE_KERNEL > 0:
+        k          = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (DILATE_KERNEL, DILATE_KERNEL))
+        img_closed = cv2.morphologyEx(img, cv2.MORPH_CLOSE, k)
+    else:
+        img_closed = img
+
+    result = cv2.connectedComponentsWithStats(img_closed, connectivity=8)
+    totalLabels, labeled_img, values, _ = result
+
+    for blob_label in range(1, totalLabels):
+        if values[blob_label, cv2.CC_STAT_AREA] < MIN_BLOB_AREA:
+            labeled_img[labeled_img == blob_label] = 0
+
+    labeled_img[labeled_img != 0] = 255
+    return labeled_img.astype(np.uint8)
+
+
+def fill_holes(binary_img: np.ndarray):
+    """
+    Fill regions fully enclosed by ground on all sides.
+    Image edges act as walls — regions touching the border are NOT filled,
+    preventing leakage out of the image boundary.
+    """
+    binary_img = binary_img.astype(np.uint8)
+    H, W = binary_img.shape
+
+    # pad with 1px border of zeros so flood fill can reach all edge-connected regions
+    padded = cv2.copyMakeBorder(binary_img, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+
+    # flood fill the non-ground regions reachable from outside
+    inv  = cv2.bitwise_not(padded)
+    mask = np.zeros((H + 4, W + 4), dtype=np.uint8)
+    cv2.floodFill(inv, mask, (0, 0), 255)
+    inv_flooded = cv2.bitwise_not(inv)
+
+    # remove padding
+    inv_flooded = inv_flooded[1:H+1, 1:W+1]
+
+    # enclosed holes → fill as ground
+    filled = cv2.bitwise_or(binary_img, inv_flooded)
+    return filled
+
+
 def detect_ground(image_bgr, median_ksize=5):
     """
     Applies the strict decision-tree ground classifier per pixel.
-    Returns a binary mask (uint8, 0 or 255), full resolution.
+    Returns (mask, holes_mask) both uint8, full resolution.
     """
     _apply = np.vectorize(is_ground)
 
@@ -101,7 +157,11 @@ def detect_ground(image_bgr, median_ksize=5):
     if median_ksize >= 3:
         mask = cv2.medianBlur(mask, median_ksize)
 
-    return mask
+    mask_before_fill = isolate_ground_blob(mask)
+    mask_filled      = fill_holes(mask_before_fill)
+    holes_mask       = cv2.subtract(mask_filled.astype(np.uint8), mask_before_fill.astype(np.uint8))
+
+    return mask_filled, holes_mask
 
 
 def ground_column_counts(mask):
@@ -161,7 +221,7 @@ def get_best_partition(part_data):
     return int(np.argmax(pcts))
 
 
-def build_display(image_bgr, mask, partitions, part_data, best_idx):
+def build_display(image_bgr, mask, holes_mask, partitions, part_data, best_idx):
     """
     Pure visualisation — takes analysis results as input, draws nothing itself.
 
@@ -169,12 +229,14 @@ def build_display(image_bgr, mask, partitions, part_data, best_idx):
     ----------
     image_bgr  : original BGR image (unrotated)
     mask       : ground mask (unrotated)
+    holes_mask : pixels filled by fill_holes (shown in blue)
     partitions : output of get_partition_edges
     part_data  : output of partition_ground_counts
     best_idx   : output of get_best_partition
     """
-    image_bgr = cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    mask      = cv2.rotate(mask,      cv2.ROTATE_90_COUNTERCLOCKWISE)
+    image_bgr  = cv2.rotate(image_bgr,  cv2.ROTATE_90_COUNTERCLOCKWISE)
+    mask       = cv2.rotate(mask,       cv2.ROTATE_90_COUNTERCLOCKWISE)
+    holes_mask = cv2.rotate(holes_mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
     H, W = image_bgr.shape[:2]
 
@@ -183,8 +245,10 @@ def build_display(image_bgr, mask, partitions, part_data, best_idx):
     max_pct   = max(part_pcts) if max(part_pcts) > 0 else 1
 
     # panel 1: original with ground overlay + partition lines
+    # green = detected ground, blue = filled holes
     overlay = image_bgr.copy()
-    overlay[mask > 0] = [0, 255, 0]
+    overlay[mask > 0]       = [0, 255, 0]   # green: detected ground
+    overlay[holes_mask > 0] = [255, 100, 0] # blue: filled holes
     panel1 = cv2.addWeighted(image_bgr, 0.5, overlay, 0.5, 0)
 
     for i, (x0, x1) in enumerate(partitions):
@@ -197,9 +261,15 @@ def build_display(image_bgr, mask, partitions, part_data, best_idx):
     max_count = counts.max() if counts.max() > 0 else 1
     norm      = (counts / max_count * (H - 1)).astype(int)
 
+    hole_counts = (holes_mask > 0).sum(axis=0).astype(np.float32)
+    hole_norm   = (hole_counts / max_count * (H - 1)).astype(int)
+
     for x, bar_h in enumerate(norm):
         if bar_h > 0:
             cv2.line(hist_img, (x, H - 1), (x, H - 1 - bar_h), (0, 200, 80), 1)
+    for x, bar_h in enumerate(hole_norm):
+        if bar_h > 0:
+            cv2.line(hist_img, (x, H - 1), (x, H - 1 - bar_h), (255, 100, 0), 1)
 
     font   = cv2.FONT_HERSHEY_SIMPLEX
     fscale = 0.4
@@ -262,7 +332,7 @@ def main():
                     continue
 
                 # ── analysis ──────────────────────────────────────────────────
-                mask       = detect_ground(raw)
+                mask, holes_mask = detect_ground(raw)
                 counts     = ground_column_counts(
                                  cv2.rotate(mask, cv2.ROTATE_90_COUNTERCLOCKWISE))
                 H, W       = (cv2.rotate(raw, cv2.ROTATE_90_COUNTERCLOCKWISE)).shape[:2]
@@ -273,7 +343,7 @@ def main():
                 print(f"[{os.path.basename(image_path)}]  best partition: {best_idx}")
 
                 # ── visualisation ─────────────────────────────────────────────
-                frame = build_display(raw, mask, partitions, part_data, best_idx)
+                frame = build_display(raw, mask, holes_mask, partitions, part_data, best_idx)
 
                 cv2.setWindowTitle(WINDOW,
                     f"[{idx+1}/{len(image_paths)}]  {os.path.basename(image_path)}"
@@ -284,10 +354,10 @@ def main():
             key = cv2.waitKey(FRAME_DELAY)
             if key == ord('q'):
                 break
-            elif key in (ord('d'), 83, 65363):
+            elif key in (ord('d'), 83, 65363) and not needs_processing:
                 idx = (idx + 1) % len(image_paths)
                 needs_processing = True
-            elif key in (ord('a'), 81, 65361):
+            elif key in (ord('a'), 81, 65361) and not needs_processing:
                 idx = (idx - 1) % len(image_paths)
                 needs_processing = True
 
