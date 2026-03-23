@@ -275,7 +275,7 @@
       <field name="actuators_t4_extra_data_in_ptr" type="float *">Pointer pointing at the actuators_t4_extra_data_in array</field>
     </message>
 
-    <message name="TEAM10_GROUND_DETECTION" id="XXX">
+    <message name="TEAM10_GROUND_DETECTION" id="42">
       <field name="obstacles"      type="struct obstacle_region_t *"/>
       <field name="obstacle_count" type="uint8_t"/>
       <field name="plants"         type="struct obstacle_region_t *"/>

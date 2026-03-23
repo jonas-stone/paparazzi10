@@ -178,10 +178,15 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
                i, global_plants[i].start, global_plants[i].width);
     pthread_mutex_unlock(&mutex);
 
-    draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
+    // RTP VISUALIZATION
+    
+    //draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
     draw_toolbar_vertical(img, img->w, img->h, result.gf, obstacle_count, local_obstacles);
-    draw_safe_direction_bar(img, img->w, img->h, obstacle_count, local_obstacles);
-    draw_obstacle_detection_bar(img, img->w, img->h, obstacle_count, local_obstacles);
+    draw_safe_direction_bar(img, img->w, img->h,
+                        obstacle_count, local_obstacles,
+                        plant_count, local_plants,
+                        ground_baseline);
+    //draw_obstacle_detection_bar(img, img->w, img->h, obstacle_count, local_obstacles);
 
     return img;
 }

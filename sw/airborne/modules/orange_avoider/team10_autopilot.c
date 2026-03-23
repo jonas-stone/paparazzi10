@@ -48,6 +48,7 @@ static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeter
 static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
 static uint8_t increase_nav_heading(float incrementDegrees);
 static uint8_t chooseRandomIncrementAvoidance(void);
+float speed_multiplier = 1.0f;
 
 enum navigation_state_t {
   SAFE,
@@ -60,15 +61,12 @@ enum navigation_state_t {
 enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
 int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
 float heading_increment = 5.f;          // heading angle increment [deg]
-float maxDistance = 0.5;//2.25;               // max waypoint displacement [m]
-float speed_multiplier = 0.05;
+float maxDistance = 2.25;               // max waypoint displacement [m]
+
 // define script-level variables
-static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
-static struct obstacle_region_t plants[MAX_PLANT_REGIONS];
-static int16_t                  boundary_rows[MAX_IMAGE_HEIGHT];
-static uint8_t                  obstacle_count = 0;
-static uint8_t                  plant_count    = 0;
-static uint16_t                 boundary_len   = 0;
+struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS]; 
+uint8_t   obstacle_count        = 0;
+uint16_t  total_obstacle_width  = 0;
 
 // define threshold settings -> lower, drone is more scared
 float obstacle_width_threshold = 0.2f;
@@ -90,21 +88,19 @@ const int16_t max_trajectory_confidence = 5; // number of consecutive negative o
 static abi_event ground_detection_ev;
 
 // ABI video callback function, gets the data from the computer vision code
-static void ground_detection_callback(
-    uint8_t __attribute__((unused)) sender_id,
-    struct obstacle_region_t *in_obs,   uint8_t  in_oc,
-    struct obstacle_region_t *in_plants, uint8_t  in_pc,
-    int16_t                  *in_br,    uint16_t in_bl)
+static void ground_detection_callback(uint8_t __attribute__((unused)) sender_id,
+                                      struct obstacle_region_t       *incoming_obstacles,
+                                      uint8_t                         incoming_obstacle_count)
 {
-    obstacle_count = in_oc;
-    memcpy(obstacles, in_obs, in_oc * sizeof(struct obstacle_region_t));
+  // store incoming variables inside this scope
+  obstacle_count = incoming_obstacle_count;
+  memcpy(obstacles, incoming_obstacles, obstacle_count * sizeof(struct obstacle_region_t));
 
-    plant_count = in_pc;
-    memcpy(plants, in_plants, in_pc * sizeof(struct obstacle_region_t));
-
-    boundary_len = in_bl;
-    if (boundary_len > MAX_IMAGE_HEIGHT) boundary_len = MAX_IMAGE_HEIGHT;
-    memcpy(boundary_rows, in_br, boundary_len * sizeof(int16_t));
+  // compute total obstacle width from incoming image
+  total_obstacle_width = 0;
+  for (uint8_t i = 0; i < obstacle_count; i++) {
+    total_obstacle_width += obstacles[i].width;
+  }
 }
 
 /*
@@ -121,140 +117,80 @@ void ground_obstacle_avoidance_init(void) {
  */
 void ground_obstacle_avoidance_periodic(void)
 {
-  if (!autopilot_in_flight()) return;
-
-  /* ════════════════════════════════════════════════════════════════════════
-   *  STEP 1 — Derive useful quantities from raw data
-   * ════════════════════════════════════════════════════════════════════════ */
-
-  // ── obstacle summary ────────────────────────────────────────────────────
-  uint16_t total_obstacle_width = 0;
-  float    widest_obs_center    = 0.5f;   // as fraction of image height [0=right, 1=left]
-  int16_t  widest_obs_width     = 0;
-  int16_t  tallest_obs_height   = 0;
-
-  for (uint8_t i = 0; i < obstacle_count; i++) {
-    total_obstacle_width += obstacles[i].width;
-
-    // track the widest (= closest) obstacle
-    if (obstacles[i].width > widest_obs_width) {
-      widest_obs_width  = obstacles[i].width;
-      widest_obs_center = (obstacles[i].start + obstacles[i].width / 2.0f)
-                          / (float)MAX_IMAGE_HEIGHT;
-      tallest_obs_height = obstacles[i].baseline_height;
-    }
+  // only evaluate our state machine if we are flying
+  if(!autopilot_in_flight()){
+    return;
   }
 
-  float obstacle_frac = total_obstacle_width / (float)MAX_IMAGE_HEIGHT;
+  // print stuff to terminal
+  printf("total obstacle width: %.2f\nthreshold (fraction): %.2f\nthreshold (total):    %.2f\n",
+       total_obstacle_width / (float)MAX_IMAGE_WIDTH,
+       obstacle_width_threshold,
+       obstacle_width_threshold * MAX_IMAGE_WIDTH);
 
-  // ── plant summary ───────────────────────────────────────────────────────
-  uint16_t total_plant_width = 0;
-  for (uint8_t i = 0; i < plant_count; i++) {
-    total_plant_width += plants[i].width;
-  }
-  float plant_frac = total_plant_width / (float)MAX_IMAGE_HEIGHT;
-
-  // ── boundary analysis (left half vs right half of view) ─────────────────
-  // lower boundary value = more ground visible = safer
-  // higher boundary value = ground occluded = obstacle
-  float left_avg  = 0.0f;
-  float right_avg = 0.0f;
-
-  if (boundary_len > 0) {
-    uint16_t mid = boundary_len / 2;
-    for (uint16_t i = 0; i < mid; i++) {
-      right_avg += boundary_rows[i];         // rows 0..mid = right side
-    }
-    for (uint16_t i = mid; i < boundary_len; i++) {
-      left_avg += boundary_rows[i];          // rows mid..end = left side
-    }
-    right_avg /= (float)mid;
-    left_avg  /= (float)(boundary_len - mid);
-  }
-
-  // higher average = more occluded = more dangerous on that side
-  // so the SAFER side has the LOWER average
-  float safer_direction = (left_avg < right_avg) ? -1.0f : 1.0f;
-  // -1 = left is safer (turn left), +1 = right is safer (turn right)
-
-
-  /* ════════════════════════════════════════════════════════════════════════
-   *  STEP 2 — Confidence update (same logic, now using local variable)
-   * ════════════════════════════════════════════════════════════════════════ */
-
-  if (obstacle_frac < obstacle_width_threshold) {
+  // update our confidence level
+  if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
     obstacle_free_confidence++;
   } else {
     obstacle_free_confidence -= 2;
   }
+
+  // bound obstacle_free_confidence
   Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
 
-  float moveDistance = fminf(maxDistance, speed_multiplier * obstacle_free_confidence);
+  float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
 
-
-  /* ════════════════════════════════════════════════════════════════════════
-   *  STEP 3 — State machine (your new logic goes here)
-   * ════════════════════════════════════════════════════════════════════════ */
-
-  switch (navigation_state) {
+  switch (navigation_state){
     case SAFE:
+      // Move waypoint forward
       moveWaypointForward(WP_TRAJECTORY, 1.5f * moveDistance);
-
-      if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY), WaypointY(WP_TRAJECTORY))) {
+      if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
         navigation_state = OUT_OF_BOUNDS;
-
-      } else if (obstacle_free_confidence == 0) {
+      } else if (obstacle_free_confidence == 0){
         navigation_state = OBSTACLE_FOUND;
-
       } else {
-        // ── NEW: slow down near plants but don't stop ──
-        float effective_distance = moveDistance;
-        if (plant_frac > 0.1f) {
-          effective_distance *= 0.5f;  // half speed near plants
-        }
-        moveWaypointForward(WP_GOAL, effective_distance);
+        moveWaypointForward(WP_GOAL, moveDistance);
       }
-      break;
 
+      break;
     case OBSTACLE_FOUND:
+      // stop
       waypoint_move_here_2d(WP_GOAL);
       waypoint_move_here_2d(WP_TRAJECTORY);
 
-      // ── NEW: smart turn direction instead of random ──
-      // use widest obstacle position OR boundary analysis
-      if (widest_obs_width > 0) {
-        // obstacle center < 0.5 means it's on the right → turn left
-        heading_increment = (widest_obs_center < 0.5f) ? -5.0f : 5.0f;
-      } else {
-        // fall back to boundary: turn toward safer side
-        heading_increment = safer_direction * 5.0f;
-      }
+      // randomly select new search direction
+      chooseRandomIncrementAvoidance();
 
       navigation_state = SEARCH_FOR_SAFE_HEADING;
-      break;
 
+      break;
     case SEARCH_FOR_SAFE_HEADING:
       increase_nav_heading(heading_increment);
 
-      if (obstacle_free_confidence >= 2) {
+      // make sure we have a couple of good readings before declaring the way safe
+      if (obstacle_free_confidence >= 2){
         navigation_state = SAFE;
       }
       break;
-
     case OUT_OF_BOUNDS:
       increase_nav_heading(heading_increment);
       moveWaypointForward(WP_TRAJECTORY, 1.5f);
 
-      if (InsideObstacleZone(WaypointX(WP_TRAJECTORY), WaypointY(WP_TRAJECTORY))) {
+      if (InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
+        // add offset to head back into arena
         increase_nav_heading(heading_increment);
+
+        // reset safe counter
         obstacle_free_confidence = 0;
+
+        // ensure direction is safe before continuing
         navigation_state = SEARCH_FOR_SAFE_HEADING;
       }
       break;
-
     default:
       break;
   }
+  return;
 }
 
 /*

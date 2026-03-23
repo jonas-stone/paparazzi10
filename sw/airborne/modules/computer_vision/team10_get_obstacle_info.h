@@ -77,11 +77,11 @@
 #define LAX_GREEN_V_MAX  141
 
 /* ── region descriptor ─────────────────────────────────────────────────────── */
+/* ── region descriptor ─────────────────────────────────────────────────────── */
 struct obstacle_region_t {
-    int16_t  left_x;
-    int16_t  width;
-    int16_t  height;
-    uint8_t  det_type;
+    uint16_t start;
+    uint16_t width;
+    uint16_t baseline_height;
 };
 
 typedef struct {

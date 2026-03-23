@@ -688,8 +688,15 @@
 /*
  * IDs of Team 10 modules (function 42 inside abi_messages.h)
  */
+
+// ground & plant detection
 #ifndef TEAM10_GROUND_DETECTION_ID
 #define TEAM10_GROUND_DETECTION_ID 1
+#endif  
+
+// RANSAC detection
+#ifndef TEAM10_RANSAC_DETECTION_ID
+#define TEAM10_RANSAC_DETECTION_ID 2
 #endif
 
 #endif /* ABI_SENDER_IDS_H */
