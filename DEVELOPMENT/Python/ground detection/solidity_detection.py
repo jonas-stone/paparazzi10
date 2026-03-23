@@ -1,6 +1,8 @@
 import numpy as np
 import cv2
-
+"""
+useless
+"""
 def is_smooth_blob_old(single_blob_mask: np.ndarray,
                    area: float) -> bool:
     """

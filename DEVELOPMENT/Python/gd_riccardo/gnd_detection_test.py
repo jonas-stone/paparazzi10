@@ -1,7 +1,9 @@
 import numpy.random as rd
 import numpy as np
 import cv2
-
+"""
+no one give a shit about this 
+"""
 
 def find_average_color_ground(img_path: str) -> tuple:
     
