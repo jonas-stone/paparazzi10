@@ -495,72 +495,62 @@ static int merge_obstacle_cols(const uint8_t *om, int nc, int mw, int mcg,
     return cnt;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE SCORING  (informational — see standalone .c for full documentation)
- *  Quadratic fit through per-row peak vertical-edge positions.
- * ══════════════════════════════════════════════════════════════════════════════ */
-#define EDGE_SCORE_MAG_THRESH    20
-#define EDGE_SCORE_MAG_NORM      80.0f
-#define EDGE_SCORE_RESID_SCALE    8.0f
+/* ── Vertical edge dY/dy + quadratic fit (see standalone .c for docs) ──── */
+#define VERT_SEARCH_W   50
+#define SOBEL_THRESH    15
+#define GRAD_NORM       60.0f
+#define RESID_SCALE      6.0f
 
-static inline int _vtap5(const uint8_t *buf, int img_w, int x, int r)
+static inline int _vtap5_y(const uint8_t *buf,int img_w,int img_h,int x,int r)
 {
-    int xm2=(x-2<0)?0:x-2, xm1=(x-1<0)?0:x-1;
-    int xp1=(x+1>=img_w)?img_w-1:x+1, xp2=(x+2>=img_w)?img_w-1:x+2;
-    int g=-2*(int)yuv422_Y(buf,img_w,xm2,r)-1*(int)yuv422_Y(buf,img_w,xm1,r)
-          +1*(int)yuv422_Y(buf,img_w,xp1,r)+2*(int)yuv422_Y(buf,img_w,xp2,r);
+    int rm2=(r-2<0)?0:r-2,rm1=(r-1<0)?0:r-1;
+    int rp1=(r+1>=img_h)?img_h-1:r+1,rp2=(r+2>=img_h)?img_h-1:r+2;
+    int g=-2*(int)yuv422_Y(buf,img_w,x,rm2)-1*(int)yuv422_Y(buf,img_w,x,rm1)
+          +1*(int)yuv422_Y(buf,img_w,x,rp1)+2*(int)yuv422_Y(buf,img_w,x,rp2);
     return g<0?-g:g;
 }
-
-static float compute_edge_score(const uint8_t *buf,
-                                 int img_w, int img_h,
-                                 int col_start, int col_end)
+static float _edge_band_score(const uint8_t *buf,int img_w,int img_h,int x0,int x1)
 {
-    if (buf==NULL||img_h<4) return 0.0f;
-    if (col_start<0) col_start=0;
-    if (col_end>=img_w) col_end=img_w-1;
-    if (col_start>col_end) return 0.0f;
-
-    int *peak_x   = (int *)ff_queue;
-    int *peak_mag = peak_x + img_h;
-    int n_kept=0; double sum_mag=0.0;
-
-    for (int r=0;r<img_h;r++){
-        int bx=col_start,bm=0;
-        for(int x=col_start;x<=col_end;x++){int m=_vtap5(buf,img_w,x,r); if(m>bm){bm=m;bx=x;}}
-        peak_x[r]=bx; peak_mag[r]=bm;
-        if(bm>=EDGE_SCORE_MAG_THRESH){n_kept++; sum_mag+=bm;}
-    }
-    if(n_kept<4) return 0.0f;
-
-    float coverage=(float)n_kept/(float)img_h;
-    float strength=(float)(sum_mag/n_kept)/EDGE_SCORE_MAG_NORM;
-    if(strength>1.0f)strength=1.0f;
-
-    double sr4=0,sr3=0,sr2=0,sr1=0,sr0=0,srx2=0,srx1=0,srx0=0;
+    if(x0<0)x0=0;if(x1>=img_w)x1=img_w-1;if(x1<=x0)return 0.0f;
+    int *pc=(int*)ff_queue,*pm=pc+img_h;
+    int n=0; double sm=0.0;
     for(int r=0;r<img_h;r++){
-        if(peak_mag[r]<EDGE_SCORE_MAG_THRESH) continue;
-        double dr=(double)r,dx=(double)peak_x[r],dr2=dr*dr;
-        sr4+=dr2*dr2; sr3+=dr2*dr; sr2+=dr2; sr1+=dr; sr0+=1.0;
-        srx2+=dr2*dx; srx1+=dr*dx; srx0+=dx;
+        int bc=x0,bm=0;
+        for(int x=x0;x<=x1;x++){int m=_vtap5_y(buf,img_w,img_h,x,r);if(m>bm){bm=m;bc=x;}}
+        if(bm>=SOBEL_THRESH){pc[r]=bc;pm[r]=bm;n++;sm+=bm;}else pm[r]=0;
     }
-    double det=sr4*(sr2*sr0-sr1*sr1)-sr3*(sr3*sr0-sr1*sr2)+sr2*(sr3*sr1-sr2*sr2);
+    if(n<4)return 0.0f;
+    float str=(float)(sm/n)/GRAD_NORM; if(str>1.0f)str=1.0f;
+    double s4=0,s3=0,s2=0,s1=0,s0=0,sx2=0,sx1=0,sx0=0;
+    for(int r=0;r<img_h;r++){
+        if(!pm[r])continue;
+        double dr=(double)r,dc=(double)pc[r],dr2=dr*dr;
+        s4+=dr2*dr2;s3+=dr2*dr;s2+=dr2;s1+=dr;s0+=1.0;sx2+=dr2*dc;sx1+=dr*dc;sx0+=dc;
+    }
+    double det=s4*(s2*s0-s1*s1)-s3*(s3*s0-s1*s2)+s2*(s3*s1-s2*s2);
     float fit=1.0f;
     if(det>1e-6||det<-1e-6){
-        double a=(srx2*(sr2*sr0-sr1*sr1)-sr3*(srx1*sr0-sr1*srx0)+sr2*(srx1*sr1-sr2*srx0))/det;
-        double b=(sr4*(srx1*sr0-sr1*srx0)-srx2*(sr3*sr0-sr1*sr2)+sr2*(sr3*srx0-sr2*srx1))/det;
-        double c=(sr4*(sr2*srx0-srx1*sr1)-sr3*(sr3*srx0-srx1*sr2)+srx2*(sr3*sr1-sr2*sr2))/det;
-        double sum_res=0.0;
+        double pa=(sx2*(s2*s0-s1*s1)-s3*(sx1*s0-s1*sx0)+s2*(sx1*s1-s2*sx0))/det;
+        double pb=(s4*(sx1*s0-s1*sx0)-sx2*(s3*s0-s1*s2)+s2*(s3*sx0-s2*sx1))/det;
+        double pc2=(s4*(s2*sx0-sx1*s1)-s3*(s3*sx0-sx1*s2)+sx2*(s3*s1-s2*s2))/det;
+        double sr=0.0;
         for(int r=0;r<img_h;r++){
-            if(peak_mag[r]<EDGE_SCORE_MAG_THRESH) continue;
-            double dr=(double)r, pred=a*dr*dr+b*dr+c, res=(double)peak_x[r]-pred;
-            sum_res+=res<0?-res:res;
+            if(!pm[r])continue;
+            double dr=(double)r,res=(double)pc[r]-(pa*dr*dr+pb*dr+pc2);
+            sr+=res<0?-res:res;
         }
-        fit=expf(-(float)(sum_res/n_kept)/EDGE_SCORE_RESID_SCALE);
+        fit=expf(-(float)(sr/n)/RESID_SCALE);
     }
-    float score=strength*coverage*fit;
-    if(score>1.0f)score=1.0f; if(score<0.0f)score=0.0f;
+    float score=str*fit;
+    if(score>1.0f)score=1.0f;if(score<0.0f)score=0.0f;
     return score;
+}
+static float boundary_score_from_image(const uint8_t *buf,int img_w,int img_h,int sc_s,int sc_e)
+{
+    if(buf==NULL)return 0.0f;
+    float sl=_edge_band_score(buf,img_w,img_h,sc_s-VERT_SEARCH_W,sc_s+VERT_SEARCH_W);
+    float sr=_edge_band_score(buf,img_w,img_h,sc_e-VERT_SEARCH_W,sc_e+VERT_SEARCH_W);
+    return sl>sr?sl:sr;
 }
 
 uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
@@ -644,14 +634,10 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
         }
         
         oo[no].baseline_height = (uint16_t)max_br;
-
-        if (img_buf != NULL) {
-            int s_s = img_w - 1 - (fl[i].start + fl[i].width - 1);
-            int e_s = img_w - 1 -  fl[i].start;
-            if (s_s > e_s) { int t = s_s; s_s = e_s; e_s = t; }
-            oo[no].edge_score = compute_edge_score(img_buf, img_w, img_h, s_s, e_s);
-        } else {
-            oo[no].edge_score = 0.0f;
+        {
+            int sc_s=img_w-1-e, sc_e=img_w-1-s;
+            if(sc_s>sc_e){int t=sc_s;sc_s=sc_e;sc_e=t;}
+            oo[no].boundary_score=boundary_score_from_image(img_buf,img_w,img_h,sc_s,sc_e,NULL,NULL);
         }
         no++;
     }

@@ -79,10 +79,6 @@ struct obstacle_region_t {
     uint16_t start;
     uint16_t width;
     uint16_t baseline_height;
-    float    edge_score;   /* 0.0–1.0: how strongly a curved/straight edge was
-                              detected in this region via Sobel + parabola fit.
-                              Purely informational — never used to reject.
-                              0.0 = no edge signal, 1.0 = clean edge. */
 };
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -111,7 +107,8 @@ void detect_green_ground_ml(struct image_t *img, uint8_t mask_out[], int median_
 void isolate_ground_blob(uint8_t mask[], int w, int h, int blob_area_threshold);
 void fill_holes_mask(uint8_t mask[], int w, int h);
 void find_ground_boundary(const uint8_t mask_flipped[], int w, int h, int boundary_out[], int min_ground_pixels, int max_gap, int smooth_kernel);
-uint8_t update_and_detect(const int boundary_row[], int h, int w, float ground_baseline[], int *baseline_inited, int min_width, int obstacle_threshold, int no_ground_baseline, int max_col_gap, struct obstacle_region_t obstacles_out[], const uint8_t *img_buf, int img_w, int img_h);
+uint8_t update_and_detect(const int boundary_row[], int h, int w, float ground_baseline[], int *baseline_inited, int min_width, int obstacle_threshold, int no_ground_baseline, int max_col_gap, struct obstacle_region_t obstacles_out[],
+                          const uint8_t *img_buf, int img_w, int img_h);
 void detect_all_green_lax(struct image_t *img, int scale_num, int scale_den, int blur_ksize, uint8_t plant_mask_out[], int *pw_out, int *ph_out);
 uint8_t detect_plant_regions(const uint8_t plant_mask[], int w, int h, int min_width, int min_pixels_per_col, int max_col_gap, struct obstacle_region_t plants_out[]);
 

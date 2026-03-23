@@ -36,10 +36,9 @@ MAX_IMAGE_WIDTH  = 240
 MAX_IMAGE_HEIGHT = 520
 
 # ── Display upscale factor ────────────────────────────────────────────────────
-# The C pipeline works at 240×520. DISPLAY_SCALE upscales every panel before
-# showing so the window is larger and text/lines are crisp.
-# 2.0 = comfortable on a 1080p screen. Raise to 2.5 on a 4K monitor.
-DISPLAY_SCALE = 1.5
+# All panels are upscaled by this factor before display.
+# 2.0 = comfortable on 1080p.  Raise to 2.5 on 4K, lower to 1.5 if too big.
+DISPLAY_SCALE = 2.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CROSS-PLATFORM LIBRARY NAME + COMPILE FLAGS
@@ -156,9 +155,9 @@ class FloatEulers(ctypes.Structure):
     _fields_ = [("phi", ctypes.c_float), ("theta", ctypes.c_float), ("psi", ctypes.c_float)]
 
 class ImageT(ctypes.Structure):
-    # On Windows, MinGW long = 32-bit  →  struct timeval = 8 bytes (not 16).
-    # Using c_byte*16 shifted buf to offset 48 in Python vs offset 40 in C,
-    # causing C to read 0x0 as the buffer pointer → access violation crash.
+    # On Windows, MinGW long = 32-bit → struct timeval = 8 bytes (not 16).
+    # Using c_byte*16 caused buf to land at offset 48 in Python vs offset 40
+    # in C, so C read 0x0 as the buffer pointer → access violation crash.
     _fields_ = [
         ("type",     ctypes.c_int),
         ("w",        ctypes.c_uint16),
@@ -173,8 +172,10 @@ class ImageT(ctypes.Structure):
     ]
 
 class ObstacleRegionT(ctypes.Structure):
-    _fields_ = [("start", ctypes.c_uint16), ("width", ctypes.c_uint16),
-                ("baseline_height", ctypes.c_uint16)]
+    _fields_ = [("start",           ctypes.c_uint16),
+                ("width",           ctypes.c_uint16),
+                ("baseline_height", ctypes.c_uint16),
+                ("boundary_score",  ctypes.c_float)]  # 0=grass edge, 1=real obstacle
 
 lib.get_obstacle_info.argtypes = [
     ctypes.POINTER(ImageT), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int),
@@ -208,8 +209,8 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
                         boundary_rows, ground_baseline, label, scale=1.0):
     vis   = img_rot.copy()
     h_rot = vis.shape[0]
-    lw    = max(1, int(scale))        # line/rect thickness
-    fs    = 0.4 * scale               # font scale
+    lw    = max(1, int(scale))
+    fs    = 0.4 * scale
     fs2   = 0.35 * scale
 
     if ground_baseline is not None:
@@ -228,17 +229,23 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
 
     for region in obs_regions_raw:
         s, e, w, bh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+        bscore = float(region[4]) if len(region) > 4 else 1.0
         if boundary_rows is not None:
             b_slice = boundary_rows[s:e+1]
             vb      = b_slice[b_slice < h_rot]
             yt      = int(np.min(vb)) if len(vb) > 0 else 0
         else:
             yt = 0
-        cv2.rectangle(vis, (s, 0), (e, h_rot - 1), (0, 0, 255), lw)
-        cv2.putText(vis, f"w={w}",  (s, max(int(15*scale), yt - int(5*scale))),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), lw)
-        cv2.putText(vis, f"h={bh}", (s, max(int(30*scale), yt - int(20*scale))),
+        # colour: red = low score (grass edge), green = high score (real obstacle)
+        score_g  = int(bscore * 200)
+        box_col  = (0, score_g, 255 - score_g)
+        cv2.rectangle(vis, (s, 0), (e, h_rot - 1), box_col, lw)
+        cv2.putText(vis, f"w={w}",           (s, max(int(15*scale), yt - int(5*scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs,  box_col,       lw)
+        cv2.putText(vis, f"h={bh}",          (s, max(int(30*scale), yt - int(20*scale))),
                     cv2.FONT_HERSHEY_SIMPLEX, fs2, (0, 150, 255), lw)
+        cv2.putText(vis, f"b={bscore:.2f}",  (s, max(int(46*scale), yt - int(36*scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs2, (200, 200, 0), lw)
         y_line = min(bh, h_rot - 1)
         cv2.line(vis, (s, y_line), (e, y_line), (255, 255, 255), lw)
 
@@ -249,9 +256,9 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
                     cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), lw)
 
     cv2.putText(vis, label, (int(5*scale), h_rot - int(8*scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale, (255, 255, 255), lw + 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55*scale, (255, 255, 255), lw+1)
     cv2.putText(vis, label, (int(5*scale), h_rot - int(8*scale)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale, (0, 0, 0), lw)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55*scale, (0, 0, 0),       lw)
     return vis
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -276,10 +283,6 @@ def main():
 
     WIN = "C Pipeline Slideshow (q=quit, SPACE=pause, a=back, d=forward)"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    # Initial window size — the composite frame is roughly:
-    #   width:  3 panels × (520 * DISPLAY_SCALE) ≈ 3120 px at 2×
-    #   height: header + top + bot ≈ (240+240+80) * DISPLAY_SCALE ≈ 1120 px at 2×
-    # Start at a comfortable size; user can resize freely.
     cv2.resizeWindow(WIN, int(1400 * DISPLAY_SCALE), int(560 * DISPLAY_SCALE))
 
     idx              = 0
@@ -362,7 +365,8 @@ def main():
             obs_raw = [(obs_out[i].start,
                         obs_out[i].start + obs_out[i].width - 1,
                         obs_out[i].width,
-                        obs_out[i].baseline_height)
+                        obs_out[i].baseline_height,
+                        obs_out[i].boundary_score)
                        for i in range(num_obs)]
             plt_raw = [(plants_out[i].start,
                         plants_out[i].start + plants_out[i].width - 1,
@@ -386,28 +390,101 @@ def main():
             S = DISPLAY_SCALE
             def upscale(img):
                 h, w = img.shape[:2]
-                return cv2.resize(img, (int(w * S), int(h * S)),
-                                  interpolation=cv2.INTER_LINEAR)
+                return cv2.resize(img, (int(w*S), int(h*S)), interpolation=cv2.INTER_LINEAR)
 
-            img_up    = upscale(img_rot)
-            mask_bgr  = cv2.cvtColor(mask_rot, cv2.COLOR_GRAY2BGR)
-            mask_up   = upscale(mask_bgr)
-            po        = img_rot.copy()
-            po[plant_rot > 0] = [0, 200, 0]
-            po_up     = upscale(po)
-            top       = np.hstack([img_up, mask_up, po_up])
+            img_up   = upscale(img_rot)
+            mask_up  = upscale(cv2.cvtColor(mask_rot, cv2.COLOR_GRAY2BGR))
 
-            # ── Scaled detection overlay ──────────────────────────────────────
-            # Scale the boundary and baseline coordinates to match upscaled image
-            boundary_sc  = (boundary  * S).astype(int) if boundary  is not None else None
+            # ── Sobel-Y sensor-space edge panel ──────────────────────────────
+            # dY/dy in sensor space = vertical edges in displayed (rotated) image.
+            # We compute on bgr_s (sensor frame, before rotation).
+            VERT_SEARCH_W = 30
+            SOBEL_THRESH  = 15
+            AGREE_TOL     = 4
+
+            grey_s = cv2.cvtColor(bgr_s, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            # 5-tap vertical gradient in sensor space (axis=0 = sensor rows)
+            ky = np.array([-2,-1,0,1,2], dtype=np.float32).reshape(5,1)
+            sobel_y_s = cv2.filter2D(grey_s, -1, ky)  # (tH, tW) sensor space
+            sobel_y_s = np.abs(sobel_y_s)
+
+            # rotate to display space for background visualisation
+            sob_rot = cv2.rotate(
+                np.clip(sobel_y_s / (np.percentile(sobel_y_s, 99)+1e-6) * 255, 0, 255)
+                .astype(np.uint8), cv2.ROTATE_90_COUNTERCLOCKWISE)
+            edge_panel = cv2.applyColorMap(sob_rot, cv2.COLORMAP_HOT)
+            h_ep = edge_panel.shape[0]
+
+            for obs in obs_raw:
+                rot_s2, rot_e2 = int(obs[0]), int(obs[1])
+                bscore = float(obs[4]) if len(obs) > 4 else 0.0
+                score_g = int(bscore * 200)
+                box_col = (0, score_g, 255 - score_g)
+                cv2.rectangle(edge_panel, (rot_s2,0), (rot_e2, h_ep-1), box_col, 1)
+                cv2.putText(edge_panel, f'b={bscore:.2f}', (rot_s2+2, 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_col, 1)
+
+                # sensor col range (same flip as C scorer)
+                sc_s = max(0,    tW - 1 - rot_e2)
+                sc_e = min(tW-1, tW - 1 - rot_s2)
+
+                def draw_band(sc_ctr, colour):
+                    x0 = max(0,    sc_ctr - VERT_SEARCH_W)
+                    x1 = min(tW-1, sc_ctr + VERT_SEARCH_W)
+                    if x1 <= x0: return
+                    bw = x1 - x0 + 1
+                    band = sobel_y_s[:, x0:x1+1]           # (tH, band_w)
+                    peak_idx = np.argmax(band, axis=1)      # best col per row (0-based in band)
+                    peak_val = band[np.arange(tH), peak_idx]
+                    peak_sc  = peak_idx + x0                # sensor col (absolute)
+                    valid    = peak_val >= SOBEL_THRESH
+                    if valid.sum() < 4: return
+
+                    # relative indices into band — must be in [0, bw-1]
+                    rel = (peak_sc[valid] - x0).astype(np.int32)
+                    rel = np.clip(rel, 0, bw - 1)
+                    hist = np.bincount(rel, minlength=bw)
+                    dom_bin = int(np.argmax(hist))
+                    dom_sc  = x0 + dom_bin
+
+                    # draw per-row peak dots (grey)
+                    for r, (sc, v) in enumerate(zip(peak_sc, valid)):
+                        if not v: continue
+                        rx = tW - 1 - int(sc)
+                        if 0 <= rx < edge_panel.shape[1]:
+                            cv2.circle(edge_panel, (rx, r), 1, (120,120,120), -1)
+
+                    # draw dominant column (bright line in display rotated space)
+                    rx_dom = tW - 1 - dom_sc
+                    if 0 <= rx_dom < edge_panel.shape[1]:
+                        cv2.line(edge_panel,(rx_dom,0),(rx_dom,h_ep-1),colour,1)
+
+                    # draw search band edges
+                    for sc_bnd in [x0, x1]:
+                        rx_b = tW - 1 - sc_bnd
+                        if 0 <= rx_b < edge_panel.shape[1]:
+                            cv2.line(edge_panel,(rx_b,0),(rx_b,h_ep-1),(50,50,50),1)
+
+                draw_band(sc_s, (0, 255, 255))    # cyan  = left obstacle edge
+                draw_band(sc_e, (255, 165,   0))  # orange = right obstacle edge
+
+            edge_up = upscale(edge_panel)
+            po       = img_rot.copy(); po[plant_rot > 0] = [0, 200, 0]
+            po_up    = upscale(po)
+            top      = np.hstack([img_up, mask_up, po_up])
+
+            # ── Canny + parabola overlay ─────────────────────────────────────
+            # Two narrow strips at left/right edges of each obstacle box.
+            # cyan = left strip, orange = right strip.
+            STRIP_W    = 12   # must match C EDGE_SCORE_STRIP_W
+            MAG_THRESH = 20
+
+
+            # scale detection coordinates + regions to match upscaled image
+            boundary_sc  = (boundary   * S).astype(int) if boundary   is not None else None
             baseline_sc  = (py_baseline * S).astype(int) if py_baseline is not None else None
-
-            def scale_regions(regions):
-                return [(int(r[0]*S), int(r[1]*S), int(r[2]*S), int(r[3]*S))
-                        for r in regions]
-
-            obs_sc = scale_regions(obs_raw)
-            plt_sc = scale_regions(plt_raw)
+            obs_sc  = [(int(r[0]*S), int(r[1]*S), int(r[2]*S), int(r[3]*S), r[4]) for r in obs_raw]
+            plt_sc  = [(int(r[0]*S), int(r[1]*S), int(r[2]*S), int(r[3]*S))       for r in plt_raw]
 
             det_vis  = draw_original_style(img_up, obs_sc, plt_sc,
                                            boundary_sc, baseline_sc,
@@ -416,33 +493,39 @@ def main():
 
             det_h, det_w = det_vis.shape[:2]
             target_w     = top.shape[1]
-            extra_w      = target_w - det_w
-            info_panel   = (np.zeros((det_h, extra_w, 3), np.uint8) if extra_w > 0 else None)
+            # resize edge panel to same height as det_vis
+            edge_up_r = cv2.resize(edge_up, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+            extra_w   = target_w - det_w - edge_up_r.shape[1]
+            info_panel = (np.zeros((det_h, extra_w, 3), np.uint8) if extra_w > 0 else None)
 
-            txt_scale = 0.55 * S   # text size scales with display
-            line_gap  = int(22 * S)
+            txt_s = 0.45 * S
+            lh    = int(20 * S)
 
             if info_panel is not None:
-                y = int(28 * S)
+                y = int(25 * S)
                 lines = (
                     [f"Frame {idx}/{len(paths)}", name, "",
                      f"Status: {st}", f"Green:  {green_frac_out.value:.3f}", "",
                      f"Obstacles: {num_obs}"]
-                    + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])} h={int(r[3])}"
+                    + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])} h={int(r[3])} b={r[4]:.2f}"
                        for i, r in enumerate(obs_raw)]
                     + ["", f"Plants: {num_plants}"]
                     + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])}"
                        for i, r in enumerate(plt_raw)]
-                    + ["", f"{'PAUSED' if paused else 'PLAYING'}  delay={a.delay}ms"]
+                    + ["", f"{'PAUSED' if paused else 'PLAYING'}  delay={a.delay}ms",
+                       "", "b: boundary score",
+                       "  0.0 = straight line (grass edge)",
+                       "  1.0 = abrupt step (real obstacle)"]
                 )
                 for line in lines:
-                    cv2.putText(info_panel, line, (int(12*S), y),
-                                cv2.FONT_HERSHEY_SIMPLEX, txt_scale * 0.7,
+                    cv2.putText(info_panel, line, (int(10*S), y),
+                                cv2.FONT_HERSHEY_SIMPLEX, txt_s,
                                 (200, 200, 200), max(1, int(S)))
-                    y += line_gap
-                bot = np.hstack([det_vis, info_panel])
+                    y += lh
+                bot = np.hstack([det_vis, edge_up_r, info_panel])
             else:
-                bot = det_vis[:, :target_w, :]
+                bot = np.hstack([det_vis, edge_up_r]) if det_w + edge_up_r.shape[1] <= target_w \
+                      else det_vis[:, :target_w, :]
 
             hdr_h = int(40 * S)
             hdr   = np.zeros((hdr_h, target_w, 3), np.uint8)
@@ -451,8 +534,15 @@ def main():
                         f"green={green_frac_out.value:.3f}  "
                         f"obs={num_obs} plt={num_plants}",
                         (int(8*S), int(28*S)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6 * S,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55 * S,
                         (0, 255, 255), max(1, int(S)))
+            # panel labels at top of image panels
+            panel_w = img_up.shape[1]
+            for pi, label_txt in enumerate(["original", "ground mask", "plants"]):
+                cv2.putText(hdr, label_txt,
+                            (int(pi * panel_w + 4), int(16 * S)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35 * S,
+                            (180, 180, 180), max(1, int(S)))
 
             last_combined    = np.vstack([hdr, top, bot])
             needs_processing = False
@@ -479,4 +569,4 @@ def main():
     print(f"\nDone. Processed {idx} frames using C backend.")
 
 if __name__ == "__main__":
-    main() 
+    main()

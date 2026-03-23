@@ -175,7 +175,7 @@ class ObstacleRegionT(ctypes.Structure):
     _fields_ = [("start",           ctypes.c_uint16),
                 ("width",           ctypes.c_uint16),
                 ("baseline_height", ctypes.c_uint16),
-                ("edge_score",      ctypes.c_float)]  # 0.0–1.0 edge confidence
+                ("boundary_score",  ctypes.c_float)]  # 0=grass edge, 1=real obstacle
 
 lib.get_obstacle_info.argtypes = [
     ctypes.POINTER(ImageT), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int),
@@ -228,22 +228,23 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
             cv2.polylines(vis, [pts], False, (255, 255, 0), lw)
 
     for region in obs_regions_raw:
-        s, e, w, bh, escore = int(region[0]), int(region[1]), int(region[2]), int(region[3]), float(region[4])
+        s, e, w, bh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
+        bscore = float(region[4]) if len(region) > 4 else 1.0
         if boundary_rows is not None:
             b_slice = boundary_rows[s:e+1]
             vb      = b_slice[b_slice < h_rot]
             yt      = int(np.min(vb)) if len(vb) > 0 else 0
         else:
             yt = 0
-        # box colour fades red→green with edge score
-        score_g = int(escore * 200)
-        box_col = (0, score_g, 255 - score_g)
+        # colour: red = low score (grass edge), green = high score (real obstacle)
+        score_g  = int(bscore * 200)
+        box_col  = (0, score_g, 255 - score_g)
         cv2.rectangle(vis, (s, 0), (e, h_rot - 1), box_col, lw)
-        cv2.putText(vis, f"w={w}",          (s, max(int(15*scale), yt - int(5*scale))),
+        cv2.putText(vis, f"w={w}",           (s, max(int(15*scale), yt - int(5*scale))),
                     cv2.FONT_HERSHEY_SIMPLEX, fs,  box_col,       lw)
-        cv2.putText(vis, f"h={bh}",         (s, max(int(30*scale), yt - int(20*scale))),
+        cv2.putText(vis, f"h={bh}",          (s, max(int(30*scale), yt - int(20*scale))),
                     cv2.FONT_HERSHEY_SIMPLEX, fs2, (0, 150, 255), lw)
-        cv2.putText(vis, f"e={escore:.2f}", (s, max(int(46*scale), yt - int(36*scale))),
+        cv2.putText(vis, f"b={bscore:.2f}",  (s, max(int(46*scale), yt - int(36*scale))),
                     cv2.FONT_HERSHEY_SIMPLEX, fs2, (200, 200, 0), lw)
         y_line = min(bh, h_rot - 1)
         cv2.line(vis, (s, y_line), (e, y_line), (255, 255, 255), lw)
@@ -365,7 +366,7 @@ def main():
                         obs_out[i].start + obs_out[i].width - 1,
                         obs_out[i].width,
                         obs_out[i].baseline_height,
-                        obs_out[i].edge_score)
+                        obs_out[i].boundary_score)
                        for i in range(num_obs)]
             plt_raw = [(plants_out[i].start,
                         plants_out[i].start + plants_out[i].width - 1,
@@ -393,72 +394,97 @@ def main():
 
             img_up   = upscale(img_rot)
             mask_up  = upscale(cv2.cvtColor(mask_rot, cv2.COLOR_GRAY2BGR))
+
+            # ── Sobel-Y sensor-space edge panel ──────────────────────────────
+            # dY/dy in sensor space = vertical edges in displayed (rotated) image.
+            # We compute on bgr_s (sensor frame, before rotation).
+            VERT_SEARCH_W = 50
+            SOBEL_THRESH  = 15
+            AGREE_TOL     = 4
+
+            grey_s = cv2.cvtColor(bgr_s, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            # 5-tap vertical gradient in sensor space (axis=0 = sensor rows)
+            ky = np.array([-2,-1,0,1,2], dtype=np.float32).reshape(5,1)
+            sobel_y_s = cv2.filter2D(grey_s, -1, ky)  # (tH, tW) sensor space
+            sobel_y_s = np.abs(sobel_y_s)
+
+            # rotate to display space for background visualisation
+            sob_rot = cv2.rotate(
+                np.clip(sobel_y_s / (np.percentile(sobel_y_s, 99)+1e-6) * 255, 0, 255)
+                .astype(np.uint8), cv2.ROTATE_90_COUNTERCLOCKWISE)
+            edge_panel = cv2.applyColorMap(sob_rot, cv2.COLORMAP_HOT)
+            h_ep = edge_panel.shape[0]
+
+            for obs in obs_raw:
+                rot_s2, rot_e2 = int(obs[0]), int(obs[1])
+                bscore = float(obs[4]) if len(obs) > 4 else 0.0
+                score_g = int(bscore * 200)
+                box_col = (0, score_g, 255 - score_g)
+                cv2.rectangle(edge_panel, (rot_s2,0), (rot_e2, h_ep-1), box_col, 1)
+                cv2.putText(edge_panel, f'b={bscore:.2f}', (rot_s2+2, 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, box_col, 1)
+
+                # sensor col range (same flip as C scorer)
+                sc_s = max(0,    tW - 1 - rot_e2)
+                sc_e = min(tW-1, tW - 1 - rot_s2)
+
+                def draw_band(sc_ctr, colour):
+                    x0 = max(0,    sc_ctr - VERT_SEARCH_W)
+                    x1 = min(tW-1, sc_ctr + VERT_SEARCH_W)
+                    if x1 <= x0: return
+                    band = sobel_y_s[:, x0:x1+1]           # (tH, band_w)
+                    peak_idx = np.argmax(band, axis=1)
+                    peak_val = band[np.arange(tH), peak_idx]
+                    peak_sc  = (peak_idx + x0).astype(np.float64)  # sensor col
+                    valid    = peak_val >= SOBEL_THRESH
+                    if valid.sum() < 4: return
+
+                    rows = np.where(valid)[0].astype(np.float64)
+                    cols = peak_sc[valid]
+
+                    # draw per-row peak dots (grey)
+                    for ri, ci in zip(rows.astype(int), cols.astype(int)):
+                        rx = tW - 1 - ci
+                        if 0 <= rx < edge_panel.shape[1]:
+                            cv2.circle(edge_panel, (rx, ri), 1, (120,120,120), -1)
+
+                    # quadratic fit: col = a*row^2 + b*row + c
+                    A = np.column_stack([rows**2, rows, np.ones_like(rows)])
+                    try:
+                        coeffs, _, _, _ = np.linalg.lstsq(A, cols, rcond=None)
+                        pa2, pb2, pc2 = coeffs
+                        pts = []
+                        for ri in range(h_ep):
+                            sc_fit = pa2*ri**2 + pb2*ri + pc2
+                            rx = tW - 1 - int(sc_fit)
+                            if 0 <= rx < edge_panel.shape[1]:
+                                pts.append((rx, ri))
+                        pts.sort(key=lambda p: p[1])
+                        for ii in range(len(pts)-1):
+                            cv2.line(edge_panel, pts[ii], pts[ii+1], colour, 1)
+                    except Exception:
+                        pass
+
+                    # draw search band edges
+                    for sc_bnd in [x0, x1]:
+                        rx_b = tW - 1 - sc_bnd
+                        if 0 <= rx_b < edge_panel.shape[1]:
+                            cv2.line(edge_panel,(rx_b,0),(rx_b,h_ep-1),(50,50,50),1)
+
+                draw_band(sc_s, (0, 255, 255))    # cyan  = left obstacle edge
+                draw_band(sc_e, (255, 165,   0))  # orange = right obstacle edge
+
+            edge_up = upscale(edge_panel)
             po       = img_rot.copy(); po[plant_rot > 0] = [0, 200, 0]
             po_up    = upscale(po)
             top      = np.hstack([img_up, mask_up, po_up])
 
-            # ── Canny + parabola fit overlay ──────────────────────────────────
-            # Canny gives clean binary edges for visual reference.
-            # For each obstacle, compute the same per-row peak-x as the C scorer
-            # and draw the fitted parabola so you can see what the scorer measured.
-            grey_rot  = cv2.cvtColor(img_rot, cv2.COLOR_BGR2GRAY)
-            canny     = cv2.Canny(grey_rot, threshold1=40, threshold2=120)
-            edge_vis  = cv2.cvtColor(canny, cv2.COLOR_GRAY2BGR)
-            h_e, w_e  = edge_vis.shape[:2]
-            MAG_THRESH = 20   # must match C EDGE_SCORE_MAG_THRESH
+            # ── Canny + parabola overlay ─────────────────────────────────────
+            # Two narrow strips at left/right edges of each obstacle box.
+            # cyan = left strip, orange = right strip.
+            STRIP_W    = 12   # must match C EDGE_SCORE_STRIP_W
+            MAG_THRESH = 20
 
-            for r in obs_raw:
-                s, e_col = int(r[0]), int(r[1])
-                score_g  = int(r[4] * 200)
-                col      = (0, score_g, 255 - score_g)
-                cv2.rectangle(edge_vis, (s, 0), (e_col, h_e - 1), col, 1)
-                cv2.putText(edge_vis, f"e={r[4]:.2f}", (s + 2, 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
-
-                # compute per-row peak-x in sensor coords, then convert to rotated
-                # rotated x = row in original = r_orig
-                # rotated y = (tW-1) - col_orig  (90° CCW: x_rot=h-1-y_orig, y_rot=x_orig... )
-                # Actually img_rot x-axis = original row axis, so obstacle cols
-                # in rotated space are already r[0]..r[1]. The band in sensor
-                # coords is tW-1-r[1] .. tW-1-r[0].
-                # We work directly in rotated image coords for the peak search.
-                grey_band = grey_rot  # already rotated
-                rows_r = range(h_e)
-                peak_xs_r, peak_rows_r = [], []
-                for row_r in rows_r:
-                    bx, bm = s, 0
-                    for cx in range(s, e_col + 1):
-                        # 5-tap on rotated grey image
-                        xm2 = max(0, cx-2); xm1 = max(0, cx-1)
-                        xp1 = min(w_e-1, cx+1); xp2 = min(w_e-1, cx+2)
-                        g = (-2*int(grey_band[row_r, xm2]) - int(grey_band[row_r, xm1])
-                              + int(grey_band[row_r, xp1]) + 2*int(grey_band[row_r, xp2]))
-                        m = abs(g)
-                        if m > bm: bm = m; bx = cx
-                    if bm >= MAG_THRESH:
-                        peak_xs_r.append(bx)
-                        peak_rows_r.append(row_r)
-
-                if len(peak_rows_r) >= 4:
-                    # fit parabola x = a*r^2 + b*r + c
-                    rs = np.array(peak_rows_r, dtype=np.float64)
-                    xs = np.array(peak_xs_r,   dtype=np.float64)
-                    A  = np.column_stack([rs**2, rs, np.ones_like(rs)])
-                    try:
-                        coeffs, _, _, _ = np.linalg.lstsq(A, xs, rcond=None)
-                        pa, pb, pc = coeffs   # pa/pb/pc to avoid shadowing argparse 'a'
-                        # draw the parabola
-                        pts = []
-                        for row_r in range(h_e):
-                            px = int(pa*row_r**2 + pb*row_r + pc)
-                            if s <= px <= e_col:
-                                pts.append((px, row_r))
-                        if len(pts) > 1:
-                            for i in range(len(pts)-1):
-                                cv2.line(edge_vis, pts[i], pts[i+1], (0, 255, 255), 1)
-                    except Exception:
-                        pass
-            edge_up  = upscale(edge_vis)
 
             # scale detection coordinates + regions to match upscaled image
             boundary_sc  = (boundary   * S).astype(int) if boundary   is not None else None
@@ -473,11 +499,9 @@ def main():
 
             det_h, det_w = det_vis.shape[:2]
             target_w     = top.shape[1]
-            # bottom row = detection | canny | info
-            # canny panel gets the same width as detection view
+            # resize edge panel to same height as det_vis
             edge_up_r = cv2.resize(edge_up, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
-            used_w    = det_w + edge_up_r.shape[1]
-            extra_w   = target_w - used_w
+            extra_w   = target_w - det_w - edge_up_r.shape[1]
             info_panel = (np.zeros((det_h, extra_w, 3), np.uint8) if extra_w > 0 else None)
 
             txt_s = 0.45 * S
@@ -489,14 +513,15 @@ def main():
                     [f"Frame {idx}/{len(paths)}", name, "",
                      f"Status: {st}", f"Green:  {green_frac_out.value:.3f}", "",
                      f"Obstacles: {num_obs}"]
-                    + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])} h={int(r[3])} e={r[4]:.2f}"
+                    + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])} h={int(r[3])} b={r[4]:.2f}"
                        for i, r in enumerate(obs_raw)]
                     + ["", f"Plants: {num_plants}"]
                     + [f"  [{i}] row={int(r[0])}-{int(r[1])} w={int(r[2])}"
                        for i, r in enumerate(plt_raw)]
                     + ["", f"{'PAUSED' if paused else 'PLAYING'}  delay={a.delay}ms",
-                       "", "edge score: 0.0=no edge  1.0=clean edge",
-                       "box colour: red=low  green=high"]
+                       "", "b: boundary score",
+                       "  0.0 = straight line (grass edge)",
+                       "  1.0 = abrupt step (real obstacle)"]
                 )
                 for line in lines:
                     cv2.putText(info_panel, line, (int(10*S), y),
@@ -505,7 +530,7 @@ def main():
                     y += lh
                 bot = np.hstack([det_vis, edge_up_r, info_panel])
             else:
-                bot = np.hstack([det_vis, edge_up_r]) if edge_up_r.shape[1] <= target_w - det_w \
+                bot = np.hstack([det_vis, edge_up_r]) if det_w + edge_up_r.shape[1] <= target_w \
                       else det_vis[:, :target_w, :]
 
             hdr_h = int(40 * S)
