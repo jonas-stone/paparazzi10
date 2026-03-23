@@ -50,7 +50,7 @@ static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
 static uint8_t increase_nav_heading(float incrementDegrees);
 static uint8_t chooseRandomIncrementAvoidance(void);
 static uint8_t chooseWiseIncrementAvoidance(int safe_col);
-float speed_multiplier = 1.0f;
+float speed_multiplier = 0.5;
 
 enum navigation_state_t {
   SAFE,
