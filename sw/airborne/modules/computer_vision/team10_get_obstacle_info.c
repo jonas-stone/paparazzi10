@@ -12,7 +12,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+<<<<<<< HEAD
 #include "team10_rtp_utilities.h"
+=======
+#include <team10_rtp_utilities.h>
+>>>>>>> e73ebd5cd7473d5228fcb3f969bef505ed7c43b1
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  STATIC WORK BUFFERS
@@ -51,7 +55,10 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
+<<<<<<< HEAD
 /* Uncomment ONE of these: */
+=======
+>>>>>>> e73ebd5cd7473d5228fcb3f969bef505ed7c43b1
 // #define GROUND_TREE_REAL
 #define GROUND_TREE_SIM
 
