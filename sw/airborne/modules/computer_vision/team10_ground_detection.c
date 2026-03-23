@@ -221,7 +221,6 @@ void ground_detection_init(void)
 void ground_detection_periodic(void)
 {
     struct obstacle_region_t lo[MAX_OBSTACLE_REGIONS], lp[MAX_PLANT_REGIONS];
-<<<<<<< HEAD
     int16_t  br[MAX_IMAGE_HEIGHT];
     uint8_t oc, pc, gd;
     uint16_t bl;
