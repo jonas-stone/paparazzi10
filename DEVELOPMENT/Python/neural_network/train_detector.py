@@ -217,8 +217,8 @@ def train_detector(
 if __name__ == '__main__':
     train_detector(
         images_folder   = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320',
-        masks_folder    = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\masks_data\ground_detection_masks',
-        model_save_path = 'ground_detector.pkl',
+        masks_folder    = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\masks_data\tree_detection_masks',
+        model_save_path = 'tree_detector.pkl',
         show_figures    = True,  # flip to True to see visualisations after training
     )
 
