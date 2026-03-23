@@ -62,39 +62,37 @@ static uint16_t edge_sobel_col[MAX_IMAGE_HEIGHT];   /* Sobel-Y magnitude per row
 /* ══════════════════════════════════════════════════════════════════════════════
  *  EDGE-CONFIRMATION TUNING PARAMETERS
  *
- *  EDGE_CONFIRM_MIN_ROWS   – minimum number of rows that must have a strong
- *                            edge inside the obstacle column band.
- *                            Lower  → easier to confirm (more obstacles kept).
- *                            Higher → stricter (fewer false positives).
+ *  The check fits a PARABOLA  x = a·r² + b·r + c  through the peak-edge
+ *  positions (r = row index, x = column of strongest Sobel response).
+ *  A parabola naturally absorbs the barrel distortion of a fisheye lens,
+ *  which curves edges that would be straight in an undistorted image.
+ *  The residual is the mean absolute deviation from that fitted curve.
  *
- *  EDGE_CONFIRM_SOBEL_THRESH – Sobel magnitude (0-1020) above which a row is
- *                              considered to contain a real edge.
- *                              Typical range: 30–120.
+ *  EDGE_CONFIRM_MIN_ROWS     – minimum rows with a strong edge.
+ *                              Lower  → easier to confirm.  Default: 6
  *
- *  EDGE_CONFIRM_MAX_RESIDUAL – maximum mean absolute deviation (in rows) of
- *                              edge positions from a fitted straight line.
- *                              Lower  → must be a very straight edge.
- *                              Higher → allows slightly curved / noisy edges.
- *                              Set to a large value (e.g. 9999) to skip the
- *                              linearity check entirely.
+ *  EDGE_CONFIRM_SOBEL_THRESH – Sobel-Y magnitude (0–1020) to count as edge.
+ *                              Lower  → more sensitive.     Default: 30
  *
- *  EDGE_CONFIRM_MIN_SPAN    – the fitted edge must span at least this many
- *                             columns (in the original image x-direction, which
- *                             after 90° rotation is the row direction).
- *                             Prevents tiny spurious edges from confirming an
- *                             obstacle.
+ *  EDGE_CONFIRM_MAX_RESIDUAL – max mean absolute deviation from the fitted
+ *                              parabola, in pixels.
+ *                              Higher → more tolerant of curved / noisy edges.
+ *                              Default: 12.0  (generous for fisheye)
+ *
+ *  EDGE_CONFIRM_MIN_SPAN     – fitted edge must span at least this many rows.
+ *                              Default: 5
  * ══════════════════════════════════════════════════════════════════════════════ */
 #ifndef EDGE_CONFIRM_MIN_ROWS
-#  define EDGE_CONFIRM_MIN_ROWS      8
+#  define EDGE_CONFIRM_MIN_ROWS      6
 #endif
 #ifndef EDGE_CONFIRM_SOBEL_THRESH
-#  define EDGE_CONFIRM_SOBEL_THRESH  40
+#  define EDGE_CONFIRM_SOBEL_THRESH  30
 #endif
 #ifndef EDGE_CONFIRM_MAX_RESIDUAL
-#  define EDGE_CONFIRM_MAX_RESIDUAL  4.0f
+#  define EDGE_CONFIRM_MAX_RESIDUAL  12.0f
 #endif
 #ifndef EDGE_CONFIRM_MIN_SPAN
-#  define EDGE_CONFIRM_MIN_SPAN      6
+#  define EDGE_CONFIRM_MIN_SPAN      5
 #endif
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -641,61 +639,85 @@ static int edge_confirm_obstacle(const uint8_t *buf,
     int span = edge_rows[n_edge - 1] - edge_rows[0] + 1;
     if (span < EDGE_CONFIRM_MIN_SPAN) return 0;
 
-    /* ── Check 3: linearity — least-squares line fit ─────────────────────
-     *  We model:  col_position(row) = a * row + b
-     *  Here "col_position" is estimated as the column within [col_start,col_end]
-     *  where the Sobel magnitude peaks, for each strong-edge row.
-     *  For efficiency we reuse edge_rows[] as the x-index (row index) and
-     *  compute peak-x per row as the y-value of the regression.
+    /* ── Check 3: parabolic fit — fisheye-aware edge smoothness ─────────────
+     *
+     *  Fisheye lenses curve edges that are physically straight.  A straight
+     *  line fit would reject those curved edges as non-obstacles.  Instead we
+     *  fit a parabola   x = a·r² + b·r + c   through the per-row peak-edge
+     *  column positions using least-squares (normal equations on 3×3 system).
+     *  The mean absolute residual from that parabola must be ≤
+     *  EDGE_CONFIRM_MAX_RESIDUAL to confirm the obstacle.
+     *
+     *  Normal equations for  x = a·r² + b·r + c :
+     *    [ Σr⁴  Σr³  Σr²  ] [a]   [Σr²·x]
+     *    [ Σr³  Σr²  Σr   ] [b] = [Σr·x ]
+     *    [ Σr²  Σr   n    ] [c]   [Σx   ]
+     *
+     *  Solved via Cramer's rule on the 3×3 system.
      * ─────────────────────────────────────────────────────────────────── */
-    float sx = 0, sy = 0, sxy = 0, sxx = 0;
+
+    /* collect peak-x per strong-edge row (second pass) */
+    /* peak_xs[] stored in edge_sobel_col reused as int16 scratch — safe,
+       n_edge ≤ MAX_IMAGE_HEIGHT ≤ MAX_IMAGE_WIDTH ≤ size of edge_sobel_col */
+    int16_t *peak_xs = (int16_t *)edge_sobel_col;  /* reuse buffer */
+
     for (int i = 0; i < n_edge; i++) {
         int r   = edge_rows[i];
         int row = row_top + r;
-        /* find the column inside the band where Sobel-Y peaks */
-        int peak_x = col_start;
-        int peak_m = 0;
+        int px  = col_start, pm = 0;
         for (int x = col_start; x <= col_end; x++) {
             if (row < 1 || row >= img_h - 1) continue;
             int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
                    - (int)yuv422_Y(buf, img_w, x, row + 1);
             if (gx < 0) gx = -gx;
-            if (gx > peak_m) { peak_m = gx; peak_x = x; }
+            if (gx > pm) { pm = gx; px = x; }
         }
-        float fx = (float)r;
-        float fy = (float)peak_x;
-        sx  += fx;
-        sy  += fy;
-        sxy += fx * fy;
-        sxx += fx * fx;
+        peak_xs[i] = (int16_t)px;
     }
-    float fn  = (float)n_edge;
-    float den = fn * sxx - sx * sx;
-    float residual_mean = 0.0f;
 
-    if (fabsf(den) > 1e-6f) {
-        float a = (fn * sxy - sx * sy) / den;
-        float b = (sy - a * sx) / fn;
-        float sum_res = 0.0f;
+    /* accumulate sums for normal equations */
+    double sr4=0, sr3=0, sr2=0, sr1=0, sr0=(double)n_edge;
+    double srx2=0, srx1=0, srx0=0;
+    for (int i = 0; i < n_edge; i++) {
+        double r = (double)edge_rows[i];
+        double x = (double)peak_xs[i];
+        double r2 = r * r;
+        sr4  += r2 * r2;
+        sr3  += r2 * r;
+        sr2  += r2;
+        sr1  += r;
+        srx2 += r2 * x;
+        srx1 += r  * x;
+        srx0 += x;
+    }
+
+    /* 3×3 determinant (Sarrus) */
+    double det = sr4*(sr2*sr0 - sr1*sr1)
+               - sr3*(sr3*sr0 - sr1*sr2)
+               + sr2*(sr3*sr1 - sr2*sr2);
+
+    float residual_mean = 0.0f;
+    if (det > 1e-6 || det < -1e-6) {
+        double a = (srx2*(sr2*sr0 - sr1*sr1)
+                  - sr3*(srx1*sr0 - sr1*srx0)
+                  + sr2*(srx1*sr1 - sr2*srx0)) / det;
+        double b = (sr4*(srx1*sr0 - sr1*srx0)
+                  - srx2*(sr3*sr0 - sr1*sr2)
+                  + sr2*(sr3*srx0 - sr2*srx1)) / det;
+        double c = (sr4*(sr2*srx0 - srx1*sr1)
+                  - sr3*(sr3*srx0 - srx1*sr2)
+                  + srx2*(sr3*sr1 - sr2*sr2)) / det;
+
+        double sum_res = 0.0;
         for (int i = 0; i < n_edge; i++) {
-            int r   = edge_rows[i];
-            int row = row_top + r;
-            int peak_x = col_start, peak_m = 0;
-            for (int x = col_start; x <= col_end; x++) {
-                if (row < 1 || row >= img_h - 1) continue;
-                int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
-                       - (int)yuv422_Y(buf, img_w, x, row + 1);
-                if (gx < 0) gx = -gx;
-                if (gx > peak_m) { peak_m = gx; peak_x = x; }
-            }
-            float predicted = a * (float)r + b;
-            float res = (float)peak_x - predicted;
+            double r    = (double)edge_rows[i];
+            double pred = a*r*r + b*r + c;
+            double res  = (double)peak_xs[i] - pred;
             sum_res += res < 0 ? -res : res;
         }
-        residual_mean = sum_res / fn;
+        residual_mean = (float)(sum_res / n_edge);
     }
-    /* If den is too small the line is near-vertical → perfectly straight,
-       so residual_mean stays 0 and the check passes. */
+    /* det ≈ 0 → degenerate (all rows identical) → treat as perfect fit */
 
     if (residual_mean > EDGE_CONFIRM_MAX_RESIDUAL) return 0;
 
