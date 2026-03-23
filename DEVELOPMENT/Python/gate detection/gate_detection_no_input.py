@@ -372,7 +372,7 @@ def process_sequence(image_folder: str, cfg: Optional[Config] = None):
 if __name__ == "__main__":
 
     # ── Set your image folder here ────────────────────────────────────────────
-    IMAGE_FOLDER = "../paparazzi10/DEVELOPMENT/downloads from drone/20260306-095826"
+    IMAGE_FOLDER = r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320"
     # ─────────────────────────────────────────────────────────────────────────
 
     process_sequence(IMAGE_FOLDER)

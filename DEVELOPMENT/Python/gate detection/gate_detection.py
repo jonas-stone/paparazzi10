@@ -154,7 +154,7 @@ def process_folder_as_video(folder_path, delay=120):
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    image_path = "../paparazzi10/DEVELOPMENT/downloads from drone/20260306-095826/1313401090.jpg"
+    image_path = r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320\450.jpg"
     corners, vis_temp, white_mask = detect_gate_corners_template(image_path, debug=False)
     gate_present, vis_gate = gate_present_from_template_output(
             image_path,

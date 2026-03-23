@@ -8,21 +8,41 @@ import numpy as np
 import random
 import os
 
-def detect_edges(img_in, sigma=0.01, scale=4, img_width=104*2, img_height=48*2):
-    img = cv2.imread(img_in)
+def detect_edges(img_in, sigma=0.0000000001, scale=4, img_width=None, img_height=None):
+    """
+    Displays a side-by-side view of the original image and its Canny edge map,
+    and prints edge density for left, center, and right thirds of the image.
 
+    Parameters
+    ----------
+    img_in     : str   — path to the input image
+    sigma      : float — Gaussian blur strength before Canny, nearly 0 = almost no blur
+    scale      : int   — display scale multiplier for the output window, tweakable
+    img_width  : int   — optional resize width in pixels, leave as None to keep original size
+    img_height : int   — optional resize height in pixels, leave as None to keep original size
+                         note: both must be provided together if resizing is wanted,
+                         providing only one will be ignored and original size is kept
+    """
+
+    img = cv2.imread(img_in)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {img_in}")
 
     img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(src=gray, ksize=(5, 5), sigmaX=sigma, sigmaY=sigma)
-    edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
-    edges = cv2.resize(edges, (img_width, img_height), interpolation=cv2.INTER_NEAREST)
+    # ── Optional resize — only applied if both dimensions are provided ────────
+    if img_width is not None and img_height is not None:
+        img = cv2.resize(img, (img_width, img_height), interpolation=cv2.INTER_NEAREST)
+    else:
+        img_height, img_width = img.shape[:2]  # use natural image size
 
-    # Partition into 3 vertical sections
-    h, w = edges.shape
+    # ── Edge detection ────────────────────────────────────────────────────────
+    gray    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(src=gray, ksize=(5, 5), sigmaX=sigma, sigmaY=sigma)
+    edges   = cv2.Canny(blurred, threshold1=50, threshold2=150)
+
+    # ── Edge density per third ────────────────────────────────────────────────
+    h, w  = edges.shape
     third = w // 3
     left   = edges[:, :third]
     center = edges[:, third:2*third]
@@ -32,17 +52,71 @@ def detect_edges(img_in, sigma=0.01, scale=4, img_width=104*2, img_height=48*2):
         density = np.sum(part > 0) / part.size
         print(f"{name} density: {density:.4f}")
 
-    img_resized = cv2.resize(img, (img_width, img_height))
+    # ── Display ───────────────────────────────────────────────────────────────
     edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    combined = np.hstack((img_resized, edges_bgr))
+    combined  = np.hstack((img, edges_bgr))
 
-    combined_big = cv2.resize(combined, (img_width * 2 * scale, img_height * scale), interpolation=cv2.INTER_NEAREST)
+    display_w = img_width  * 2 * scale  # x2 because original + edges side by side
+    display_h = img_height * scale
+    combined_big = cv2.resize(combined, (display_w, display_h), interpolation=cv2.INTER_NEAREST)
+
     cv2.imshow("Original | Canny Edges", combined_big)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 
-detect_edges(r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260313-100130\70964142.jpg",scale=4, img_width=104*2, img_height=48*2)
+# ── Usage examples ────────────────────────────────────────────────────────────
+
+# With resize — explicitly set output dimensions
+detect_edges(
+    r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320\709.jpg",
+    scale      = 1
+    # img_width  = 104 * 3,
+    # img_height = 48  * 3
+)
+
+# Without resize — uses natural image dimensions
+# detect_edges(
+#     r"C:\...\709.jpg",
+#     scale = 4
+# )
+#
+# def detect_edges(img_in, sigma=0.0000000001, scale=4, img_width=104*2, img_height=48*2):
+#     img = cv2.imread(img_in)
+#
+#     if img is None:
+#         raise FileNotFoundError(f"Could not read image: {img_in}")
+#
+#     img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+#
+#     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+#     blurred = cv2.GaussianBlur(src=gray, ksize=(5, 5), sigmaX=sigma, sigmaY=sigma)
+#     edges = cv2.Canny(blurred, threshold1=50, threshold2=150)
+#     edges = cv2.resize(edges, (img_width, img_height), interpolation=cv2.INTER_NEAREST)
+#
+#     # Partition into 3 vertical sections
+#     h, w = edges.shape
+#     third = w // 3
+#     left   = edges[:, :third]
+#     center = edges[:, third:2*third]
+#     right  = edges[:, 2*third:]
+#
+#     for name, part in [("left", left), ("center", center), ("right", right)]:
+#         density = np.sum(part > 0) / part.size
+#         print(f"{name} density: {density:.4f}")
+#
+#     # img_resized = cv2.resize(img, (img_width, img_height))
+#     edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+#     # combined = np.hstack((img_resized, edges_bgr))
+#     combined = np.hstack((img, edges_bgr))
+#
+#     combined_big = cv2.resize(combined, (img_width * 2 * scale, img_height * scale), interpolation=cv2.INTER_NEAREST)
+#     cv2.imshow("Original | Canny Edges", combined_big)
+#     cv2.waitKey(0)
+#     cv2.destroyAllWindows()
+#
+#
+# detect_edges(r"C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320\709.jpg",scale=4, img_width=104*3, img_height=48*3)
 
 
 
