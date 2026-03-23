@@ -12,11 +12,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
-<<<<<<< HEAD
 #include <team10_rtp_utilities.h>
-=======
-#include "team10_rtp_utilities.h"
->>>>>>> 32326a99260adae9114a2a979e67b37702172aa1
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  STATIC WORK BUFFERS
@@ -55,10 +51,6 @@ static inline uint8_t yuv422_V(const uint8_t *buf, int w, int x, int y)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  1. DECISION TREE (exact match of Python is_ground)
  * ══════════════════════════════════════════════════════════════════════════════ */
-<<<<<<< HEAD
-=======
-/* Uncomment ONE of these: */
->>>>>>> 32326a99260adae9114a2a979e67b37702172aa1
 // #define GROUND_TREE_REAL
 #define GROUND_TREE_SIM
 
@@ -695,17 +687,12 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
 
-<<<<<<< HEAD
     if (result_out) {
         result_out->gf     = gf;
         result_out->ground = ground;
         result_out->mask   = work_mask;
     }
 
-=======
-
-    
->>>>>>> 32326a99260adae9114a2a979e67b37702172aa1
     return no;
 }
 

@@ -284,6 +284,12 @@
       <field name="boundary_len"   type="uint16_t"/>
     </message>
 
+    <message name="TEAM10_GATE_DETECTION" id="43">
+      <field name="id" type="uint8"/>
+      <field name="gd" type="float"/>
+      <field name="gx" type="float"/>
+    </message>
+
   </msg_class>
 
 </protocol>

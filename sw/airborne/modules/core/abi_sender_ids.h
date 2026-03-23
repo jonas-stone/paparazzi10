@@ -694,6 +694,11 @@
 #define TEAM10_GROUND_DETECTION_ID 1
 #endif  
 
+// gate detection
+#ifndef TEAM10_GATE_DETECTION_ID
+#define TEAM10_GATE_DETECTION_ID 3
+#endif 
+
 // RANSAC detection
 #ifndef TEAM10_RANSAC_DETECTION_ID
 #define TEAM10_RANSAC_DETECTION_ID 2
