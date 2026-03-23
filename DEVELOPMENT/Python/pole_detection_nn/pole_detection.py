@@ -108,7 +108,7 @@ score = accuracy_score(y_test, y_pred)
 print('Sensitivity:', round(score, 3))
 
 # ── Save the model ────────────────────────────────────────────────────────────
-MODEL_PATH = 'pole_detector.pkl'
+MODEL_PATH = '../neural_network/pole_detector.pkl'
 joblib.dump(clf, MODEL_PATH)
 print(f'Model saved to {MODEL_PATH}')
 

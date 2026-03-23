@@ -23,7 +23,7 @@ import numpy as np
 MODE = 1          # 1 = folder mode,  2 = single image mode
 
 _script_dir   = os.path.dirname(os.path.abspath(__file__))
-_project_root = os.path.abspath(os.path.join(_script_dir, "..", "..", "..", ".."))
+_project_root = os.path.abspath(os.path.join(_script_dir, "", "..", "..", ".."))
 
 SINGLE_IMAGE_PATH = os.path.join(_project_root, "DEVELOPMENT", "downloads from drone", "20260320", "475.jpg")
 FOLDER_PATH       = os.path.join(_project_root, "DEVELOPMENT", "downloads from drone", "20260320")
