@@ -33,7 +33,7 @@ so you have to define which filter to use with the ORANGE_AVOIDER_VISUAL_DETECTI
     <file name="team10_custom_autopilot.h"/>
   </header>
   <init fun="ground_obstacle_avoidance_init()"/>
-  <periodic fun="ground_obstacle_avoidance_periodic()" freq="1"/>
+  <periodic fun="ground_obstacle_avoidance_periodic()" freq="10"/>
   <makefile target="ap|nps">
     <file name="team10_custom_autopilot.c"/>
   </makefile>
