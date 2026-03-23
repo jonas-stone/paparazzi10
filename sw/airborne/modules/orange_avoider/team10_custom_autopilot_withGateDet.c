@@ -1,0 +1,376 @@
+/*
+ * Copyright (C) Roland Meertens
+ *
+ * This file is part of paparazzi
+ *
+ */
+/**
+ * @file "modules/orange_avoider/orange_avoider.c"
+ * @author Roland Meertens
+ * Example on how to use the colours detected to avoid orange pole in the cyberzoo
+ * This module is an example module for the course AE4317 Autonomous Flight of Micro Air Vehicles at the TU Delft.
+ * This module is used in combination with a color filter (cv_detect_color_object) and the navigation mode of the autopilot.
+ * The avoidance strategy is to simply count the total number of orange pixels. When above a certain percentage threshold,
+ * (given by color_count_frac) we assume that there is an obstacle and we turn.
+ *
+ * The color filter settings are set using the cv_detect_color_object. This module can run multiple filters simultaneously
+ * so you have to define which filter to use with the ORANGE_AVOIDER_VISUAL_DETECTION_ID setting.
+ */
+
+ // Team 10 inclusions
+#include "modules/orange_avoider/team10_custom_autopilot_withGateDet.h"
+#include "modules/computer_vision/team10_get_obstacle_info.h"
+#include "modules/computer_vision/team10_logic.h"
+
+// Other inclusions
+#include "modules/orange_avoider/orange_avoider.h"
+#include "firmwares/rotorcraft/navigation.h"
+#include "generated/airframe.h"
+#include "state.h"
+#include "modules/core/abi.h"
+#include <time.h>
+#include <stdio.h>
+#include <string.h>
+
+// flight plan inclusions
+#include "generated/flight_plan.h"
+
+#define ORANGE_AVOIDER_VERBOSE TRUE
+
+#define PRINT(string,...) fprintf(stderr, "[orange_avoider->%s()] " string,__FUNCTION__ , ##__VA_ARGS__)
+#if ORANGE_AVOIDER_VERBOSE
+#define VERBOSE_PRINT PRINT
+#else
+#define VERBOSE_PRINT(...)
+#endif
+
+static uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters);
+static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters);
+static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
+static uint8_t increase_nav_heading(float incrementDegrees);
+static uint8_t chooseRandomIncrementAvoidance(void);
+static uint8_t chooseWiseIncrementAvoidance(int safe_col);
+float speed_multiplier = 1.0f;
+
+#ifndef TEAM10_GATE_DETECTION_ID
+#define TEAM10_GATE_DETECTION_ID ABI_BROADCAST
+#endif
+
+static abi_event gate_detection_ev;
+static uint8_t gate_seen = 0;
+static int16_t gate_center_col = 0;
+
+static void gate_detection_callback(
+    uint8_t __attribute__((unused)) sender_id,
+    uint8_t in_gate_detected,
+    int in_gate_center_x);
+
+static uint8_t moveWaypointToImageColumn(uint8_t waypoint,
+                                         int image_col,
+                                         float forward_distance,
+                                         float lateral_range_m);
+static float clampf_local(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static uint8_t moveWaypointToImageColumn(uint8_t waypoint,
+                                         int image_col,
+                                         float forward_distance,
+                                         float lateral_range_m)
+{
+  struct EnuCoor_i new_coor;
+  float heading = stateGetNedToBodyEulers_f()->psi;
+  float image_center = MAX_IMAGE_WIDTH / 2.0f;
+
+  float normalized = ((float)image_col - image_center) / image_center;
+  normalized = clampf_local(normalized, -1.0f, 1.0f);
+
+  float lateral = normalized * lateral_range_m;
+  float forward = forward_distance;
+
+  float dx = sinf(heading) * forward + cosf(heading) * lateral;
+  float dy = cosf(heading) * forward - sinf(heading) * lateral;
+
+  new_coor.x = stateGetPositionEnu_i()->x + POS_BFP_OF_REAL(dx);
+  new_coor.y = stateGetPositionEnu_i()->y + POS_BFP_OF_REAL(dy);
+
+  moveWaypoint(waypoint, &new_coor);
+  return false;
+}
+
+enum navigation_state_t {
+  SAFE,
+  OBSTACLE_FOUND,
+  SEARCH_FOR_SAFE_HEADING,
+  OUT_OF_BOUNDS
+};
+
+// define and initialise global variables
+enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
+int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
+float heading_increment = 5.f;          // heading angle increment [deg]
+float maxDistance = 2.25;               // max waypoint displacement [m]
+
+// define script-level variables
+static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
+static struct obstacle_region_t plants[MAX_PLANT_REGIONS];
+static int16_t                  boundary_rows[MAX_IMAGE_HEIGHT];
+static float boundary_rows_f[MAX_IMAGE_HEIGHT];
+static uint8_t                  obstacle_count = 0;
+static uint8_t                  plant_count    = 0;
+static uint16_t                 boundary_len   = 0;
+uint16_t  total_obstacle_width  = 0;
+
+// define threshold settings -> lower, drone is more scared
+float obstacle_width_threshold = 0.2f;
+
+const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
+
+/*
+ * This next section defines an ABI messaging event (http://wiki.paparazziuav.org/wiki/ABI), necessary
+ * any time data calculated in another module needs to be accessed. Including the file where this external
+ * data is defined is not enough, since modules are executed parallel to each other, at different frequencies,
+ * in different threads. The ABI event is triggered every time new data is sent out, and as such the function
+ * defined in this file does not need to be explicitly called, only bound in the init function
+ */
+#ifndef TEAM10_GROUND_DETECTION_ID
+#define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
+#endif
+
+// ABI event declaration (used to bind to callback function)
+static abi_event ground_detection_ev;
+
+// ABI video callback function, gets the data from the computer vision code
+static void ground_detection_callback(
+    uint8_t __attribute__((unused)) sender_id,
+    struct obstacle_region_t *in_obs,   uint8_t  in_oc,
+    struct obstacle_region_t *in_plants, uint8_t  in_pc,
+    int16_t                  *in_br,    uint16_t in_bl)
+{
+    obstacle_count = in_oc;
+    memcpy(obstacles, in_obs, in_oc * sizeof(struct obstacle_region_t));
+
+    plant_count = in_pc;
+    memcpy(plants, in_plants, in_pc * sizeof(struct obstacle_region_t));
+
+    boundary_len = in_bl;
+    if (boundary_len > MAX_IMAGE_HEIGHT) boundary_len = MAX_IMAGE_HEIGHT;
+    memcpy(boundary_rows, in_br, boundary_len * sizeof(int16_t));
+
+    for (uint16_t i = 0; i < boundary_len; i++)
+    boundary_rows_f[i] = (float)in_br[i];
+}
+
+static void gate_detection_callback(
+    uint8_t __attribute__((unused)) sender_id,
+    uint8_t in_gate_detected,
+    int in_gate_center_x)
+{
+    gate_seen = in_gate_detected;
+    gate_center_col = (int16_t)in_gate_center_x;
+}
+
+/*
+ * Initialisation function, random seed and heading_increment
+ */
+void ground_obstacle_avoidance_init(void) {
+  srand(time(NULL));
+
+  int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                         plants, plant_count,
+                                         boundary_rows_f,
+                                         boundary_len, MAX_IMAGE_HEIGHT,
+                                         DEFAULT_OBS_BIAS_FRAC,
+                                         DEFAULT_PLANT_BIAS_FRAC);
+  chooseWiseIncrementAvoidance(safe_col);
+
+  AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID,
+                                    &ground_detection_ev,
+                                    ground_detection_callback);
+
+  AbiBindMsgTEAM10_GATE_DETECTION(TEAM10_GATE_DETECTION_ID,
+                                  &gate_detection_ev,
+                                  gate_detection_callback);
+}
+
+/*
+ * Function that checks it is safe to move forwards, and then moves a waypoint forward or changes the heading
+ */
+void ground_obstacle_avoidance_periodic(void)
+{
+  // only evaluate our state machine if we are flying
+  if(!autopilot_in_flight()){
+    return;
+  }
+
+  // print stuff to terminal
+  printf("total obstacle width: %.2f\nthreshold (fraction): %.2f\nthreshold (total):    %.2f\n",
+       total_obstacle_width / (float)MAX_IMAGE_WIDTH,
+       obstacle_width_threshold,
+       obstacle_width_threshold * MAX_IMAGE_WIDTH);
+
+  // update our confidence level
+  if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
+    obstacle_free_confidence++;
+  } else {
+    obstacle_free_confidence -= 2;
+  }
+
+  // bound obstacle_free_confidence
+  Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
+
+  float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
+
+  switch (navigation_state){
+    case SAFE:
+      // Move waypoint forward
+      moveWaypointForward(WP_TRAJECTORY, 1.5f * moveDistance);
+      if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
+        navigation_state = OUT_OF_BOUNDS;
+      } else if (obstacle_free_confidence == 0){
+        navigation_state = OBSTACLE_FOUND;
+      } else {
+        moveWaypointForward(WP_GOAL, moveDistance);
+      }
+
+      break;
+    case OBSTACLE_FOUND:
+      // stop
+      waypoint_move_here_2d(WP_GOAL);
+      waypoint_move_here_2d(WP_TRAJECTORY);
+
+      if (gate_seen) {
+        // gate detected: place waypoints through the gate centre
+        moveWaypointToImageColumn(WP_GOAL, gate_center_col, 1.0f, 0.8f);
+        moveWaypointToImageColumn(WP_TRAJECTORY, gate_center_col, 1.5f, 0.8f);
+
+        obstacle_free_confidence = 0;
+        navigation_state = SAFE;
+      } else {
+        // normal obstacle avoidance
+        int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                              plants, plant_count,
+                                              boundary_rows_f,
+                                              boundary_len, MAX_IMAGE_HEIGHT,
+                                              DEFAULT_OBS_BIAS_FRAC,
+                                              DEFAULT_PLANT_BIAS_FRAC);
+        chooseWiseIncrementAvoidance(safe_col);
+        navigation_state = SEARCH_FOR_SAFE_HEADING;
+      }
+
+      break;
+    case SEARCH_FOR_SAFE_HEADING:
+      increase_nav_heading(heading_increment);
+
+      // make sure we have a couple of good readings before declaring the way safe
+      if (obstacle_free_confidence >= 2){
+        navigation_state = SAFE;
+      }
+      break;
+    case OUT_OF_BOUNDS:
+      increase_nav_heading(heading_increment);
+      moveWaypointForward(WP_TRAJECTORY, 1.5f);
+
+      if (InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
+        // add offset to head back into arena
+        increase_nav_heading(heading_increment);
+
+        // reset safe counter
+        obstacle_free_confidence = 0;
+
+        // ensure direction is safe before continuing
+        navigation_state = SEARCH_FOR_SAFE_HEADING;
+      }
+      break;
+    default:
+      break;
+  }
+  return;
+}
+
+/*
+ * Increases the NAV heading. Assumes heading is an INT32_ANGLE. It is bound in this function.
+ */
+uint8_t increase_nav_heading(float incrementDegrees)
+{
+  float new_heading = stateGetNedToBodyEulers_f()->psi + RadOfDeg(incrementDegrees);
+
+  // normalize heading to [-pi, pi]
+  FLOAT_ANGLE_NORMALIZE(new_heading);
+
+  // set heading, declared in firmwares/rotorcraft/navigation.h
+  nav.heading = new_heading;
+
+  VERBOSE_PRINT("Increasing heading to %f\n", DegOfRad(new_heading));
+  return false;
+}
+
+/*
+ * Calculates coordinates of distance forward and sets waypoint 'waypoint' to those coordinates
+ */
+uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
+{
+  struct EnuCoor_i new_coor;
+  calculateForwards(&new_coor, distanceMeters);
+  moveWaypoint(waypoint, &new_coor);
+  return false;
+}
+
+/*
+ * Calculates coordinates of a distance of 'distanceMeters' forward w.r.t. current position and heading
+ */
+uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
+{
+  float heading  = stateGetNedToBodyEulers_f()->psi;
+
+  // Now determine where to place the waypoint you want to go to
+  new_coor->x = stateGetPositionEnu_i()->x + POS_BFP_OF_REAL(sinf(heading) * (distanceMeters));
+  new_coor->y = stateGetPositionEnu_i()->y + POS_BFP_OF_REAL(cosf(heading) * (distanceMeters));
+  VERBOSE_PRINT("Calculated %f m forward position. x: %f  y: %f based on pos(%f, %f) and heading(%f)\n", distanceMeters,	
+                POS_FLOAT_OF_BFP(new_coor->x), POS_FLOAT_OF_BFP(new_coor->y),
+                stateGetPositionEnu_f()->x, stateGetPositionEnu_f()->y, DegOfRad(heading));
+  return false;
+}
+
+/*
+ * Sets waypoint 'waypoint' to the coordinates of 'new_coor'
+ */
+uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
+{
+  VERBOSE_PRINT("Moving waypoint %d to x:%f y:%f\n", waypoint, POS_FLOAT_OF_BFP(new_coor->x),
+                POS_FLOAT_OF_BFP(new_coor->y));
+  waypoint_move_xy_i(waypoint, new_coor->x, new_coor->y);
+  return false;
+}
+
+/*
+ * Sets the variable 'heading_increment' randomly positive/negative
+ */
+uint8_t chooseRandomIncrementAvoidance(void)
+{
+  // Randomly choose CW or CCW avoiding direction
+  if (rand() % 2 == 0) {
+    heading_increment = 5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  } else {
+    heading_increment = -5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  }
+  return false;
+}
+
+uint8_t chooseWiseIncrementAvoidance(int safe_direction)
+{
+  
+  if (safe_direction > MAX_IMAGE_WIDTH / 2) {
+    heading_increment = 5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  } else {
+    heading_increment = -5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  }
+  return false;
+}
