@@ -56,45 +56,6 @@ static uint8_t  plant_clean_small[MAX_PLANT_PIXELS];
 static uint8_t  plant_mask_small[MAX_PLANT_PIXELS];
 static uint8_t  plant_mask_full[MAX_PIXELS];
 
-/* ── Edge-confirmation scratch buffer (one row of Sobel magnitudes) ───────── */
-static uint16_t edge_sobel_col[MAX_IMAGE_HEIGHT];   /* Sobel-Y magnitude per row */
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE-CONFIRMATION TUNING PARAMETERS
- *
- *  The check fits a PARABOLA  x = a·r² + b·r + c  through the peak-edge
- *  positions (r = row index, x = column of strongest Sobel response).
- *  A parabola naturally absorbs the barrel distortion of a fisheye lens,
- *  which curves edges that would be straight in an undistorted image.
- *  The residual is the mean absolute deviation from that fitted curve.
- *
- *  EDGE_CONFIRM_MIN_ROWS     – minimum rows with a strong edge.
- *                              Lower  → easier to confirm.  Default: 6
- *
- *  EDGE_CONFIRM_SOBEL_THRESH – Sobel-Y magnitude (0–1020) to count as edge.
- *                              Lower  → more sensitive.     Default: 30
- *
- *  EDGE_CONFIRM_MAX_RESIDUAL – max mean absolute deviation from the fitted
- *                              parabola, in pixels.
- *                              Higher → more tolerant of curved / noisy edges.
- *                              Default: 12.0  (generous for fisheye)
- *
- *  EDGE_CONFIRM_MIN_SPAN     – fitted edge must span at least this many rows.
- *                              Default: 5
- * ══════════════════════════════════════════════════════════════════════════════ */
-#ifndef EDGE_CONFIRM_MIN_ROWS
-#  define EDGE_CONFIRM_MIN_ROWS      6
-#endif
-#ifndef EDGE_CONFIRM_SOBEL_THRESH
-#  define EDGE_CONFIRM_SOBEL_THRESH  30
-#endif
-#ifndef EDGE_CONFIRM_MAX_RESIDUAL
-#  define EDGE_CONFIRM_MAX_RESIDUAL  12.0f
-#endif
-#ifndef EDGE_CONFIRM_MIN_SPAN
-#  define EDGE_CONFIRM_MIN_SPAN      5
-#endif
-
 /* ══════════════════════════════════════════════════════════════════════════════
  *  YUV422 (UYVY) PIXEL ACCESS
  * ══════════════════════════════════════════════════════════════════════════════ */
@@ -552,176 +513,150 @@ static int merge_obstacle_cols(const uint8_t *om, int nc, int mw, int mcg,
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE CONFIRMATION
+ *  EDGE SCORING  (informational — never rejects an obstacle)
  *
- *  For a candidate obstacle spanning columns [col_start, col_end] of the
- *  (pre-rotation) image, scan every row and compute the maximum Sobel-Y
- *  magnitude within that column band.  A row "has an edge" when that magnitude
- *  exceeds EDGE_CONFIRM_SOBEL_THRESH.
+ *  Confidence score 0.0–1.0 based on fitting a parabola through the
+ *  strongest vertical-edge position in each row of the obstacle band.
  *
- *  After collecting all edge-row positions, fit a line y = a*x + b through
- *  them with least-squares and compute the mean absolute residual.  The
- *  obstacle is confirmed when:
- *    1. At least EDGE_CONFIRM_MIN_ROWS rows have a strong edge.
- *    2. Those rows span at least EDGE_CONFIRM_MIN_SPAN rows.
- *    3. The mean absolute residual is ≤ EDGE_CONFIRM_MAX_RESIDUAL.
+ *  Algorithm
+ *  ─────────
+ *  For every row r inside the obstacle column band [col_start, col_end]:
+ *    1. Compute the 5-tap horizontal gradient at every column x:
+ *           g(x) = -2·Y(x-2) - Y(x-1) + Y(x+1) + 2·Y(x+2)
+ *    2. Record peak_x[r] = column with the highest |g(x)|
+ *       and peak_mag[r]  = that |g(x)| value.
+ *    3. Only keep rows where peak_mag >= EDGE_SCORE_MAG_THRESH.
  *
- *  Parameters
- *  ----------
- *  buf        : raw UYVY (2 bytes/pixel) image buffer, row-major.
- *  img_w      : image width  (columns in sensor coords).
- *  img_h      : image height (rows    in sensor coords).
- *  col_start  : first column of the obstacle band (sensor coords, 0-based).
- *  col_end    : last  column of the obstacle band (inclusive).
- *  row_top    : first row to search (0 = full image).
- *  row_bot    : last  row  to search (img_h-1 = full image).
+ *  Fit a parabola  x = a·r² + b·r + c  through the kept (r, peak_x) points
+ *  using least-squares (3×3 normal equations, Cramer's rule).
  *
- *  Returns 1 if confirmed, 0 if rejected.
+ *  Score formula
+ *  ─────────────
+ *    strength  = mean(peak_mag of kept rows) / EDGE_SCORE_MAG_NORM   [0..1]
+ *    coverage  = n_kept / img_h                                        [0..1]
+ *    fit       = exp(-mean_abs_residual / EDGE_SCORE_RESID_SCALE)     [0..1]
+ *    score     = strength * coverage * fit
+ *
+ *  Why this works
+ *  ──────────────
+ *  • A clear pillar edge: high magnitude, runs most of the image height,
+ *    peak positions follow a smooth parabola  → score near 1.
+ *  • Image border: clamped pixels → gradient ≈ 0 → few rows pass threshold
+ *    → coverage ≈ 0 → score ≈ 0.
+ *  • Noisy background texture: many rows pass threshold but peak positions
+ *    scatter randomly → high residual → fit ≈ 0 → score ≈ 0.
+ *
+ *  TUNING
+ *  ──────
+ *  EDGE_SCORE_MAG_THRESH   – min 5-tap magnitude to count a row (0–510).
+ *                            Lower = more sensitive.   Default: 20
+ *  EDGE_SCORE_MAG_NORM     – magnitude that gives strength = 1.0.
+ *                            Default: 80
+ *  EDGE_SCORE_RESID_SCALE  – residual (px) where fit drops to e^-1 ≈ 0.37.
+ *                            Higher = more tolerant of fisheye curvature.
+ *                            Default: 8.0
  * ══════════════════════════════════════════════════════════════════════════════ */
-static int edge_confirm_obstacle(const uint8_t *buf,
-                                 int img_w, int img_h,
-                                 int col_start, int col_end,
-                                 int row_top,   int row_bot)
+#define EDGE_SCORE_MAG_THRESH    20
+#define EDGE_SCORE_MAG_NORM      80.0f
+#define EDGE_SCORE_RESID_SCALE    8.0f
+
+/* 5-tap horizontal gradient magnitude at (x, r) */
+static inline int _vtap5(const uint8_t *buf, int img_w, int x, int r)
 {
-    /* ── clamp to image bounds ─────────────────────────────────────────────── */
-    if (col_start < 0)        col_start = 0;
-    if (col_end   >= img_w)   col_end   = img_w - 1;
-    if (row_top   < 1)        row_top   = 1;         /* need y-1 for Sobel */
-    if (row_bot   >= img_h-1) row_bot   = img_h - 2; /* need y+1 for Sobel */
-    if (col_start > col_end || row_top > row_bot) return 0;
+    int xm2 = (x-2 < 0)      ? 0       : x-2;
+    int xm1 = (x-1 < 0)      ? 0       : x-1;
+    int xp1 = (x+1 >= img_w) ? img_w-1 : x+1;
+    int xp2 = (x+2 >= img_w) ? img_w-1 : x+2;
+    int g = -2*(int)yuv422_Y(buf, img_w, xm2, r)
+            -1*(int)yuv422_Y(buf, img_w, xm1, r)
+            +1*(int)yuv422_Y(buf, img_w, xp1, r)
+            +2*(int)yuv422_Y(buf, img_w, xp2, r);
+    return g < 0 ? -g : g;
+}
 
-    /* ── Step 1: Sobel-Y magnitude, maximised across the column band ─────── */
-    /*
-     * Sobel-Y kernel:
-     *   -1  -2  -1
-     *    0   0   0
-     *   +1  +2  +1
-     *
-     * We work on Y (luminance) from the UYVY buffer.
-     * edge_sobel_col[r] = max Sobel-Y magnitude over x in [col_start, col_end].
-     */
-    int n_rows = row_bot - row_top + 1;
-    for (int r = row_top; r <= row_bot; r++) {
-        int max_mag = 0;
-        int x0 = (col_start > 0)        ? col_start - 1 : col_start;
-        int x1 = (col_end   < img_w-1)  ? col_end   + 1 : col_end;
-        for (int x = x0; x <= x1; x++) {
-            int gx = (int)yuv422_Y(buf, img_w, x, r - 1)
-                   + (int)yuv422_Y(buf, img_w, x, r + 1);
-            /* weight centre column × 2 using the kernel */
-            if (x > 0 && x < img_w - 1) {
-                gx += (int)yuv422_Y(buf, img_w, x - 1, r - 1)
-                    - (int)yuv422_Y(buf, img_w, x - 1, r + 1);
-                gx += (int)yuv422_Y(buf, img_w, x + 1, r - 1)
-                    - (int)yuv422_Y(buf, img_w, x + 1, r + 1);
-            }
-            int mag = gx < 0 ? -gx : gx;
-            if (mag > max_mag) max_mag = mag;
-        }
-        edge_sobel_col[r - row_top] = (uint16_t)(max_mag > 65535 ? 65535 : max_mag);
-    }
+static float compute_edge_score(const uint8_t *buf,
+                                 int img_w, int img_h,
+                                 int col_start, int col_end)
+{
+    if (buf == NULL || img_h < 4) return 0.0f;
+    if (col_start < 0)       col_start = 0;
+    if (col_end  >= img_w)   col_end   = img_w - 1;
+    if (col_start > col_end) return 0.0f;
 
-    /* ── Step 2: collect rows that have a strong edge ────────────────────── */
-    /* reuse ff_queue (int32_t, MAX_PIXELS) as a temporary row-index list     */
-    int  n_edge = 0;
-    int *edge_rows = (int *)ff_queue;   /* safe: not used during this phase   */
-    for (int r = 0; r < n_rows; r++) {
-        if (edge_sobel_col[r] >= EDGE_CONFIRM_SOBEL_THRESH) {
-            edge_rows[n_edge++] = r;
-            if (n_edge >= MAX_PIXELS) break; /* safety cap */
-        }
-    }
+    /* ── Step 1: find peak-x and peak-magnitude per row ─────────────────── */
+    /* reuse ff_queue as scratch: first img_h ints = peak_x,
+       next img_h ints = peak_mag  (MAX_PIXELS >> 2*MAX_IMAGE_HEIGHT, safe) */
+    int *peak_x   = (int *)ff_queue;
+    int *peak_mag = peak_x + img_h;
 
-    /* ── Check 1: enough edge rows? ─────────────────────────────────────── */
-    if (n_edge < EDGE_CONFIRM_MIN_ROWS) return 0;
+    int n_kept = 0;
+    double sum_mag = 0.0;
 
-    /* ── Check 2: sufficient span? ──────────────────────────────────────── */
-    int span = edge_rows[n_edge - 1] - edge_rows[0] + 1;
-    if (span < EDGE_CONFIRM_MIN_SPAN) return 0;
-
-    /* ── Check 3: parabolic fit — fisheye-aware edge smoothness ─────────────
-     *
-     *  Fisheye lenses curve edges that are physically straight.  A straight
-     *  line fit would reject those curved edges as non-obstacles.  Instead we
-     *  fit a parabola   x = a·r² + b·r + c   through the per-row peak-edge
-     *  column positions using least-squares (normal equations on 3×3 system).
-     *  The mean absolute residual from that parabola must be ≤
-     *  EDGE_CONFIRM_MAX_RESIDUAL to confirm the obstacle.
-     *
-     *  Normal equations for  x = a·r² + b·r + c :
-     *    [ Σr⁴  Σr³  Σr²  ] [a]   [Σr²·x]
-     *    [ Σr³  Σr²  Σr   ] [b] = [Σr·x ]
-     *    [ Σr²  Σr   n    ] [c]   [Σx   ]
-     *
-     *  Solved via Cramer's rule on the 3×3 system.
-     * ─────────────────────────────────────────────────────────────────── */
-
-    /* collect peak-x per strong-edge row (second pass) */
-    /* peak_xs[] stored in edge_sobel_col reused as int16 scratch — safe,
-       n_edge ≤ MAX_IMAGE_HEIGHT ≤ MAX_IMAGE_WIDTH ≤ size of edge_sobel_col */
-    int16_t *peak_xs = (int16_t *)edge_sobel_col;  /* reuse buffer */
-
-    for (int i = 0; i < n_edge; i++) {
-        int r   = edge_rows[i];
-        int row = row_top + r;
-        int px  = col_start, pm = 0;
+    for (int r = 0; r < img_h; r++) {
+        int best_x = col_start, best_m = 0;
         for (int x = col_start; x <= col_end; x++) {
-            if (row < 1 || row >= img_h - 1) continue;
-            int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
-                   - (int)yuv422_Y(buf, img_w, x, row + 1);
-            if (gx < 0) gx = -gx;
-            if (gx > pm) { pm = gx; px = x; }
+            int m = _vtap5(buf, img_w, x, r);
+            if (m > best_m) { best_m = m; best_x = x; }
         }
-        peak_xs[i] = (int16_t)px;
+        peak_x[r]   = best_x;
+        peak_mag[r] = best_m;
+        if (best_m >= EDGE_SCORE_MAG_THRESH) {
+            n_kept++;
+            sum_mag += best_m;
+        }
     }
 
-    /* accumulate sums for normal equations */
-    double sr4=0, sr3=0, sr2=0, sr1=0, sr0=(double)n_edge;
-    double srx2=0, srx1=0, srx0=0;
-    for (int i = 0; i < n_edge; i++) {
-        double r = (double)edge_rows[i];
-        double x = (double)peak_xs[i];
-        double r2 = r * r;
-        sr4  += r2 * r2;
-        sr3  += r2 * r;
-        sr2  += r2;
-        sr1  += r;
-        srx2 += r2 * x;
-        srx1 += r  * x;
-        srx0 += x;
+    if (n_kept < 4) return 0.0f;   /* too few strong-edge rows */
+
+    float coverage = (float)n_kept / (float)img_h;
+    float strength = (float)(sum_mag / n_kept) / EDGE_SCORE_MAG_NORM;
+    if (strength > 1.0f) strength = 1.0f;
+
+    /* ── Step 2: parabola fit  x = a·r² + b·r + c  (normal equations) ──── */
+    double sr4=0,sr3=0,sr2=0,sr1=0,sr0=0;
+    double srx2=0,srx1=0,srx0=0;
+
+    for (int r = 0; r < img_h; r++) {
+        if (peak_mag[r] < EDGE_SCORE_MAG_THRESH) continue;
+        double dr  = (double)r;
+        double dx  = (double)peak_x[r];
+        double dr2 = dr * dr;
+        sr4  += dr2 * dr2;
+        sr3  += dr2 * dr;
+        sr2  += dr2;
+        sr1  += dr;
+        sr0  += 1.0;
+        srx2 += dr2 * dx;
+        srx1 += dr  * dx;
+        srx0 += dx;
     }
 
-    /* 3×3 determinant (Sarrus) */
     double det = sr4*(sr2*sr0 - sr1*sr1)
                - sr3*(sr3*sr0 - sr1*sr2)
                + sr2*(sr3*sr1 - sr2*sr2);
 
-    float residual_mean = 0.0f;
+    float fit = 1.0f;   /* default: perfect fit (degenerate case) */
     if (det > 1e-6 || det < -1e-6) {
-        double a = (srx2*(sr2*sr0 - sr1*sr1)
-                  - sr3*(srx1*sr0 - sr1*srx0)
-                  + sr2*(srx1*sr1 - sr2*srx0)) / det;
-        double b = (sr4*(srx1*sr0 - sr1*srx0)
-                  - srx2*(sr3*sr0 - sr1*sr2)
-                  + sr2*(sr3*srx0 - sr2*srx1)) / det;
-        double c = (sr4*(sr2*srx0 - srx1*sr1)
-                  - sr3*(sr3*srx0 - srx1*sr2)
-                  + srx2*(sr3*sr1 - sr2*sr2)) / det;
+        double a = (srx2*(sr2*sr0-sr1*sr1) - sr3*(srx1*sr0-sr1*srx0) + sr2*(srx1*sr1-sr2*srx0)) / det;
+        double b = (sr4*(srx1*sr0-sr1*srx0) - srx2*(sr3*sr0-sr1*sr2) + sr2*(sr3*srx0-sr2*srx1)) / det;
+        double c = (sr4*(sr2*srx0-srx1*sr1) - sr3*(sr3*srx0-srx1*sr2) + srx2*(sr3*sr1-sr2*sr2)) / det;
 
         double sum_res = 0.0;
-        for (int i = 0; i < n_edge; i++) {
-            double r    = (double)edge_rows[i];
-            double pred = a*r*r + b*r + c;
-            double res  = (double)peak_xs[i] - pred;
+        for (int r = 0; r < img_h; r++) {
+            if (peak_mag[r] < EDGE_SCORE_MAG_THRESH) continue;
+            double dr   = (double)r;
+            double pred = a*dr*dr + b*dr + c;
+            double res  = (double)peak_x[r] - pred;
             sum_res += res < 0 ? -res : res;
         }
-        residual_mean = (float)(sum_res / n_edge);
+        float mean_res = (float)(sum_res / n_kept);
+        fit = expf(-mean_res / EDGE_SCORE_RESID_SCALE);
     }
-    /* det ≈ 0 → degenerate (all rows identical) → treat as perfect fit */
 
-    if (residual_mean > EDGE_CONFIRM_MAX_RESIDUAL) return 0;
-
-    return 1;  /* all checks passed — confirmed obstacle */
+    float score = strength * coverage * fit;
+    if (score > 1.0f) score = 1.0f;
+    if (score < 0.0f) score = 0.0f;
+    return score;
 }
 
 uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
@@ -775,33 +710,6 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     int no = 0;
     for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
         if (fl[i].width < 5) continue;
-
-        /* ── Edge confirmation ──────────────────────────────────────────────
-         *  The obstacle spans columns [fl[i].start, fl[i].start+fl[i].width-1]
-         *  in the boundary / rotated coordinate system (where image rows are
-         *  the "columns" after the 90° CCW rotation used by the visualiser).
-         *
-         *  In sensor coordinates the image is img_w × img_h (not rotated).
-         *  The boundary scan works on the FLIPPED (left↔right) mask, so
-         *  column index `s` in boundary space maps to sensor column
-         *  (img_w - 1 - s).  We pass the full row range (0 … img_h-1) so the
-         *  search covers the entire height.
-         *
-         *  If img_buf is NULL (e.g. baseline initialisation frame) we skip
-         *  the check and accept the region unconditionally.
-         * ────────────────────────────────────────────────────────────────── */
-        if (img_buf != NULL) {
-            int s_sensor = img_w - 1 - (fl[i].start + fl[i].width - 1);
-            int e_sensor = img_w - 1 -  fl[i].start;
-            if (s_sensor > e_sensor) { int tmp = s_sensor; s_sensor = e_sensor; e_sensor = tmp; }
-
-            if (!edge_confirm_obstacle(img_buf, img_w, img_h,
-                                       s_sensor, e_sensor,
-                                       0, img_h - 1)) {
-                /* No straight edge found — not a real obstacle, skip. */
-                continue;
-            }
-        }
         oo[no].start = (uint16_t)fl[i].start;
         oo[no].width = (uint16_t)fl[i].width;
 
@@ -832,6 +740,19 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
         }
         
         oo[no].baseline_height = (uint16_t)max_br;
+
+        /* ── Edge score (informational, never rejects) ──────────────────── */
+        /* boundary scan works on the L-R flipped mask, so col index s in
+           boundary space → sensor col (img_w-1-s).  Swap so s_s ≤ e_s.    */
+        if (img_buf != NULL) {
+            int s_s = img_w - 1 - (fl[i].start + fl[i].width - 1);
+            int e_s = img_w - 1 -  fl[i].start;
+            if (s_s > e_s) { int t = s_s; s_s = e_s; e_s = t; }
+            oo[no].edge_score = compute_edge_score(img_buf, img_w, img_h, s_s, e_s);
+        } else {
+            oo[no].edge_score = 0.0f;
+        }
+
         no++;
     }
     return (uint8_t)no;

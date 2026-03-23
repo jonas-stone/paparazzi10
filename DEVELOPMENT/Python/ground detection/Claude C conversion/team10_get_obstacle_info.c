@@ -38,25 +38,8 @@ static uint8_t  plant_clean_small[MAX_PLANT_PIXELS];
 static uint8_t  plant_mask_small[MAX_PLANT_PIXELS];
 static uint8_t  plant_mask_full[MAX_PIXELS];
 
-/* ── Edge-confirmation scratch buffer ────────────────────────────────────── */
-static uint16_t edge_sobel_col[MAX_IMAGE_HEIGHT];
-
 /* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE-CONFIRMATION TUNING PARAMETERS
- *  See team10_get_obstacle_info_standalone.c for full documentation.
- * ══════════════════════════════════════════════════════════════════════════════ */
-#ifndef EDGE_CONFIRM_MIN_ROWS
-#  define EDGE_CONFIRM_MIN_ROWS      8
-#endif
-#ifndef EDGE_CONFIRM_SOBEL_THRESH
-#  define EDGE_CONFIRM_SOBEL_THRESH  40
-#endif
-#ifndef EDGE_CONFIRM_MAX_RESIDUAL
-#  define EDGE_CONFIRM_MAX_RESIDUAL  4.0f
-#endif
-#ifndef EDGE_CONFIRM_MIN_SPAN
-#  define EDGE_CONFIRM_MIN_SPAN      6
-#endif
+ *  YUV422 (UYVY) PIXEL ACCESS
  * ══════════════════════════════════════════════════════════════════════════════ */
 static inline uint8_t yuv422_Y(const uint8_t *buf, int w, int x, int y)
 { return buf[y * w * 2 + x * 2 + 1]; }
@@ -512,101 +495,9 @@ static int merge_obstacle_cols(const uint8_t *om, int nc, int mw, int mcg,
     return cnt;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE CONFIRMATION  (shared implementation — see standalone .c for details)
- * ══════════════════════════════════════════════════════════════════════════════ */
-static int edge_confirm_obstacle(const uint8_t *buf,
-                                 int img_w, int img_h,
-                                 int col_start, int col_end,
-                                 int row_top,   int row_bot)
-{
-    if (col_start < 0)        col_start = 0;
-    if (col_end   >= img_w)   col_end   = img_w - 1;
-    if (row_top   < 1)        row_top   = 1;
-    if (row_bot   >= img_h-1) row_bot   = img_h - 2;
-    if (col_start > col_end || row_top > row_bot) return 0;
-
-    int n_rows = row_bot - row_top + 1;
-    for (int r = row_top; r <= row_bot; r++) {
-        int max_mag = 0;
-        int x0 = (col_start > 0)       ? col_start - 1 : col_start;
-        int x1 = (col_end   < img_w-1) ? col_end   + 1 : col_end;
-        for (int x = x0; x <= x1; x++) {
-            int gx = (int)yuv422_Y(buf, img_w, x, r - 1)
-                   + (int)yuv422_Y(buf, img_w, x, r + 1);
-            if (x > 0 && x < img_w - 1) {
-                gx += (int)yuv422_Y(buf, img_w, x - 1, r - 1)
-                    - (int)yuv422_Y(buf, img_w, x - 1, r + 1);
-                gx += (int)yuv422_Y(buf, img_w, x + 1, r - 1)
-                    - (int)yuv422_Y(buf, img_w, x + 1, r + 1);
-            }
-            int mag = gx < 0 ? -gx : gx;
-            if (mag > max_mag) max_mag = mag;
-        }
-        edge_sobel_col[r - row_top] = (uint16_t)(max_mag > 65535 ? 65535 : max_mag);
-    }
-
-    int  n_edge = 0;
-    int *edge_rows = (int *)ff_queue;
-    for (int r = 0; r < n_rows; r++) {
-        if (edge_sobel_col[r] >= EDGE_CONFIRM_SOBEL_THRESH) {
-            edge_rows[n_edge++] = r;
-            if (n_edge >= MAX_PIXELS) break;
-        }
-    }
-
-    if (n_edge < EDGE_CONFIRM_MIN_ROWS) return 0;
-
-    int span = edge_rows[n_edge - 1] - edge_rows[0] + 1;
-    if (span < EDGE_CONFIRM_MIN_SPAN) return 0;
-
-    float sx = 0, sy = 0, sxy = 0, sxx = 0;
-    for (int i = 0; i < n_edge; i++) {
-        int r   = edge_rows[i];
-        int row = row_top + r;
-        int peak_x = col_start, peak_m = 0;
-        for (int x = col_start; x <= col_end; x++) {
-            if (row < 1 || row >= img_h - 1) continue;
-            int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
-                   - (int)yuv422_Y(buf, img_w, x, row + 1);
-            if (gx < 0) gx = -gx;
-            if (gx > peak_m) { peak_m = gx; peak_x = x; }
-        }
-        float fx = (float)r, fy = (float)peak_x;
-        sx += fx; sy += fy; sxy += fx * fy; sxx += fx * fx;
-    }
-    float fn  = (float)n_edge;
-    float den = fn * sxx - sx * sx;
-    float residual_mean = 0.0f;
-
-    if (fabsf(den) > 1e-6f) {
-        float a = (fn * sxy - sx * sy) / den;
-        float b = (sy - a * sx) / fn;
-        float sum_res = 0.0f;
-        for (int i = 0; i < n_edge; i++) {
-            int r   = edge_rows[i];
-            int row = row_top + r;
-            int peak_x = col_start, peak_m = 0;
-            for (int x = col_start; x <= col_end; x++) {
-                if (row < 1 || row >= img_h - 1) continue;
-                int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
-                       - (int)yuv422_Y(buf, img_w, x, row + 1);
-                if (gx < 0) gx = -gx;
-                if (gx > peak_m) { peak_m = gx; peak_x = x; }
-            }
-            float res = (float)peak_x - (a * (float)r + b);
-            sum_res += res < 0 ? -res : res;
-        }
-        residual_mean = sum_res / fn;
-    }
-
-    return (residual_mean <= EDGE_CONFIRM_MAX_RESIDUAL) ? 1 : 0;
-}
-
 uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
                           int mw, int ot, int ngb, int mcg,
-                          struct obstacle_region_t oo[],
-                          const uint8_t *img_buf, int img_w, int img_h)
+                          struct obstacle_region_t oo[])
 {
     float alpha = DEFAULT_BASELINE_ALPHA;
     if (!(*bi)) {
@@ -624,57 +515,70 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     int nf = merge_obstacle_cols(om, w, mw, mcg, fl, MAX_OBSTACLE_REGIONS);
     for (int i = 0; i < w; i++)
         if (nom[i]) gb[i] = (1.0f - alpha) * gb[i] + alpha * (float)br[i];
+    //float lg = (float)ngb;
+    //for (int i = 0; i < w; i++) { if (nom[i]) lg = gb[i]; else gb[i] = lg; }
     /* Two-pass propagation: left-to-right, then right-to-left, take min */
     float lg = (float)ngb;
     for (int i = 0; i < w; i++) {
         if (nom[i]) lg = gb[i];
-        else gb[i] = lg;
+        else gb[i] = lg;  /* left neighbor's value */
     }
+
+    /* Right-to-left pass */
     float rg = (float)ngb;
     for (int i = w - 1; i >= 0; i--) {
         if (nom[i]) {
             rg = gb[i];
         } else {
+            /* If we haven't seen ANY valid ground to the right yet, 
+               force it to the default low baseline, ignoring the left anchor. */
             if (rg == (float)ngb) {
                 gb[i] = (float)ngb;
             } else {
-                if (rg < gb[i]) gb[i] = rg;
+                /* Keep the MINIMUM (visually highest) of left-propagated and right-propagated */
+                if (rg < gb[i]) {
+                    gb[i] = rg;
+                }
             }
         }
     }
     int no = 0;
     for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
         if (fl[i].width < 5) continue;
-
-        /* ── Edge confirmation ────────────────────────────────────────────── */
-        if (img_buf != NULL) {
-            int s_sensor = img_w - 1 - (fl[i].start + fl[i].width - 1);
-            int e_sensor = img_w - 1 -  fl[i].start;
-            if (s_sensor > e_sensor) { int tmp = s_sensor; s_sensor = e_sensor; e_sensor = tmp; }
-            if (!edge_confirm_obstacle(img_buf, img_w, img_h,
-                                       s_sensor, e_sensor, 0, img_h - 1))
-                continue;
-        }
-
         oo[no].start = (uint16_t)fl[i].start;
         oo[no].width = (uint16_t)fl[i].width;
 
         int s = fl[i].start;
         int e = s + fl[i].width - 1;
-        int max_br = 0, touches_bottom = 0;
+        
+        // ── SIMPLIFIED HEIGHT LOGIC ──
+        int max_br = 0; 
+        int touches_bottom = 0; // Flag to track if ground vanishes
+        
         for (int r = s; r <= e; r++) {
             if (r < w) {
-                if (br[r] >= h) { touches_bottom = 1; }
-                else { if (br[r] > max_br) max_br = br[r]; }
+                if (br[r] >= h) {
+                    // No ground found in this specific column
+                    touches_bottom = 1; 
+                } else {
+                    // Track valid points just in case it DOESN'T touch the bottom
+                    if (br[r] > max_br) {
+                        max_br = br[r];
+                    }
+                }
             }
         }
-        if (touches_bottom || max_br == 0) max_br = ngb;
+        
+        // The Simple Rule: If it loses the ground ANYWHERE, or has no valid points, set to default.
+        if (touches_bottom || max_br == 0) {
+            max_br = ngb;
+        }
+        
         oo[no].baseline_height = (uint16_t)max_br;
         no++;
     }
     return (uint8_t)no;
 }
-
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  9-15. PLANT DETECTION
@@ -763,8 +667,7 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
         static int bl[MAX_IMAGE_HEIGHT];
         find_ground_boundary(work_flipped, w, h, bl, DEFAULT_MIN_GROUND_PX, DEFAULT_MAX_GAP, DEFAULT_SMOOTH_KERNEL);
         if (bro) memcpy(bro, bl, h * sizeof(int));
-        no = update_and_detect(bl, w, h, gb, bi, mw, DEFAULT_OBSTACLE_THRESH, DEFAULT_NO_GROUND_BASE, DEFAULT_MAX_COL_GAP, oo,
-                               (const uint8_t *)img->buf, w, h);
+        no = update_and_detect(bl, w, h, gb, bi, mw, DEFAULT_OBSTACLE_THRESH, DEFAULT_NO_GROUND_BASE, DEFAULT_MAX_COL_GAP, oo);
     }
 
     if (po != NULL) {

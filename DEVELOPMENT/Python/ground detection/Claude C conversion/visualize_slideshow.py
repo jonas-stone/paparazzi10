@@ -13,7 +13,6 @@ import ctypes
 import subprocess
 import numpy as np
 import cv2
-import re
 from glob import glob
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -22,13 +21,12 @@ from glob import glob
 if len(sys.argv) == 1:
     sys.argv = [
         "visualize_slideshow.py",
-        "/home/jonas/paparazzi/DEVELOPMENT/downloads from drone/20260320/",
+        "/home/jonas/paparazzi/DEVELOPMENT/downloads from drone/20260306-095826/",
         "--python-dir", "/home/jonas/paparazzi/DEVELOPMENT/Python/ground detection/",
-        "--start", "1",
+        "--start", "300",
         "--delay", "50"
     ]
 # "/home/jonas/paparazzi/DEVELOPMENT/downloads from drone/20260313-100130/",
-# "/home/jonas/paparazzi/DEVELOPMENT/downloads from drone/20260306-095826/",
 # ═══════════════════════════════════════════════════════════════════════════════
 #  C-TYPES BINDINGS & AUTO-COMPILATION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -174,12 +172,10 @@ def main():
     p.add_argument("folder")
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--delay", type=int, default=50, help="ms between frames (default 50)")
-    p.add_argument("--python-dir", type=str, help="Path to Python directory") # Added to prevent crash 
+    p.add_argument("--python-dir", type=str, help="Path to Python directory") # Added to prevent crash
     a = p.parse_args()
 
-    import re
-    paths = glob(os.path.join(a.folder, "*.jpg"))
-    paths.sort(key=lambda f: int(re.search(r'\d+', os.path.basename(f)).group()))
+    paths = sorted(glob(os.path.join(a.folder, "*.jpg")))
     if not paths: 
         print("No images found in", a.folder)
         sys.exit(1)

@@ -21,15 +21,12 @@ from glob import glob
 #  OVERRIDE FOR VS CODE RUN BUTTON (HARDCODED ARGS)
 # ═══════════════════════════════════════════════════════════════════════════════
 if len(sys.argv) == 1:
-    # ── Edit these two lines to match your machine ──────────────────────────
-    IMAGE_FOLDER = r"../paparazzi10/DEVELOPMENT/downloads from drone/20260320/"
-    C_SRC_DIR    = os.path.dirname(os.path.abspath(__file__))   # same folder as this script
-    # ────────────────────────────────────────────────────────────────────────
     sys.argv = [
-        "visualize_slideshow_Win32.py",
-        IMAGE_FOLDER,
+        "visualize_slideshow.py",
+        "../paparazzi10/DEVELOPMENT/downloads from drone/20260320/",
+        "--python-dir", "../paparazzi10/DEVELOPMENT/Python/ground detection/",
         "--start", "1",
-        "--delay", "50",
+        "--delay", "50"
     ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -37,6 +34,12 @@ if len(sys.argv) == 1:
 # ═══════════════════════════════════════════════════════════════════════════════
 MAX_IMAGE_WIDTH  = 240
 MAX_IMAGE_HEIGHT = 520
+
+# ── Display upscale factor ────────────────────────────────────────────────────
+# The C pipeline works at 240×520. DISPLAY_SCALE upscales every panel before
+# showing so the window is larger and text/lines are crisp.
+# 2.0 = comfortable on a 1080p screen. Raise to 2.5 on a 4K monitor.
+DISPLAY_SCALE = 1.5
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CROSS-PLATFORM LIBRARY NAME + COMPILE FLAGS
@@ -153,16 +156,20 @@ class FloatEulers(ctypes.Structure):
     _fields_ = [("phi", ctypes.c_float), ("theta", ctypes.c_float), ("psi", ctypes.c_float)]
 
 class ImageT(ctypes.Structure):
+    # On Windows, MinGW long = 32-bit  →  struct timeval = 8 bytes (not 16).
+    # Using c_byte*16 shifted buf to offset 48 in Python vs offset 40 in C,
+    # causing C to read 0x0 as the buffer pointer → access violation crash.
     _fields_ = [
         ("type",     ctypes.c_int),
         ("w",        ctypes.c_uint16),
         ("h",        ctypes.c_uint16),
-        ("ts",       ctypes.c_byte * 16),
+        ("tv_sec",   ctypes.c_int32),   # timeval.tv_sec  (4 bytes on Windows)
+        ("tv_usec",  ctypes.c_int32),   # timeval.tv_usec (4 bytes on Windows)
         ("eulers",   FloatEulers),
         ("pprz_ts",  ctypes.c_uint32),
         ("buf_idx",  ctypes.c_uint8),
         ("buf_size", ctypes.c_uint32),
-        ("buf",      ctypes.c_uint64),  # use uint64 to avoid c_void_p truncation on Windows
+        ("buf",      ctypes.c_uint64),  # c_uint64 avoids c_void_p silent-None truncation
     ]
 
 class ObstacleRegionT(ctypes.Structure):
@@ -198,23 +205,26 @@ def bgr_to_uyvy_numpy(bgr):
 
 
 def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
-                        boundary_rows, ground_baseline, label):
+                        boundary_rows, ground_baseline, label, scale=1.0):
     vis   = img_rot.copy()
     h_rot = vis.shape[0]
+    lw    = max(1, int(scale))        # line/rect thickness
+    fs    = 0.4 * scale               # font scale
+    fs2   = 0.35 * scale
 
     if ground_baseline is not None:
         valid = ground_baseline < h_rot
         rv    = np.where(valid)[0]
         if len(rv) > 1:
             pts = np.array([[int(r), int(ground_baseline[r])] for r in rv], np.int32)
-            cv2.polylines(vis, [pts], False, (255, 0, 0), 1)
+            cv2.polylines(vis, [pts], False, (255, 0, 0), lw)
 
     if boundary_rows is not None:
         valid = boundary_rows < h_rot
         rv    = np.where(valid)[0]
         if len(rv) > 1:
             pts = np.array([[int(r), int(boundary_rows[r])] for r in rv], np.int32)
-            cv2.polylines(vis, [pts], False, (255, 255, 0), 1)
+            cv2.polylines(vis, [pts], False, (255, 255, 0), lw)
 
     for region in obs_regions_raw:
         s, e, w, bh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
@@ -224,24 +234,24 @@ def draw_original_style(img_rot, obs_regions_raw, plant_regions_raw,
             yt      = int(np.min(vb)) if len(vb) > 0 else 0
         else:
             yt = 0
-        cv2.rectangle(vis, (s, 0), (e, h_rot - 1), (0, 0, 255), 2)
-        cv2.putText(vis, f"w={w}",  (s, max(15, yt - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-        cv2.putText(vis, f"h={bh}", (s, max(30, yt - 20)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 150, 255), 1)
+        cv2.rectangle(vis, (s, 0), (e, h_rot - 1), (0, 0, 255), lw)
+        cv2.putText(vis, f"w={w}",  (s, max(int(15*scale), yt - int(5*scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), lw)
+        cv2.putText(vis, f"h={bh}", (s, max(int(30*scale), yt - int(20*scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs2, (0, 150, 255), lw)
         y_line = min(bh, h_rot - 1)
-        cv2.line(vis, (s, y_line), (e, y_line), (255, 255, 255), 1)
+        cv2.line(vis, (s, y_line), (e, y_line), (255, 255, 255), lw)
 
     for region in plant_regions_raw:
         s, e, w, bh = int(region[0]), int(region[1]), int(region[2]), int(region[3])
-        cv2.rectangle(vis, (s, 0), (e, h_rot - 1), (0, 255, 0), 2)
-        cv2.putText(vis, f"p={w}", (s, 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        cv2.rectangle(vis, (s, 0), (e, h_rot - 1), (0, 255, 0), lw)
+        cv2.putText(vis, f"p={w}", (s, int(15*scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), lw)
 
-    cv2.putText(vis, label, (5, h_rot - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-    cv2.putText(vis, label, (5, h_rot - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+    cv2.putText(vis, label, (int(5*scale), h_rot - int(8*scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale, (255, 255, 255), lw + 1)
+    cv2.putText(vis, label, (int(5*scale), h_rot - int(8*scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale, (0, 0, 0), lw)
     return vis
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -264,8 +274,13 @@ def main():
     min_width_c    = 20
     median_ksize_c = 5
 
-    WIN = "C Pipeline Slideshow Win32 (q=quit, SPACE=pause, a=back, d=forward)"
+    WIN = "C Pipeline Slideshow (q=quit, SPACE=pause, a=back, d=forward)"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    # Initial window size — the composite frame is roughly:
+    #   width:  3 panels × (520 * DISPLAY_SCALE) ≈ 3120 px at 2×
+    #   height: header + top + bot ≈ (240+240+80) * DISPLAY_SCALE ≈ 1120 px at 2×
+    # Start at a comfortable size; user can resize freely.
+    cv2.resizeWindow(WIN, int(1400 * DISPLAY_SCALE), int(560 * DISPLAY_SCALE))
 
     idx              = 0
     paused           = False
@@ -367,21 +382,48 @@ def main():
             mask_rot  = cv2.rotate(clean_mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
             plant_rot = cv2.rotate(plant_mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-            det_vis  = draw_original_style(img_rot, obs_raw, plt_raw,
-                                           boundary, py_baseline,
-                                           f"{num_obs} obs, {num_plants} plt")
-            mask_bgr = cv2.cvtColor(mask_rot, cv2.COLOR_GRAY2BGR)
-            po       = img_rot.copy()
+            # ── Upscale all panels for display ────────────────────────────────
+            S = DISPLAY_SCALE
+            def upscale(img):
+                h, w = img.shape[:2]
+                return cv2.resize(img, (int(w * S), int(h * S)),
+                                  interpolation=cv2.INTER_LINEAR)
+
+            img_up    = upscale(img_rot)
+            mask_bgr  = cv2.cvtColor(mask_rot, cv2.COLOR_GRAY2BGR)
+            mask_up   = upscale(mask_bgr)
+            po        = img_rot.copy()
             po[plant_rot > 0] = [0, 200, 0]
-            top      = np.hstack([img_rot, mask_bgr, po])
+            po_up     = upscale(po)
+            top       = np.hstack([img_up, mask_up, po_up])
+
+            # ── Scaled detection overlay ──────────────────────────────────────
+            # Scale the boundary and baseline coordinates to match upscaled image
+            boundary_sc  = (boundary  * S).astype(int) if boundary  is not None else None
+            baseline_sc  = (py_baseline * S).astype(int) if py_baseline is not None else None
+
+            def scale_regions(regions):
+                return [(int(r[0]*S), int(r[1]*S), int(r[2]*S), int(r[3]*S))
+                        for r in regions]
+
+            obs_sc = scale_regions(obs_raw)
+            plt_sc = scale_regions(plt_raw)
+
+            det_vis  = draw_original_style(img_up, obs_sc, plt_sc,
+                                           boundary_sc, baseline_sc,
+                                           f"{num_obs} obs, {num_plants} plt",
+                                           scale=S)
 
             det_h, det_w = det_vis.shape[:2]
             target_w     = top.shape[1]
             extra_w      = target_w - det_w
             info_panel   = (np.zeros((det_h, extra_w, 3), np.uint8) if extra_w > 0 else None)
 
+            txt_scale = 0.55 * S   # text size scales with display
+            line_gap  = int(22 * S)
+
             if info_panel is not None:
-                y = 25
+                y = int(28 * S)
                 lines = (
                     [f"Frame {idx}/{len(paths)}", name, "",
                      f"Status: {st}", f"Green:  {green_frac_out.value:.3f}", "",
@@ -394,19 +436,23 @@ def main():
                     + ["", f"{'PAUSED' if paused else 'PLAYING'}  delay={a.delay}ms"]
                 )
                 for line in lines:
-                    cv2.putText(info_panel, line, (10, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-                    y += 18
+                    cv2.putText(info_panel, line, (int(12*S), y),
+                                cv2.FONT_HERSHEY_SIMPLEX, txt_scale * 0.7,
+                                (200, 200, 200), max(1, int(S)))
+                    y += line_gap
                 bot = np.hstack([det_vis, info_panel])
             else:
                 bot = det_vis[:, :target_w, :]
 
-            hdr = np.zeros((30, target_w, 3), np.uint8)
+            hdr_h = int(40 * S)
+            hdr   = np.zeros((hdr_h, target_w, 3), np.uint8)
             cv2.putText(hdr,
                         f"C PIPELINE | {name} ({tW}x{tH})  {st}  "
                         f"green={green_frac_out.value:.3f}  "
                         f"obs={num_obs} plt={num_plants}",
-                        (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                        (int(8*S), int(28*S)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6 * S,
+                        (0, 255, 255), max(1, int(S)))
 
             last_combined    = np.vstack([hdr, top, bot])
             needs_processing = False
@@ -433,4 +479,4 @@ def main():
     print(f"\nDone. Processed {idx} frames using C backend.")
 
 if __name__ == "__main__":
-    main()
+    main() 

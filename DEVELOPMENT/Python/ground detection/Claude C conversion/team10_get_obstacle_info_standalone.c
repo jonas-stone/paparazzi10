@@ -56,47 +56,6 @@ static uint8_t  plant_clean_small[MAX_PLANT_PIXELS];
 static uint8_t  plant_mask_small[MAX_PLANT_PIXELS];
 static uint8_t  plant_mask_full[MAX_PIXELS];
 
-/* ── Edge-confirmation scratch buffer (one row of Sobel magnitudes) ───────── */
-static uint16_t edge_sobel_col[MAX_IMAGE_HEIGHT];   /* Sobel-Y magnitude per row */
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE-CONFIRMATION TUNING PARAMETERS
- *
- *  EDGE_CONFIRM_MIN_ROWS   – minimum number of rows that must have a strong
- *                            edge inside the obstacle column band.
- *                            Lower  → easier to confirm (more obstacles kept).
- *                            Higher → stricter (fewer false positives).
- *
- *  EDGE_CONFIRM_SOBEL_THRESH – Sobel magnitude (0-1020) above which a row is
- *                              considered to contain a real edge.
- *                              Typical range: 30–120.
- *
- *  EDGE_CONFIRM_MAX_RESIDUAL – maximum mean absolute deviation (in rows) of
- *                              edge positions from a fitted straight line.
- *                              Lower  → must be a very straight edge.
- *                              Higher → allows slightly curved / noisy edges.
- *                              Set to a large value (e.g. 9999) to skip the
- *                              linearity check entirely.
- *
- *  EDGE_CONFIRM_MIN_SPAN    – the fitted edge must span at least this many
- *                             columns (in the original image x-direction, which
- *                             after 90° rotation is the row direction).
- *                             Prevents tiny spurious edges from confirming an
- *                             obstacle.
- * ══════════════════════════════════════════════════════════════════════════════ */
-#ifndef EDGE_CONFIRM_MIN_ROWS
-#  define EDGE_CONFIRM_MIN_ROWS      8
-#endif
-#ifndef EDGE_CONFIRM_SOBEL_THRESH
-#  define EDGE_CONFIRM_SOBEL_THRESH  40
-#endif
-#ifndef EDGE_CONFIRM_MAX_RESIDUAL
-#  define EDGE_CONFIRM_MAX_RESIDUAL  4.0f
-#endif
-#ifndef EDGE_CONFIRM_MIN_SPAN
-#  define EDGE_CONFIRM_MIN_SPAN      6
-#endif
-
 /* ══════════════════════════════════════════════════════════════════════════════
  *  YUV422 (UYVY) PIXEL ACCESS
  * ══════════════════════════════════════════════════════════════════════════════ */
@@ -553,159 +512,9 @@ static int merge_obstacle_cols(const uint8_t *om, int nc, int mw, int mcg,
     return cnt;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  EDGE CONFIRMATION
- *
- *  For a candidate obstacle spanning columns [col_start, col_end] of the
- *  (pre-rotation) image, scan every row and compute the maximum Sobel-Y
- *  magnitude within that column band.  A row "has an edge" when that magnitude
- *  exceeds EDGE_CONFIRM_SOBEL_THRESH.
- *
- *  After collecting all edge-row positions, fit a line y = a*x + b through
- *  them with least-squares and compute the mean absolute residual.  The
- *  obstacle is confirmed when:
- *    1. At least EDGE_CONFIRM_MIN_ROWS rows have a strong edge.
- *    2. Those rows span at least EDGE_CONFIRM_MIN_SPAN rows.
- *    3. The mean absolute residual is ≤ EDGE_CONFIRM_MAX_RESIDUAL.
- *
- *  Parameters
- *  ----------
- *  buf        : raw UYVY (2 bytes/pixel) image buffer, row-major.
- *  img_w      : image width  (columns in sensor coords).
- *  img_h      : image height (rows    in sensor coords).
- *  col_start  : first column of the obstacle band (sensor coords, 0-based).
- *  col_end    : last  column of the obstacle band (inclusive).
- *  row_top    : first row to search (0 = full image).
- *  row_bot    : last  row  to search (img_h-1 = full image).
- *
- *  Returns 1 if confirmed, 0 if rejected.
- * ══════════════════════════════════════════════════════════════════════════════ */
-static int edge_confirm_obstacle(const uint8_t *buf,
-                                 int img_w, int img_h,
-                                 int col_start, int col_end,
-                                 int row_top,   int row_bot)
-{
-    /* ── clamp to image bounds ─────────────────────────────────────────────── */
-    if (col_start < 0)        col_start = 0;
-    if (col_end   >= img_w)   col_end   = img_w - 1;
-    if (row_top   < 1)        row_top   = 1;         /* need y-1 for Sobel */
-    if (row_bot   >= img_h-1) row_bot   = img_h - 2; /* need y+1 for Sobel */
-    if (col_start > col_end || row_top > row_bot) return 0;
-
-    /* ── Step 1: Sobel-Y magnitude, maximised across the column band ─────── */
-    /*
-     * Sobel-Y kernel:
-     *   -1  -2  -1
-     *    0   0   0
-     *   +1  +2  +1
-     *
-     * We work on Y (luminance) from the UYVY buffer.
-     * edge_sobel_col[r] = max Sobel-Y magnitude over x in [col_start, col_end].
-     */
-    int n_rows = row_bot - row_top + 1;
-    for (int r = row_top; r <= row_bot; r++) {
-        int max_mag = 0;
-        int x0 = (col_start > 0)        ? col_start - 1 : col_start;
-        int x1 = (col_end   < img_w-1)  ? col_end   + 1 : col_end;
-        for (int x = x0; x <= x1; x++) {
-            int gx = (int)yuv422_Y(buf, img_w, x, r - 1)
-                   + (int)yuv422_Y(buf, img_w, x, r + 1);
-            /* weight centre column × 2 using the kernel */
-            if (x > 0 && x < img_w - 1) {
-                gx += (int)yuv422_Y(buf, img_w, x - 1, r - 1)
-                    - (int)yuv422_Y(buf, img_w, x - 1, r + 1);
-                gx += (int)yuv422_Y(buf, img_w, x + 1, r - 1)
-                    - (int)yuv422_Y(buf, img_w, x + 1, r + 1);
-            }
-            int mag = gx < 0 ? -gx : gx;
-            if (mag > max_mag) max_mag = mag;
-        }
-        edge_sobel_col[r - row_top] = (uint16_t)(max_mag > 65535 ? 65535 : max_mag);
-    }
-
-    /* ── Step 2: collect rows that have a strong edge ────────────────────── */
-    /* reuse ff_queue (int32_t, MAX_PIXELS) as a temporary row-index list     */
-    int  n_edge = 0;
-    int *edge_rows = (int *)ff_queue;   /* safe: not used during this phase   */
-    for (int r = 0; r < n_rows; r++) {
-        if (edge_sobel_col[r] >= EDGE_CONFIRM_SOBEL_THRESH) {
-            edge_rows[n_edge++] = r;
-            if (n_edge >= MAX_PIXELS) break; /* safety cap */
-        }
-    }
-
-    /* ── Check 1: enough edge rows? ─────────────────────────────────────── */
-    if (n_edge < EDGE_CONFIRM_MIN_ROWS) return 0;
-
-    /* ── Check 2: sufficient span? ──────────────────────────────────────── */
-    int span = edge_rows[n_edge - 1] - edge_rows[0] + 1;
-    if (span < EDGE_CONFIRM_MIN_SPAN) return 0;
-
-    /* ── Check 3: linearity — least-squares line fit ─────────────────────
-     *  We model:  col_position(row) = a * row + b
-     *  Here "col_position" is estimated as the column within [col_start,col_end]
-     *  where the Sobel magnitude peaks, for each strong-edge row.
-     *  For efficiency we reuse edge_rows[] as the x-index (row index) and
-     *  compute peak-x per row as the y-value of the regression.
-     * ─────────────────────────────────────────────────────────────────── */
-    float sx = 0, sy = 0, sxy = 0, sxx = 0;
-    for (int i = 0; i < n_edge; i++) {
-        int r   = edge_rows[i];
-        int row = row_top + r;
-        /* find the column inside the band where Sobel-Y peaks */
-        int peak_x = col_start;
-        int peak_m = 0;
-        for (int x = col_start; x <= col_end; x++) {
-            if (row < 1 || row >= img_h - 1) continue;
-            int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
-                   - (int)yuv422_Y(buf, img_w, x, row + 1);
-            if (gx < 0) gx = -gx;
-            if (gx > peak_m) { peak_m = gx; peak_x = x; }
-        }
-        float fx = (float)r;
-        float fy = (float)peak_x;
-        sx  += fx;
-        sy  += fy;
-        sxy += fx * fy;
-        sxx += fx * fx;
-    }
-    float fn  = (float)n_edge;
-    float den = fn * sxx - sx * sx;
-    float residual_mean = 0.0f;
-
-    if (fabsf(den) > 1e-6f) {
-        float a = (fn * sxy - sx * sy) / den;
-        float b = (sy - a * sx) / fn;
-        float sum_res = 0.0f;
-        for (int i = 0; i < n_edge; i++) {
-            int r   = edge_rows[i];
-            int row = row_top + r;
-            int peak_x = col_start, peak_m = 0;
-            for (int x = col_start; x <= col_end; x++) {
-                if (row < 1 || row >= img_h - 1) continue;
-                int gx = (int)yuv422_Y(buf, img_w, x, row - 1)
-                       - (int)yuv422_Y(buf, img_w, x, row + 1);
-                if (gx < 0) gx = -gx;
-                if (gx > peak_m) { peak_m = gx; peak_x = x; }
-            }
-            float predicted = a * (float)r + b;
-            float res = (float)peak_x - predicted;
-            sum_res += res < 0 ? -res : res;
-        }
-        residual_mean = sum_res / fn;
-    }
-    /* If den is too small the line is near-vertical → perfectly straight,
-       so residual_mean stays 0 and the check passes. */
-
-    if (residual_mean > EDGE_CONFIRM_MAX_RESIDUAL) return 0;
-
-    return 1;  /* all checks passed — confirmed obstacle */
-}
-
 uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
                           int mw, int ot, int ngb, int mcg,
-                          struct obstacle_region_t oo[],
-                          const uint8_t *img_buf, int img_w, int img_h)
+                          struct obstacle_region_t oo[])
 {
     float alpha = DEFAULT_BASELINE_ALPHA;
     if (!(*bi)) {
@@ -753,33 +562,6 @@ uint8_t update_and_detect(const int br[], int h, int w, float gb[], int *bi,
     int no = 0;
     for (int i = 0; i < nf && no < MAX_OBSTACLE_REGIONS; i++) {
         if (fl[i].width < 5) continue;
-
-        /* ── Edge confirmation ──────────────────────────────────────────────
-         *  The obstacle spans columns [fl[i].start, fl[i].start+fl[i].width-1]
-         *  in the boundary / rotated coordinate system (where image rows are
-         *  the "columns" after the 90° CCW rotation used by the visualiser).
-         *
-         *  In sensor coordinates the image is img_w × img_h (not rotated).
-         *  The boundary scan works on the FLIPPED (left↔right) mask, so
-         *  column index `s` in boundary space maps to sensor column
-         *  (img_w - 1 - s).  We pass the full row range (0 … img_h-1) so the
-         *  search covers the entire height.
-         *
-         *  If img_buf is NULL (e.g. baseline initialisation frame) we skip
-         *  the check and accept the region unconditionally.
-         * ────────────────────────────────────────────────────────────────── */
-        if (img_buf != NULL) {
-            int s_sensor = img_w - 1 - (fl[i].start + fl[i].width - 1);
-            int e_sensor = img_w - 1 -  fl[i].start;
-            if (s_sensor > e_sensor) { int tmp = s_sensor; s_sensor = e_sensor; e_sensor = tmp; }
-
-            if (!edge_confirm_obstacle(img_buf, img_w, img_h,
-                                       s_sensor, e_sensor,
-                                       0, img_h - 1)) {
-                /* No straight edge found — not a real obstacle, skip. */
-                continue;
-            }
-        }
         oo[no].start = (uint16_t)fl[i].start;
         oo[no].width = (uint16_t)fl[i].width;
 
@@ -902,8 +684,7 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
         static int bl[MAX_IMAGE_HEIGHT];
         find_ground_boundary(work_flipped, w, h, bl, DEFAULT_MIN_GROUND_PX, DEFAULT_MAX_GAP, DEFAULT_SMOOTH_KERNEL);
         if (bro) memcpy(bro, bl, h * sizeof(int));
-        no = update_and_detect(bl, w, h, gb, bi, mw, DEFAULT_OBSTACLE_THRESH, DEFAULT_NO_GROUND_BASE, DEFAULT_MAX_COL_GAP, oo,
-                               (const uint8_t *)img->buf, w, h);
+        no = update_and_detect(bl, w, h, gb, bi, mw, DEFAULT_OBSTACLE_THRESH, DEFAULT_NO_GROUND_BASE, DEFAULT_MAX_COL_GAP, oo);
     }
 
     if (po != NULL) {
