@@ -64,8 +64,13 @@ float heading_increment = 5.f;          // heading angle increment [deg]
 float maxDistance = 2.25;               // max waypoint displacement [m]
 
 // define script-level variables
-struct    obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS]; 
-uint8_t   obstacle_count        = 0;
+static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
+static struct obstacle_region_t plants[MAX_PLANT_REGIONS];
+static int16_t                  boundary_rows[MAX_IMAGE_HEIGHT];
+static float boundary_rows_f[MAX_IMAGE_HEIGHT];
+static uint8_t                  obstacle_count = 0;
+static uint8_t                  plant_count    = 0;
+static uint16_t                 boundary_len   = 0;
 uint16_t  total_obstacle_width  = 0;
 
 // define threshold settings -> lower, drone is more scared
@@ -88,19 +93,24 @@ const int16_t max_trajectory_confidence = 5; // number of consecutive negative o
 static abi_event ground_detection_ev;
 
 // ABI video callback function, gets the data from the computer vision code
-static void ground_detection_callback(uint8_t __attribute__((unused)) sender_id,
-                                      struct obstacle_region_t       *incoming_obstacles,
-                                      uint8_t                         incoming_obstacle_count)
+static void ground_detection_callback(
+    uint8_t __attribute__((unused)) sender_id,
+    struct obstacle_region_t *in_obs,   uint8_t  in_oc,
+    struct obstacle_region_t *in_plants, uint8_t  in_pc,
+    int16_t                  *in_br,    uint16_t in_bl)
 {
-  // store incoming variables inside this scope
-  obstacle_count = incoming_obstacle_count;
-  memcpy(obstacles, incoming_obstacles, obstacle_count * sizeof(struct obstacle_region_t));
+    obstacle_count = in_oc;
+    memcpy(obstacles, in_obs, in_oc * sizeof(struct obstacle_region_t));
 
-  // compute total obstacle width from incoming image
-  total_obstacle_width = 0;
-  for (uint8_t i = 0; i < obstacle_count; i++) {
-    total_obstacle_width += obstacles[i].width;
-  }
+    plant_count = in_pc;
+    memcpy(plants, in_plants, in_pc * sizeof(struct obstacle_region_t));
+
+    boundary_len = in_bl;
+    if (boundary_len > MAX_IMAGE_HEIGHT) boundary_len = MAX_IMAGE_HEIGHT;
+    memcpy(boundary_rows, in_br, boundary_len * sizeof(int16_t));
+
+    for (uint16_t i = 0; i < boundary_len; i++)
+    boundary_rows_f[i] = (float)in_br[i];
 }
 
 /*
@@ -263,4 +273,3 @@ uint8_t chooseRandomIncrementAvoidance(void)
   }
   return false;
 }
-
