@@ -294,7 +294,7 @@ uint8_t chooseWiseIncrementAvoidance(int safe_direction)
   if (safe_direction > MAX_IMAGE_WIDTH / 2) {
     heading_increment = 5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
-  } else {
+  } else if(safe_direction < MAX_IMAGE_WIDTH / 2){
     heading_increment = -5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
   }
