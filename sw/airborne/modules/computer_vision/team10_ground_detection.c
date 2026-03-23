@@ -1,6 +1,8 @@
 /*
- * team10_ground_detection.c — master module (obstacles + plants)
- *
+ * team10_ground_detection.c — master module (obstacles + plants + gate)
+ * get_obstacle_info handles obstacle/plant detection.
+ * detect_gate() runs on the same frame and adds gate presence + centre.
+ * 
  * Downscales camera frame to 0.8× before processing for performance,
  * then scales obstacle/plant coordinates back to native resolution
  * so the autopilot always works in native camera space.
@@ -13,7 +15,7 @@
  *   After 90° CCW rotation:
  *     row 0        = RIGHT side of drone's view
  *     row H-1      = LEFT side of drone's view
- *     row H/2      = CENTER
+ *     row H/2      = CENTE
  */
 #include "modules/computer_vision/team10_ground_detection.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
@@ -102,9 +104,14 @@ static void downsample_yuv422(struct image_t *src, struct image_t *dst,
 /* ══════════════════════════════════════════════════════════════════════════════
  *  CAMERA CALLBACK
  * ══════════════════════════════════════════════════════════════════════════════ */
+/* ── Gate state (protected by mutex, written by camera thread) ─────────── */
+uint8_t gate_detected  = 0;   /* 0 = no gate, 1 = gate present             */
+int gate_center_x  = 0;   /* px from left edge of raw image to centre  */
+
 static struct image_t *detect_obstacles_from_ground(struct image_t *img,
         uint8_t camera_id __attribute__((unused)))
 {
+
     /* ── Compute scaled dimensions ────────────────────────────────────────── */
     int dst_w = (img->w * SCALE_NUM) / SCALE_DEN;
     int dst_h = (img->h * SCALE_NUM) / SCALE_DEN;
@@ -148,19 +155,22 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
         local_obstacles[i].width           = (uint16_t)((local_obstacles[i].width * SCALE_DEN) / SCALE_NUM);
         local_obstacles[i].baseline_height = (uint16_t)((local_obstacles[i].baseline_height * SCALE_DEN) / SCALE_NUM);
     }
+
     for (int i = 0; i < plant_count; i++) {
         local_plants[i].start           = (uint16_t)((local_plants[i].start * SCALE_DEN) / SCALE_NUM);
         local_plants[i].width           = (uint16_t)((local_plants[i].width * SCALE_DEN) / SCALE_NUM);
         local_plants[i].baseline_height = 0;  /* not meaningful for plants */
     }
+            
+    /* ── Gate detection ────────────────────────────────────────────────── */
+    int gate_result[2];   /* [0] = detected flag, [1] = centre x pixel     */
+    detect_gate(img, gate_result);
 
     /* ── Copy to globals ──────────────────────────────────────────────────── */
     uint16_t br_len = (uint16_t)dst_h;
     pthread_mutex_lock(&mutex);
-    memcpy(global_obstacles, local_obstacles,
-           MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
-    memcpy(global_plants, local_plants,
-           MAX_PLANT_REGIONS * sizeof(struct obstacle_region_t));
+    memcpy(global_obstacles, local_obstacles, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
+    memcpy(global_plants, local_plants, MAX_PLANT_REGIONS * sizeof(struct obstacle_region_t));
     global_obstacle_count = obstacle_count;
     global_plant_count    = plant_count;
     // copy boundary rows
@@ -170,12 +180,17 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     }
     obstacles_updated = true;
 
+    gate_detected         = (uint8_t)gate_result[0];
+    gate_center_x         = gate_result[1];
+    obstacles_updated     = true;
     for (int i = 0; i < obstacle_count; i++)
-        printf("Obstacle %d: start=%d width=%d\n",
-               i, global_obstacles[i].start, global_obstacles[i].width);
+        printf("Obstacle %d: left=%d width=%d\n", i, global_obstacles[i].start, global_obstacles[i].width);
     for (int i = 0; i < plant_count; i++)
-        printf("Plant    %d: start=%d width=%d\n",
-               i, global_plants[i].start, global_plants[i].width);
+        printf("Plant    %d: start=%d width=%d\n", i, global_plants[i].start, global_plants[i].width);
+    if (gate_detected)
+        printf("Gate: detected  centre_x=%d px\n", gate_center_x);
+    else
+        printf("Gate: not detected\n");
     pthread_mutex_unlock(&mutex);
 
     // RTP VISUALIZATION
@@ -191,25 +206,26 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     return img;
 }
 
+
 /* ══════════════════════════════════════════════════════════════════════════════
  *  INIT + PERIODIC
  * ══════════════════════════════════════════════════════════════════════════════ */
 void ground_detection_init(void)
 {
     memset(global_obstacles, 0, sizeof(global_obstacles));
-    memset(global_plants,    0, sizeof(global_plants));
+    memset(global_plants, 0, sizeof(global_plants));
     pthread_mutex_init(&mutex, NULL);
-    cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1,
-                     detect_obstacles_from_ground,
-                     COLOR_OBJECT_DETECTOR_FPS1, 0);
+    cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1, detect_obstacles_from_ground, COLOR_OBJECT_DETECTOR_FPS1, 0);
 }
 
 void ground_detection_periodic(void)
 {
     struct obstacle_region_t lo[MAX_OBSTACLE_REGIONS], lp[MAX_PLANT_REGIONS];
+<<<<<<< HEAD
     int16_t  br[MAX_IMAGE_HEIGHT];
-    uint8_t  oc, pc;
+    uint8_t oc, pc, gd;
     uint16_t bl;
+    int gx;
 
     pthread_mutex_lock(&mutex);
     if (!obstacles_updated) {
@@ -219,6 +235,9 @@ void ground_detection_periodic(void)
     oc = global_obstacle_count;
     pc = global_plant_count;
     bl = global_boundary_len;
+    gd = gate_detected;
+    gx = gate_center_x;
+
     memcpy(lo, global_obstacles, sizeof(lo));
     memcpy(lp, global_plants,    sizeof(lp));
     memcpy(br, global_boundary,  bl * sizeof(int16_t));
@@ -232,4 +251,7 @@ void ground_detection_periodic(void)
         lp, pc,
         br, bl
     );
+    AbiSendMsgTEAM10_GATE_DETECTION(TEAM10_GATE_DETECTION_ID, gd, gx);
+    (void)pc; (void)lp;
 }
+
