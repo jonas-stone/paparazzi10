@@ -1,0 +1,89 @@
+<!DOCTYPE module SYSTEM "module.dtd">
+
+<module name="team10_custom_autopilot_control" dir="orange_avoider">
+  <doc>
+    <description>
+Gate-aware obstacle avoidance for the Bebop2 (Team 10).
+Uses ground baseline detection to find clear corridors and avoid obstacles
+and plants. When a gate is detected in front of an obstacle, the drone aligns
+with it and flies through instead of turning away.
+Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
+    </description>
+    <define name="ORANGE_AVOIDER_VISUAL_DETECTION_ID" value="ABI_BROADCAST"
+            description="Which VISUAL_DETECTION message to receive."/>
+  </doc>
+
+  <settings>
+    <dl_settings>
+
+      <!-- ── Obstacle avoidance ──────────────────────────────────────────── -->
+      <dl_settings name="Avoidance">
+        <dl_setting
+          var="obstacle_width_threshold" min="0.05" step="0.01" max="0.50"
+          shortname="obs_w_thresh"
+          module="modules/orange_avoider/team10_custom_autopilot"
+          description="Fraction of image width covered by ground-touching obstacles that starts reducing confidence. Lower = react sooner."/>
+        <dl_setting
+          var="obs_bias_frac" min="0.10" step="0.05" max="1.00"
+          shortname="obs_bias"
+          module="modules/orange_avoider/team10_custom_autopilot"
+          description="Safety margin added around each obstacle, as a fraction of its width. Increase to steer further from walls."/>
+        <dl_setting
+          var="plant_bias_frac" min="0.10" step="0.05" max="1.50"
+          shortname="plant_bias"
+          module="modules/orange_avoider/team10_custom_autopilot"
+          description="Safety margin around each plant region. Keep larger than obs_bias_frac — plant pots are narrow."/>
+      </dl_settings>
+
+      <!-- ── Corridor picker ─────────────────────────────────────────────── -->
+      <dl_settings name="Corridor">
+        <dl_setting
+          var="clear_frac" min="0.50" step="0.01" max="1.00"
+          shortname="clear_frac"
+          module="modules/computer_vision/team10_logic"
+          description="Baseline must be below this fraction of image height for a column to count as clear. Higher = stricter."/>
+        <dl_setting
+          var="min_corridor_width_px" min="10" step="5" max="200"
+          shortname="min_corr_w"
+          module="modules/computer_vision/team10_logic"
+          description="Minimum clear-column run width in pixels to qualify as a usable corridor. Narrower runs are ignored."/>
+      </dl_settings>
+
+      <!-- ── Waypoint / speed ────────────────────────────────────────────── -->
+      <dl_settings name="Waypoint">
+        <dl_setting
+          var="wp_update_period_ticks" min="1" step="1" max="20"
+          shortname="wp_period"
+          module="modules/orange_avoider/team10_custom_autopilot"
+          description="Ticks between WP_GOAL advances in SAFE state. At 10 Hz: 1=0.1s, 5=0.5s, 10=1s. Increase if drone overshoots."/>
+        <dl_setting
+          var="maxDistance" min="0.0" step="0.1" max="5.0"
+          shortname="max_dist"
+          module="modules/orange_avoider/team10_custom_autopilot"
+          description="Maximum waypoint displacement in metres."/>
+        <dl_setting
+          var="speed_multiplier" min="0.0" step="0.01" max="1.0"
+          shortname="speed_mul"
+          module="modules/orange_avoider/team10_custom_autopilot"
+          description="Overall speed multiplier."/>
+      </dl_settings>
+
+    </dl_settings>
+  </settings>
+
+  <dep>
+    <depends>team10_cv_detect_ground</depends>
+  </dep>
+
+  <header>
+    <file name="team10_custom_autopilot_withGateDet.h"/>
+  </header>
+
+  <init fun="ground_obstacle_avoidance_init()"/>
+  <periodic fun="ground_obstacle_avoidance_periodic()" freq="10"/>
+
+  <makefile target="ap|nps">
+    <file name="team10_custom_autopilot_withGateDet.c"/>
+  </makefile>
+
+</module>

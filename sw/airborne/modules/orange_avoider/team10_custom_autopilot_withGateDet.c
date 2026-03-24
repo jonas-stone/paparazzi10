@@ -70,16 +70,11 @@ float speed_multiplier = 0.5f;
  *  TUNING CONSTANTS
  * ══════════════════════════════════════════════════════════════════════════════ */
 
-/* Obstacle / plant bias fractions passed to motion_logic_normalised.
- * IMPROVEMENT #5: plant bias is larger than obstacle bias because plant pots
- * are narrow objects that need proportionally more clearance than wide walls. */
-#define DEFAULT_OBS_BIAS_FRAC    0.50f
-#define DEFAULT_PLANT_BIAS_FRAC  0.75f   /* was same as obs in previous version */
-
-/* Gate approach */
-#define GATE_HEADING_MAX_DEG     15.0f   /* proportional yaw clamp             */
-#define GATE_ALIGN_COLUMN_TOL    20      /* px: |gate_col - centre| for aligned */
+/* Gate approach — kept as compile-time constants; not exposed as sliders */
+#define GATE_HEADING_MAX_DEG     15.0f
+#define GATE_ALIGN_COLUMN_TOL    20
 #define GATE_APPROACH_DISTANCE_M 1.5f
+#define GATE_CONFIRM_STREAK      2
 
 /* IMPROVEMENT #7: number of consecutive gate-detected frames required before
  * committing to GATE_APPROACH.  Prevents a single noisy frame from overriding
@@ -116,13 +111,41 @@ static uint8_t                  plant_count          = 0;
 static uint16_t                 boundary_len         = 0;
 uint16_t                        total_obstacle_width = 0;   /* #2: now written */
 
-float obstacle_width_threshold = 0.2f;
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  RUNTIME-TUNABLE PARAMETERS
+ *  All variables in this block are non-static globals so they can be adjusted
+ *  via Paparazzi <dl_setting> sliders in the GCS without recompiling.
+ *  Matching declarations must appear in team10_custom_autopilot.h and the
+ *  module's settings XML (see team10_custom_autopilot.xml).
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Fraction of image width covered by ground-touching obstacles above which the
+ * confidence counter decrements.  Lower = react to smaller obstacles sooner.
+ * Range [0.05, 0.50].  Default 0.15.                                          */
+float obstacle_width_threshold = 0.15f;
+
+/* Safety margin added around each obstacle column span, as a fraction of the
+ * obstacle's own width.  Range [0.1, 1.0].  Default 0.50.                     */
+float obs_bias_frac   = 0.50f;
+
+/* Safety margin around each plant column span.  Larger than obs_bias_frac
+ * because plant pots are narrow and need proportionally more clearance.
+ * Range [0.1, 1.5].  Default 0.75.                                            */
+float plant_bias_frac = 0.75f;
+
+/* How many periodic ticks between WP_GOAL advances in the SAFE state.
+ * At 10 Hz: 1 = every 0.1 s, 5 = every 0.5 s, 10 = every 1 s.
+ * Range [1, 20].  Default 5.                                                  */
+int   wp_update_period_ticks = 5;
 
 /* Gate state */
 static uint8_t  cur_gate_detected  = 0;
 static int      cur_gate_center_x  = 0;
 /* IMPROVEMENT #7: consecutive-detection streak counter                        */
 static uint8_t  gate_seen_streak   = 0;
+
+/* Waypoint update rate limiter counter — counts down from wp_update_period_ticks */
+static uint8_t  wp_update_ticks    = 0;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  ABI — GROUND DETECTION
@@ -202,8 +225,8 @@ void ground_obstacle_avoidance_init(void)
             obstacles, obstacle_count,
             plants,    plant_count,
             boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
-            DEFAULT_OBS_BIAS_FRAC,
-            DEFAULT_PLANT_BIAS_FRAC);
+            obs_bias_frac,
+            plant_bias_frac);
     chooseWiseIncrementAvoidance(safe_col);
 
     AbiBindMsgTEAM10_GROUND_DETECTION(
@@ -245,9 +268,20 @@ void ground_obstacle_avoidance_periodic(void)
         if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY), WaypointY(WP_TRAJECTORY))) {
             navigation_state = OUT_OF_BOUNDS;
         } else if (obstacle_free_confidence == 0) {
+            wp_update_ticks  = 0;   /* reset limiter so next SAFE entry is immediate */
             navigation_state = OBSTACLE_FOUND;
         } else {
-            moveWaypointForward(WP_GOAL, moveDistance);
+            /* Rate-limit WP_GOAL updates: only move it every wp_update_period_ticks
+             * ticks.  WP_TRAJECTORY still moves every tick as a lookahead probe so
+             * the bounds check above stays responsive, but WP_GOAL — the target the
+             * flight controller actually chases — advances at a slower, steadier
+             * pace that the drone can physically track before it changes again.    */
+            if (wp_update_ticks == 0) {
+                moveWaypointForward(WP_GOAL, moveDistance);
+                wp_update_ticks = (uint8_t)wp_update_period_ticks;
+            } else {
+                wp_update_ticks--;
+            }
         }
         break;
 
@@ -270,8 +304,8 @@ void ground_obstacle_avoidance_periodic(void)
                     obstacles, obstacle_count,
                     plants,    plant_count,
                     boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
-                    DEFAULT_OBS_BIAS_FRAC,
-                    DEFAULT_PLANT_BIAS_FRAC);
+                    obs_bias_frac,
+                    plant_bias_frac);
             chooseWiseIncrementAvoidance(safe_col);
             navigation_state = SEARCH_FOR_SAFE_HEADING;
         }
@@ -321,8 +355,8 @@ void ground_obstacle_avoidance_periodic(void)
                     obstacles, obstacle_count,
                     plants,    plant_count,
                     boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
-                    DEFAULT_OBS_BIAS_FRAC,
-                    DEFAULT_PLANT_BIAS_FRAC);
+                    obs_bias_frac,
+                    plant_bias_frac);
             chooseWiseIncrementAvoidance(safe_col);
         }
         increase_nav_heading(heading_increment);
