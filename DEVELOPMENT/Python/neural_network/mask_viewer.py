@@ -62,19 +62,12 @@ HOLE_CLOSING_RADIUS = 0.04
 HOLE_MIN_AREA       = 200
 
 # Tree bounding-box padding tuning
-# TREE_PAD_W_INIT      = 0
-# TREE_PAD_H_INIT      = 0
-TREE_PAD_STEP        = 5
-# TREE_CLUSTER_MARGIN_INIT = 10   # initial dilation radius for blob clustering (px)
-TREE_CLUSTER_STEP        = 5    # step size for ,/. keys
-# TREE_MEAS_MODES      = ['pixels', 'ratio', 'aspect']
-
-
-TREE_PAD_W_INIT              = 0
-TREE_PAD_H_INIT              = 30
-TREE_CLUSTER_MARGIN_INIT     = 35
-TREE_MEAS_MODES              = ['pixels', 'ratio', 'aspect']
-# set initial mode to aspect (index 2)
+TREE_PAD_W_INIT          = 0
+TREE_PAD_H_INIT          = 30
+TREE_PAD_STEP            = 5
+TREE_CLUSTER_MARGIN_INIT = 35
+TREE_CLUSTER_STEP        = 5
+TREE_MEAS_MODES          = ['pixels', 'ratio', 'aspect']
 
 # Alternating strip shade colours (BGR) for the line-plot background
 STRIP_SHADES = [
@@ -430,29 +423,22 @@ def carve_poles_from_ground(ground_mask, pole_mask):
 
 def get_tree_bboxes(tree_mask, pad_w=0, pad_h=0, cluster_margin=10):
     """
-    Clusters nearby tree blobs by dilating the mask by `cluster_margin` pixels
-    before finding connected components — blobs within that distance merge into
-    one.  The tight bounding box is then computed over the ORIGINAL (undilated)
-    pixels belonging to each cluster, so the margin only affects grouping, not
-    the box size.  Padding is then added on top of the tight box.
-
-    Parameters
-    ----------
-    tree_mask      : uint8 grayscale mask
-    pad_w          : extra pixels added to each horizontal side of tight box
-    pad_h          : extra pixels added to each vertical side of tight box
-    cluster_margin : dilation radius (px) used for merging nearby blobs
+    Clusters nearby tree blobs with two passes:
+      1. Dilation by cluster_margin — merges blobs within that pixel distance.
+      2. Vertical-overlap merge — any two clusters whose horizontal extents
+         overlap (or are within cluster_margin px) are merged, because blobs
+         stacked above each other must belong to the same tree.
+    Tight boxes are computed over original pixels; padding is added after.
     """
     if tree_mask is None:
         return []
 
     H, W   = tree_mask.shape
     binary = (tree_mask > 0).astype(np.uint8)
-
     if binary.sum() == 0:
         return []
 
-    # ── Cluster by dilation ───────────────────────────────────────────────────
+    # ── Pass 1: dilation-based spatial clustering ─────────────────────────────
     if cluster_margin > 0:
         k       = cluster_margin * 2 + 1
         kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
@@ -462,34 +448,68 @@ def get_tree_bboxes(tree_mask, pad_w=0, pad_h=0, cluster_margin=10):
 
     _, cluster_labels = cv2.connectedComponents(dilated, connectivity=8)
 
-    # ── For each cluster, get tight box over ORIGINAL pixels ─────────────────
-    boxes = []
+    # Collect per-cluster pixel sets and bounding x-ranges
+    cluster_cols = {}   # cid -> (x_min, x_max)
     for cid in np.unique(cluster_labels):
         if cid == 0:
             continue
-        # Original pixels that belong to this cluster
         orig_pixels = (binary == 1) & (cluster_labels == cid)
         if not orig_pixels.any():
             continue
-
-        rows = np.where(orig_pixels.any(axis=1))[0]
         cols = np.where(orig_pixels.any(axis=0))[0]
+        cluster_cols[cid] = (int(cols[0]), int(cols[-1]))
+
+    # ── Pass 2: merge clusters whose x-ranges overlap or are within margin ────
+    # Union-Find
+    parent = {cid: cid for cid in cluster_cols}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    cids = list(cluster_cols.keys())
+    for i in range(len(cids)):
+        for j in range(i + 1, len(cids)):
+            a, b = cids[i], cids[j]
+            ax0, ax1 = cluster_cols[a]
+            bx0, bx1 = cluster_cols[b]
+            # Overlap or within margin horizontally → same tree
+            if ax0 <= bx1 + cluster_margin and bx0 <= ax1 + cluster_margin:
+                union(a, b)
+
+    # Group clusters by their root
+    groups = {}
+    for cid in cids:
+        root = find(cid)
+        groups.setdefault(root, []).append(cid)
+
+    # ── Build final boxes ─────────────────────────────────────────────────────
+    boxes = []
+    for root, members in groups.items():
+        combined = np.zeros_like(binary, dtype=bool)
+        for cid in members:
+            combined |= ((binary == 1) & (cluster_labels == cid))
+
+        rows = np.where(combined.any(axis=1))[0]
+        cols = np.where(combined.any(axis=0))[0]
         ty, by_ = int(rows[0]), int(rows[-1])
         tx, bx_ = int(cols[0]), int(cols[-1])
         tw = bx_ - tx + 1
         th = by_ - ty + 1
 
-        # Padded box clamped to image
         px  = max(0,     tx - pad_w)
         py  = max(0,     ty - pad_h)
         px2 = min(W - 1, tx + tw + pad_w)
         py2 = min(H - 1, ty + th + pad_h)
-        pw  = px2 - px
-        ph  = py2 - py
 
         boxes.append({
             'tight':  (tx, ty, tw, th),
-            'padded': (px, py, pw, ph),
+            'padded': (px, py, px2 - px, py2 - py),
         })
     return boxes
 
@@ -542,6 +562,25 @@ def draw_tree_bboxes(image, tree_mask, pad_w, pad_h, meas_mode, cluster_margin):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
     return out
 
+
+
+def carve_trees_from_ground(ground_mask, tree_mask, pad_w, pad_h, cluster_margin):
+    """
+    Carves the padded tree bounding boxes out of the ground mask.
+    Uses the same clustering and padding logic as the visual overlay so
+    the carved region exactly matches what is shown on screen.
+    """
+    if ground_mask is None or tree_mask is None:
+        return ground_mask
+
+    boxes  = get_tree_bboxes(tree_mask, pad_w, pad_h, cluster_margin)
+    result = ground_mask.copy()
+
+    for b in boxes:
+        px, py, pw, ph = b['padded']
+        result[py:py + ph, px:px + pw] = 0
+
+    return result
 
 
 def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
@@ -866,7 +905,7 @@ def main():
     tree_pad_w           = TREE_PAD_W_INIT
     tree_pad_h           = TREE_PAD_H_INIT
     tree_cluster_margin  = TREE_CLUSTER_MARGIN_INIT
-    tree_meas_idx        = 0
+    tree_meas_idx        = 2    # start in 'aspect' mode
     needs_redraw         = True
 
     while True:
@@ -889,6 +928,15 @@ def main():
                                                    HOLE_MIN_AREA)
             # Step 3 (always): carve pole footprints out of ground last
             display_ground = carve_poles_from_ground(display_ground, pole_mask)
+            # Step 4 (always): carve padded tree bounding boxes out of ground
+            # Must operate in rotated space to match the visual bbox coordinates
+            if tree_mask is not None and display_ground is not None:
+                tree_mask_rot    = cv2.rotate(tree_mask,    cv2.ROTATE_90_COUNTERCLOCKWISE)
+                ground_mask_rot  = cv2.rotate(display_ground, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                ground_mask_rot  = carve_trees_from_ground(ground_mask_rot, tree_mask_rot,
+                                                           tree_pad_w, tree_pad_h,
+                                                           tree_cluster_margin)
+                display_ground   = cv2.rotate(ground_mask_rot, cv2.ROTATE_90_CLOCKWISE)
 
             mid      = gate_data[3]
             gate_str = f'GATE at {mid}' if mid is not None else 'no gate'
