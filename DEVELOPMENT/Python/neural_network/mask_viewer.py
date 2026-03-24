@@ -1,216 +1,17 @@
-# """
-# mask_viewer.py
-# ==============
-# Loads an image and overlays its ground, pole and tree masks on top,
-# each in a different colour with adjustable opacity.
-#
-# Controls
-# --------
-#   a / d          — previous / next image
-#   1              — toggle ground mask  (green)
-#   2              — toggle pole mask    (orange)
-#   3              — toggle tree mask    (purple)
-#   +  / -         — increase / decrease opacity of all masks
-#   q              — quit
-#
-# Layout
-# ------
-#   Top panel    : original image + mask overlays
-#   Bottom panel : the three raw masks side by side (B&W)
-# """
-#
-# import cv2
-# import numpy as np
-# import os
-# import glob
-# import sys
-#
-# # ══════════════════════════════════════════════════════════════════════════════
-# # CONFIG
-# # ══════════════════════════════════════════════════════════════════════════════
-#
-# IMAGE_FOLDER      = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320'
-# MASKS_OUTPUT_ROOT = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\testorni_generated_masks_new_test'
-#
-# GROUND_MASK_DIR = os.path.join(MASKS_OUTPUT_ROOT, 'ground_masks')
-# POLE_MASK_DIR   = os.path.join(MASKS_OUTPUT_ROOT, 'pole_masks')
-# TREE_MASK_DIR   = os.path.join(MASKS_OUTPUT_ROOT, 'tree_masks')
-#
-# # Overlay colours (BGR)
-# GROUND_COLOUR = (0,   255,   0)    # green
-# POLE_COLOUR   = (0,   165, 255)    # orange
-# TREE_COLOUR   = (255,   0, 200)    # purple
-#
-# INITIAL_OPACITY   = 0.5    # 0.0 = invisible, 1.0 = fully opaque
-# OPACITY_STEP      = 0.05
-#
-# # ══════════════════════════════════════════════════════════════════════════════
-# # HELPERS
-# # ══════════════════════════════════════════════════════════════════════════════
-#
-# def load_mask(mask_dir, stem, suffix):
-#     path = os.path.join(mask_dir, f'{stem}_mask_{suffix}.png')
-#     if not os.path.exists(path):
-#         return None
-#     return cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-#
-#
-# def apply_colour_overlay(base, mask, colour, opacity):
-#     """Paints 'colour' onto 'base' wherever mask > 0, blended by opacity."""
-#     if mask is None:
-#         return base
-#     coloured        = np.zeros_like(base)
-#     coloured[mask > 0] = colour
-#     return cv2.addWeighted(base, 1.0, coloured, opacity, 0)
-#
-#
-# def make_bw_panel(mask, label, W, H):
-#     """Renders a single B&W mask as a labelled BGR panel of size (H, W)."""
-#     if mask is None:
-#         panel = np.zeros((H, W, 3), dtype=np.uint8)
-#         cv2.putText(panel, f'{label}: NOT FOUND', (10, H // 2),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
-#         return panel
-#
-#     resized = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
-#     panel   = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
-#     cv2.putText(panel, label, (8, 22),
-#                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 1)
-#     return panel
-#
-#
-# def build_frame(img, ground_mask, pole_mask, tree_mask,
-#                 show_ground, show_pole, show_tree, opacity):
-#     H, W = img.shape[:2]
-#
-#     # ── Top panel: overlays on original ──────────────────────────────────────
-#     top = img.copy()
-#     if show_ground: top = apply_colour_overlay(top, ground_mask, GROUND_COLOUR, opacity)
-#     if show_pole:   top = apply_colour_overlay(top, pole_mask,   POLE_COLOUR,   opacity)
-#     if show_tree:   top = apply_colour_overlay(top, tree_mask,   TREE_COLOUR,   opacity)
-#
-#     # Legend
-#     legend_items = []
-#     if show_ground: legend_items.append(('[1] Ground', GROUND_COLOUR))
-#     if show_pole:   legend_items.append(('[2] Pole',   POLE_COLOUR))
-#     if show_tree:   legend_items.append(('[3] Tree',   TREE_COLOUR))
-#
-#     for i, (label, colour) in enumerate(legend_items):
-#         cv2.putText(top, label, (8, 22 + i * 22),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 1)
-#
-#     cv2.putText(top, f'opacity: {opacity:.2f}  (+/-)',
-#                 (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-#
-#     # ── Bottom panel: raw B&W masks side by side ──────────────────────────────
-#     panel_w = W // 3
-#     panel_h = H // 3   # shorter strip below
-#
-#     ground_panel = make_bw_panel(ground_mask, 'Ground', panel_w, panel_h)
-#     pole_panel   = make_bw_panel(pole_mask,   'Pole',   panel_w, panel_h)
-#     tree_panel   = make_bw_panel(tree_mask,   'Tree',   panel_w, panel_h)
-#
-#     bottom = np.hstack((ground_panel, pole_panel, tree_panel))
-#
-#     return np.vstack((top, bottom))
-#
-#
-# # ══════════════════════════════════════════════════════════════════════════════
-# # MAIN
-# # ══════════════════════════════════════════════════════════════════════════════
-#
-# def main():
-#     # Collect images that have at least one mask generated
-#     all_images = sorted(glob.glob(os.path.join(IMAGE_FOLDER, '*.jpg')) +
-#                         glob.glob(os.path.join(IMAGE_FOLDER, '*.png')))
-#     all_images = [p for p in all_images if '_mask' not in os.path.basename(p).lower()]
-#
-#     # Only keep images that have at least one mask
-#     def has_any_mask(path):
-#         stem = os.path.splitext(os.path.basename(path))[0]
-#         return any(os.path.exists(os.path.join(d, f'{stem}_mask_{s}.png'))
-#                    for d, s in [(GROUND_MASK_DIR, 'ground'),
-#                                 (POLE_MASK_DIR,   'pole'),
-#                                 (TREE_MASK_DIR,   'tree')])
-#
-#     image_paths = [p for p in all_images if has_any_mask(p)]
-#
-#     if not image_paths:
-#         print('No images with masks found. Run generate_masks.py first.')
-#         sys.exit(1)
-#
-#     print(f'Found {len(image_paths)} images with masks.')
-#
-#     WINDOW = 'Mask Viewer  |  a/d = prev/next  |  1/2/3 = toggle masks  |  +/- = opacity  |  q = quit'
-#     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-#     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
-#
-#     idx          = 0
-#     opacity      = INITIAL_OPACITY
-#     show_ground  = True
-#     show_pole    = True
-#     show_tree    = True
-#     needs_redraw = True
-#
-#     while True:
-#         if needs_redraw:
-#             path = image_paths[idx]
-#             stem = os.path.splitext(os.path.basename(path))[0]
-#
-#             img         = cv2.imread(path)
-#             ground_mask = load_mask(GROUND_MASK_DIR, stem, 'ground')
-#             pole_mask   = load_mask(POLE_MASK_DIR,   stem, 'pole')
-#             tree_mask   = load_mask(TREE_MASK_DIR,   stem, 'tree')
-#
-#             frame = build_frame(img, ground_mask, pole_mask, tree_mask,
-#                                 show_ground, show_pole, show_tree, opacity)
-#
-#             cv2.setWindowTitle(WINDOW,
-#                 f'[{idx+1}/{len(image_paths)}]  {stem}  |  '
-#                 f'ground={"ON" if show_ground else "off"}  '
-#                 f'pole={"ON" if show_pole else "off"}  '
-#                 f'tree={"ON" if show_tree else "off"}  '
-#                 f'opacity={opacity:.2f}')
-#             cv2.imshow(WINDOW, frame)
-#             needs_redraw = False
-#
-#         key = cv2.waitKey(15)
-#
-#         if key == ord('q'):
-#             break
-#         elif key in (ord('d'), 83, 65363):
-#             idx = (idx + 1) % len(image_paths)
-#             needs_redraw = True
-#         elif key in (ord('a'), 81, 65361):
-#             idx = (idx - 1) % len(image_paths)
-#             needs_redraw = True
-#         elif key == ord('1'):
-#             show_ground  = not show_ground
-#             needs_redraw = True
-#         elif key == ord('2'):
-#             show_pole    = not show_pole
-#             needs_redraw = True
-#         elif key == ord('3'):
-#             show_tree    = not show_tree
-#             needs_redraw = True
-#         elif key in (ord('+'), ord('=')):
-#             opacity      = min(1.0, opacity + OPACITY_STEP)
-#             needs_redraw = True
-#         elif key == ord('-'):
-#             opacity      = max(0.0, opacity - OPACITY_STEP)
-#             needs_redraw = True
-#
-#     cv2.destroyAllWindows()
-#
-#
-# if __name__ == '__main__':
-#     main()
-
 """
 mask_viewer.py
 ==============
 Loads an image and overlays its ground, pole, tree masks and gate detection
 on top, each in a different colour with adjustable opacity.
+
+The display is rotated 90° CCW so that the ground (originally on the left
+side of the raw fisheye frame) appears at the bottom, as expected.
+
+Below the image a two-panel analysis strip is shown:
+  Left  : per-column ground-pixel count (line plot), with the 7 bi-exp
+           strips shaded in alternating colours and vertical dividers.
+  Right : bar chart — total ground pixels per strip (the "score" used to
+           pick the best direction).
 
 Controls
 --------
@@ -221,11 +22,6 @@ Controls
   4              — toggle gate overlay (cyan)
   +  / -         — increase / decrease opacity of all masks
   q              — quit
-
-Layout
-------
-  Top panel    : original image + mask overlays + gate annotation
-  Bottom panel : the three raw masks side by side (B&W)
 """
 
 import cv2
@@ -241,26 +37,88 @@ from typing import Optional
 # ══════════════════════════════════════════════════════════════════════════════
 
 IMAGE_FOLDER      = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320'
-# MASKS_OUTPUT_ROOT = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\testorni_generated_masks_new_test'
-
-MASKS_OUTPUT_ROOT = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\generated_masks'
-
+MASKS_OUTPUT_ROOT = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\latest_flight_all_generated_masks'
 
 GROUND_MASK_DIR = os.path.join(MASKS_OUTPUT_ROOT, 'ground_masks')
 POLE_MASK_DIR   = os.path.join(MASKS_OUTPUT_ROOT, 'pole_masks')
 TREE_MASK_DIR   = os.path.join(MASKS_OUTPUT_ROOT, 'tree_masks')
 
 # Overlay colours (BGR)
-GROUND_COLOUR = (0,   255,   0)    # green
-POLE_COLOUR   = (0,   165, 255)    # orange
-TREE_COLOUR   = (255,   0, 200)    # purple
-GATE_COLOUR   = (255, 255,   0)    # cyan
+GROUND_COLOUR = (0,   255,   0)
+POLE_COLOUR   = (0,   165, 255)
+TREE_COLOUR   = (255,   0, 200)
+GATE_COLOUR   = (255, 255,   0)
 
 INITIAL_OPACITY = 0.5
 OPACITY_STEP    = 0.05
 
+# Strip analysis
+N_STRIPS    = 7
+BIEXP_EXP   = 0.7          # lower = more aggressive narrowing at centre
+STRIP_ALPHA = 0.18         # shading opacity on line plot
+
+# Alternating strip shade colours (BGR) for the line-plot background
+STRIP_SHADES = [
+    (60,  60,  60),
+    (90,  90,  90),
+]
+
+# Bar chart colour for the best strip
+BAR_BEST_COLOUR    = (0, 220, 80)     # bright green
+BAR_NORMAL_COLOUR  = (80, 140, 200)   # steel blue
+BAR_AXIS_COLOUR    = (200, 200, 200)
+PLOT_BG_COLOUR     = (30,  30,  30)
+
 # ══════════════════════════════════════════════════════════════════════════════
-# GATE DETECTION — copied exactly from gate_detection.py
+# STRIP / PARTITION HELPERS  (your existing logic, embedded here)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_partition_edges(W, n_partitions=7, spacing="biexp", biexp_exp=0.7):
+    """
+    Returns a list of (x_start, x_end) pixel ranges for each partition.
+    W is the axis being divided (height of the rotated image).
+    Strip 1 = bottom of rotated image (drone's left), strip 7 = top (drone's right).
+    """
+    if spacing == "uniform":
+        edges = np.linspace(0, W, n_partitions + 1, dtype=int)
+
+    elif spacing == "biexp":
+        t      = np.linspace(-1, 1, n_partitions + 1)
+        warped = np.sign(t) * (np.abs(t) ** biexp_exp)
+        warped = (warped - warped[0]) / (warped[-1] - warped[0])
+        edges  = (warped * W).astype(int)
+
+    else:
+        raise ValueError(f"Unknown spacing: '{spacing}'.")
+
+    # Reverse so strip 1 is at the bottom of the rotated image
+    pairs = [(int(edges[i]), int(edges[i + 1])) for i in range(n_partitions)]
+    return list(reversed(pairs))
+
+
+def partition_ground_counts(col_counts, partitions, total_rows):
+    """
+    col_counts  : 1-D array of length W_rot — ground pixels per column
+    partitions  : list of (x0, x1) from get_partition_edges
+    total_rows  : height of rotated image  (= original image width)
+    Returns list of (ground_pixels, percentage) per strip.
+    """
+    result = []
+    for (x0, x1) in partitions:
+        total_pixels  = (x1 - x0) * total_rows
+        ground_pixels = int(col_counts[x0:x1].sum())
+        pct = 100.0 * ground_pixels / total_pixels if total_pixels > 0 else 0.0
+        result.append((ground_pixels, pct))
+    return result
+
+
+def get_best_partition(part_data):
+    pcts = [pct for (_, pct) in part_data]
+    return int(np.argmax(pcts))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -311,17 +169,17 @@ def extract_blobs(mask: np.ndarray, image_shape: tuple, cfg: Config) -> list:
         bw = int(stats[i, cv2.CC_STAT_WIDTH])
         bh = int(stats[i, cv2.CC_STAT_HEIGHT])
         blobs.append({
-            "x_min":  x,        "y_min":  y,
-            "x_max":  x + bw,   "y_max":  y + bh,
-            "cx":     int(cents[i, 0]),
-            "cy":     int(cents[i, 1]),
-            "area":   area,
+            "x_min": x,      "y_min": y,
+            "x_max": x + bw, "y_max": y + bh,
+            "cx":    int(cents[i, 0]),
+            "cy":    int(cents[i, 1]),
+            "area":  area,
             "aspect": bw / max(bh, 1),
         })
     return blobs
 
 
-def _are_parallel(b1: dict, b2: dict, cfg: Config) -> bool:
+def _are_parallel(b1, b2, cfg):
     dx0 = b2["cx"] - b1["cx"]
     dy0 = b2["cy"] - b1["cy"]
     if abs(dy0) <= abs(dx0):
@@ -351,7 +209,7 @@ def _are_parallel(b1: dict, b2: dict, cfg: Config) -> bool:
     return skew <= cfg.max_skew_deg
 
 
-def find_gate_pair(blobs: list, cfg: Config) -> Optional[tuple]:
+def find_gate_pair(blobs, cfg):
     best, best_area = None, 0
     for i in range(len(blobs)):
         for j in range(i + 1, len(blobs)):
@@ -365,11 +223,11 @@ def find_gate_pair(blobs: list, cfg: Config) -> Optional[tuple]:
     return best
 
 
-def gate_midpoint(b1: dict, b2: dict) -> tuple:
+def gate_midpoint(b1, b2):
     return ((b1["cx"] + b2["cx"]) // 2, (b1["cy"] + b2["cy"]) // 2)
 
 
-def process_frame(image_bgr: np.ndarray, cfg: Config) -> tuple:
+def process_frame(image_bgr, cfg):
     mask  = blue_mask(image_bgr, cfg)
     blobs = extract_blobs(mask, image_bgr.shape, cfg)
     pair  = find_gate_pair(blobs, cfg)
@@ -377,29 +235,18 @@ def process_frame(image_bgr: np.ndarray, cfg: Config) -> tuple:
     return mask, blobs, pair, mid
 
 
-def draw_gate_overlay(base: np.ndarray, mask: np.ndarray, blobs: list,
-                      pair: Optional[tuple], mid: Optional[tuple],
-                      opacity: float) -> np.ndarray:
-    """Draws the gate blue mask + blob boxes + midpoint onto base."""
-    out = base.copy()
-
-    # Blue mask tint
+def draw_gate_overlay(base, mask, blobs, pair, mid, opacity):
+    out      = base.copy()
     coloured = np.zeros_like(out)
     coloured[mask > 0] = GATE_COLOUR
     out = cv2.addWeighted(out, 1.0, coloured, opacity, 0)
-
-    # All blob outlines (grey)
     for b in blobs:
         cv2.rectangle(out, (b["x_min"], b["y_min"]),
                       (b["x_max"], b["y_max"]), (120, 120, 120), 1)
-
-    # Gate pair boxes (cyan)
     if pair is not None:
         for b in pair:
             cv2.rectangle(out, (b["x_min"], b["y_min"]),
                           (b["x_max"], b["y_max"]), GATE_COLOUR, 2)
-
-    # Midpoint marker
     if mid is not None:
         cv2.drawMarker(out, mid, (0, 255, 0),
                        cv2.MARKER_CROSS, 26, 2, cv2.LINE_AA)
@@ -411,7 +258,7 @@ def draw_gate_overlay(base: np.ndarray, mask: np.ndarray, blobs: list,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MASK VIEWER HELPERS
+# MASK HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_mask(mask_dir, stem, suffix):
@@ -442,12 +289,186 @@ def make_bw_panel(mask, label, W, H):
     return panel
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GROUND ANALYSIS PLOT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
+    """
+    Builds a side-by-side (line plot | bar chart) analysis panel.
+
+    ground_mask_rot : the ground mask already rotated 90° CCW  (H_rot × W_rot)
+    W_rot           : width of rotated image  — THIS is the strip axis (left→right)
+    H_rot           : height of rotated image
+    panel_w, panel_h: pixel size of the whole analysis panel
+    """
+
+    # Per-column ground counts: sum down each column (axis=0) → length W_rot
+    if ground_mask_rot is not None:
+        col_counts = (ground_mask_rot > 0).astype(np.int32).sum(axis=0).astype(float)
+    else:
+        col_counts = np.zeros(W_rot, dtype=float)
+
+    partitions = get_partition_edges(W_rot, N_STRIPS, spacing="biexp",
+                                     biexp_exp=BIEXP_EXP)
+    part_data  = partition_ground_counts(col_counts, partitions, H_rot)
+    best_idx   = get_best_partition(part_data)
+
+    half_w     = panel_w // 2
+    half_w2    = panel_w - half_w   # right panel absorbs any odd pixel
+    plot_h     = panel_h
+
+    # ── LEFT: per-column line plot ────────────────────────────────────────────
+    line_panel = np.full((plot_h, half_w, 3), PLOT_BG_COLOUR, dtype=np.uint8)
+
+    pad_top    = 24
+    pad_bottom = 30
+    pad_left   = 40
+    pad_right  = 10
+    draw_w     = half_w  - pad_left  - pad_right
+    draw_h     = plot_h  - pad_top   - pad_bottom
+
+    max_count  = col_counts.max() if col_counts.max() > 0 else 1.0
+
+    # Strip shading
+    for si, (x0, x1) in enumerate(partitions):
+        shade   = STRIP_SHADES[si % len(STRIP_SHADES)]
+        px0 = pad_left + int(x0 / W_rot * draw_w)
+        px1 = pad_left + int(x1 / W_rot * draw_w)
+        overlay = line_panel.copy()
+        cv2.rectangle(overlay, (px0, pad_top), (px1, pad_top + draw_h), shade, -1)
+        cv2.addWeighted(overlay, STRIP_ALPHA, line_panel, 1 - STRIP_ALPHA, 0, line_panel)
+        # Divider line
+        cv2.line(line_panel, (px0, pad_top), (px0, pad_top + draw_h),
+                 (100, 100, 100), 1)
+        # Strip label
+        mid_px = (px0 + px1) // 2
+        cv2.putText(line_panel, str(si + 1),
+                    (mid_px - 4, pad_top - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1)
+
+    # Highlight best strip
+    bx0 = pad_left + int(partitions[best_idx][0] / W_rot * draw_w)
+    bx1 = pad_left + int(partitions[best_idx][1] / W_rot * draw_w)
+    highlight = line_panel.copy()
+    cv2.rectangle(highlight, (bx0, pad_top), (bx1, pad_top + draw_h),
+                  BAR_BEST_COLOUR, -1)
+    cv2.addWeighted(highlight, 0.22, line_panel, 0.78, 0, line_panel)
+
+    # Y-axis label
+    cv2.putText(line_panel, 'ground px',
+                (2, pad_top + draw_h // 2 + 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 160), 1)
+
+    # Axes
+    cv2.line(line_panel,
+             (pad_left, pad_top), (pad_left, pad_top + draw_h),
+             BAR_AXIS_COLOUR, 1)
+    cv2.line(line_panel,
+             (pad_left, pad_top + draw_h),
+             (pad_left + draw_w, pad_top + draw_h),
+             BAR_AXIS_COLOUR, 1)
+
+    # Y-axis ticks
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        ty    = pad_top + draw_h - int(frac * draw_h)
+        label = str(int(frac * max_count))
+        cv2.line(line_panel, (pad_left - 3, ty), (pad_left, ty),
+                 BAR_AXIS_COLOUR, 1)
+        cv2.putText(line_panel, label, (2, ty + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (140, 140, 140), 1)
+
+    # Line plot
+    xs = np.linspace(0, len(col_counts) - 1, len(col_counts))
+    px_arr = (pad_left + xs / W_rot * draw_w).astype(int)
+    py_arr = (pad_top + draw_h - (col_counts / max_count) * draw_h).astype(int)
+    pts    = np.stack([px_arr, py_arr], axis=1).reshape(-1, 1, 2).astype(np.int32)
+    cv2.polylines(line_panel, [pts], False, (0, 230, 80), 1, cv2.LINE_AA)
+
+    # Title
+    cv2.putText(line_panel, 'Ground pixels per column',
+                (pad_left, plot_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (160, 160, 160), 1)
+
+    # ── RIGHT: bar chart ──────────────────────────────────────────────────────
+    bar_panel  = np.full((plot_h, half_w2, 3), PLOT_BG_COLOUR, dtype=np.uint8)
+
+    pad_top_b  = 24
+    pad_bot_b  = 30
+    pad_left_b = 44
+    pad_right_b= 10
+    draw_wb    = half_w2  - pad_left_b  - pad_right_b
+    draw_hb    = plot_h   - pad_top_b   - pad_bot_b
+
+    max_pct    = max((pct for (_, pct) in part_data), default=1.0)
+    if max_pct == 0:
+        max_pct = 1.0
+
+    bar_gap    = max(1, draw_wb // (N_STRIPS * 6))
+    bar_w      = (draw_wb - bar_gap * (N_STRIPS + 1)) // N_STRIPS
+
+    for si, (gp, pct) in enumerate(part_data):
+        bx     = pad_left_b + bar_gap + si * (bar_w + bar_gap)
+        bh     = int(pct / max_pct * draw_hb)
+        by     = pad_top_b + draw_hb - bh
+        colour = BAR_BEST_COLOUR if si == best_idx else BAR_NORMAL_COLOUR
+        cv2.rectangle(bar_panel, (bx, by), (bx + bar_w, pad_top_b + draw_hb),
+                      colour, -1)
+        # Percentage label above bar
+        label  = f'{pct:.1f}%'
+        lx     = bx + bar_w // 2 - len(label) * 3
+        ly     = max(pad_top_b - 2, by - 3)
+        cv2.putText(bar_panel, label, (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (210, 210, 210), 1)
+        # Strip number below
+        cv2.putText(bar_panel, str(si + 1),
+                    (bx + bar_w // 2 - 4, pad_top_b + draw_hb + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1)
+
+    # Axes
+    cv2.line(bar_panel,
+             (pad_left_b, pad_top_b), (pad_left_b, pad_top_b + draw_hb),
+             BAR_AXIS_COLOUR, 1)
+    cv2.line(bar_panel,
+             (pad_left_b, pad_top_b + draw_hb),
+             (pad_left_b + draw_wb, pad_top_b + draw_hb),
+             BAR_AXIS_COLOUR, 1)
+
+    # Y-axis ticks
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        ty    = pad_top_b + draw_hb - int(frac * draw_hb)
+        label = f'{frac * max_pct:.0f}%'
+        cv2.line(bar_panel, (pad_left_b - 3, ty), (pad_left_b, ty),
+                 BAR_AXIS_COLOUR, 1)
+        cv2.putText(bar_panel, label, (2, ty + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (140, 140, 140), 1)
+
+    # "BEST → strip N" annotation
+    cv2.putText(bar_panel,
+                f'BEST: strip {best_idx + 1}',
+                (pad_left_b, plot_h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, BAR_BEST_COLOUR, 1)
+
+    # Title
+    cv2.putText(bar_panel, 'Ground % per strip',
+                (pad_left_b + draw_wb // 2 - 40, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+    return np.hstack((line_panel, bar_panel)), best_idx, partitions
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FRAME BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
 def build_frame(img, ground_mask, pole_mask, tree_mask,
                 gate_data,
                 show_ground, show_pole, show_tree, show_gate, opacity):
-    H, W = img.shape[:2]
-
-    # ── Top panel ─────────────────────────────────────────────────────────────
+    """
+    img and all masks are in their ORIGINAL orientation.
+    Everything is rotated 90° CCW before display.
+    """
+    # ── Apply overlays on original image ─────────────────────────────────────
     top = img.copy()
     if show_ground: top = apply_colour_overlay(top, ground_mask, GROUND_COLOUR, opacity)
     if show_pole:   top = apply_colour_overlay(top, pole_mask,   POLE_COLOUR,   opacity)
@@ -456,7 +477,32 @@ def build_frame(img, ground_mask, pole_mask, tree_mask,
         gate_mask, blobs, pair, mid = gate_data
         top = draw_gate_overlay(top, gate_mask, blobs, pair, mid, opacity)
 
-    # Legend
+    # ── Rotate 90° CCW ───────────────────────────────────────────────────────
+    top_rot = cv2.rotate(top, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    H_rot, W_rot = top_rot.shape[:2]
+
+    # Rotate ground mask for analysis
+    ground_rot = None
+    if ground_mask is not None:
+        ground_rot = cv2.rotate(ground_mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # ── Strip divider lines on rotated image (vertical strips) ───────────────
+    partitions = get_partition_edges(W_rot, N_STRIPS, spacing="biexp",
+                                     biexp_exp=BIEXP_EXP)
+    for si, (x0, _) in enumerate(partitions):
+        if si == 0:
+            continue
+        cv2.line(top_rot, (x0, 0), (x0, H_rot), (200, 200, 200), 1)
+
+    # Strip numbers along top of image
+    for si, (x0, x1) in enumerate(partitions):
+        mid_x = (x0 + x1) // 2
+        cv2.putText(top_rot, str(si + 1),
+                    (mid_x - 5, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # ── Legend ────────────────────────────────────────────────────────────────
     legend_items = []
     if show_ground: legend_items.append(('[1] Ground', GROUND_COLOUR))
     if show_pole:   legend_items.append(('[2] Pole',   POLE_COLOUR))
@@ -464,22 +510,56 @@ def build_frame(img, ground_mask, pole_mask, tree_mask,
     if show_gate:   legend_items.append(('[4] Gate',   GATE_COLOUR))
 
     for i, (label, colour) in enumerate(legend_items):
-        cv2.putText(top, label, (8, 22 + i * 22),
+        cv2.putText(top_rot, label, (8, 22 + i * 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 1)
 
-    cv2.putText(top, f'opacity: {opacity:.2f}  (+/-)',
-                (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    cv2.putText(top_rot, f'opacity: {opacity:.2f}  (+/-)',
+                (8, H_rot - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
-    # ── Bottom panel: raw B&W masks side by side ──────────────────────────────
-    panel_w = W // 3
-    panel_h = H // 3
+    # ── Bottom panel: raw B&W masks (also rotated) ────────────────────────────
+    panel_h = H_rot // 3
+    # Divide W_rot into exactly 3 panels that sum to W_rot (no off-by-one)
+    pw0 = W_rot // 3
+    pw1 = W_rot // 3
+    pw2 = W_rot - pw0 - pw1   # absorbs any remainder
 
-    ground_panel = make_bw_panel(ground_mask, 'Ground', panel_w, panel_h)
-    pole_panel   = make_bw_panel(pole_mask,   'Pole',   panel_w, panel_h)
-    tree_panel   = make_bw_panel(tree_mask,   'Tree',   panel_w, panel_h)
+    def rot_mask(m):
+        if m is None: return None
+        return cv2.rotate(m, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-    bottom = np.hstack((ground_panel, pole_panel, tree_panel))
-    return np.vstack((top, bottom))
+    ground_panel = make_bw_panel(rot_mask(ground_mask), 'Ground', pw0, panel_h)
+    pole_panel   = make_bw_panel(rot_mask(pole_mask),   'Pole',   pw1, panel_h)
+    tree_panel   = make_bw_panel(rot_mask(tree_mask),   'Tree',   pw2, panel_h)
+    bw_row       = np.hstack((ground_panel, pole_panel, tree_panel))
+
+    # ── Analysis panel ────────────────────────────────────────────────────────
+    analysis_h    = max(120, H_rot // 3)
+    analysis_panel, best_idx, _ = build_analysis_panel(
+        ground_rot, W_rot, H_rot, W_rot, analysis_h)
+
+    if analysis_panel.shape[1] != W_rot:
+        analysis_panel = cv2.resize(analysis_panel,
+                                    (W_rot, analysis_panel.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
+
+    # Highlight best strip on the rotated image (vertical band)
+    bx0, bx1 = partitions[best_idx]
+    highlight = top_rot.copy()
+    cv2.rectangle(highlight, (bx0, 0), (bx1, H_rot), BAR_BEST_COLOUR, -1)
+    cv2.addWeighted(highlight, 0.15, top_rot, 0.85, 0, top_rot)
+    cv2.line(top_rot, (bx0, 0), (bx0, H_rot), BAR_BEST_COLOUR, 2)
+    cv2.line(top_rot, (bx1, 0), (bx1, H_rot), BAR_BEST_COLOUR, 2)
+
+    # ── Force all panels to identical width before stacking ──────────────────
+    def _fix_w(arr, w):
+        if arr.shape[1] == w:
+            return arr
+        return cv2.resize(arr, (w, arr.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    bw_row        = _fix_w(bw_row,        W_rot)
+    analysis_panel = _fix_w(analysis_panel, W_rot)
+
+    return np.vstack((top_rot, bw_row, analysis_panel))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -489,7 +569,8 @@ def build_frame(img, ground_mask, pole_mask, tree_mask,
 def main():
     all_images = sorted(glob.glob(os.path.join(IMAGE_FOLDER, '*.jpg')) +
                         glob.glob(os.path.join(IMAGE_FOLDER, '*.png')))
-    all_images = [p for p in all_images if '_mask' not in os.path.basename(p).lower()]
+    all_images = [p for p in all_images
+                  if '_mask' not in os.path.basename(p).lower()]
 
     def has_any_mask(path):
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -508,7 +589,8 @@ def main():
 
     gate_cfg = Config()
 
-    WINDOW = 'Mask Viewer  |  a/d=prev/next  |  1/2/3/4=toggle  |  +/-=opacity  |  q=quit'
+    WINDOW = ('Mask Viewer  |  a/d=prev/next  |  1/2/3/4=toggle  '
+              '|  +/-=opacity  |  q=quit')
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
 
@@ -529,14 +611,15 @@ def main():
             ground_mask = load_mask(GROUND_MASK_DIR, stem, 'ground')
             pole_mask   = load_mask(POLE_MASK_DIR,   stem, 'pole')
             tree_mask   = load_mask(TREE_MASK_DIR,   stem, 'tree')
-            gate_data   = process_frame(img, gate_cfg)   # always computed, only drawn if show_gate
+            gate_data   = process_frame(img, gate_cfg)
 
-            mid = gate_data[3]
+            mid      = gate_data[3]
             gate_str = f'GATE at {mid}' if mid is not None else 'no gate'
 
             frame = build_frame(img, ground_mask, pole_mask, tree_mask,
                                 gate_data,
-                                show_ground, show_pole, show_tree, show_gate, opacity)
+                                show_ground, show_pole, show_tree, show_gate,
+                                opacity)
 
             cv2.setWindowTitle(WINDOW,
                 f'[{idx+1}/{len(image_paths)}]  {stem}  |  {gate_str}  |  '
