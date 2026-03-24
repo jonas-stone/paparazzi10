@@ -82,7 +82,7 @@
 
     <!-- FIX: duplicate entry removed — was listed twice, which caused double
          ABI callback registration and double periodic execution.              -->
-    <module name="team10_custom_autopilot_withGateDet_control">
+    <module name="team10_custom_autopilot_control_withGateDet">
       <define name="ORANGE_AVOIDER_VISUAL_DETECTION_ID" value="COLOR_OBJECT_DETECTION1_ID"/>
     </module>
 
