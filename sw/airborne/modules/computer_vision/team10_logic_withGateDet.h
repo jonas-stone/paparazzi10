@@ -5,10 +5,6 @@
 #include "modules/computer_vision/lib/vision/image.h"
 #include "team10_get_obstacle_info.h"
 
-/* ── Tunable parameters (exposed as GCS sliders via module XML) ───────────── */
-extern float    clear_frac;               /* baseline clear threshold, default 0.90  */
-extern int      min_corridor_width_px;    /* minimum passable corridor (px), default 60 */
-
 /* ── Legacy bias defaults (kept for callers that still use fixed values) ──── */
 #define DEFAULT_OBS_BIAS         50
 #define DEFAULT_PLANT_BIAS       70

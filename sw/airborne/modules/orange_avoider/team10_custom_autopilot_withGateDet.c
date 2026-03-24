@@ -138,6 +138,16 @@ float plant_bias_frac = 0.75f;
  * Range [1, 20].  Default 5.                                                  */
 int   wp_update_period_ticks = 5;
 
+/* Corridor picker parameters — defined here (not in team10_logic.c) so that
+ * there is exactly one definition in the build regardless of which logic file
+ * version is compiled.  The logic file reads these as extern.
+ * Range [0.5, 1.0].  Default 0.90.                                           */
+float clear_frac            = 0.90f;
+
+/* Minimum contiguous clear-column run to qualify as a usable corridor (px).
+ * Range [10, 200].  Default 60.                                               */
+int   min_corridor_width_px = 60;
+
 /* Gate state */
 static uint8_t  cur_gate_detected  = 0;
 static int      cur_gate_center_x  = 0;

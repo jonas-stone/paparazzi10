@@ -19,6 +19,8 @@ extern float    plant_bias_frac;           /* plant safety margin frac,    defau
 extern int      wp_update_period_ticks;    /* WP_GOAL update interval (ticks), default 5 */
 extern float    maxDistance;               /* max waypoint displacement [m], default 2.25 */
 extern float    speed_multiplier;          /* overall speed multiplier, default 0.5   */
+extern float    clear_frac;               /* corridor clear threshold, default 0.90  */
+extern int      min_corridor_width_px;    /* minimum passable corridor (px), default 60 */
 
 /* ── Module entry points ──────────────────────────────────────────────────── */
 extern void ground_obstacle_avoidance_init(void);

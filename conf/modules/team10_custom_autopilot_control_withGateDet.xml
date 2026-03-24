@@ -37,11 +37,11 @@ Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
         <dl_setting
           var="clear_frac" min="0.50" step="0.01" max="1.00"
           shortname="clear_frac"
-          module="modules/computer_vision/team10_logic_withGateDet"/>
+          module="modules/orange_avoider/team10_custom_autopilot_withGateDet"/>
         <dl_setting
           var="min_corridor_width_px" min="10" step="5" max="200"
           shortname="min_corr_w"
-          module="modules/computer_vision/team10_logic_withGateDet"/>
+          module="modules/orange_avoider/team10_custom_autopilot_withGateDet"/>
       </dl_settings>
 
       <!-- ── Waypoint / speed ────────────────────────────────────────────── -->
@@ -76,7 +76,6 @@ Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
 
   <makefile target="ap|nps">
     <file name="team10_custom_autopilot_withGateDet.c"/>
-    <file name="../computer_vision/team10_logic_withGateDet.c"/>
   </makefile>
 
 </module>
