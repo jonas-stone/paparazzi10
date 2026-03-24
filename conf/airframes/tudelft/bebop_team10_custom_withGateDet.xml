@@ -50,7 +50,7 @@
          Append with a space if you already have other settings files, e.g.:
            value="settings/other.xml settings/team10_custom_autopilot.xml"
          ═══════════════════════════════════════════════════════════════════ -->
-    <configure name="SETTINGS" value="settings/team10_custom_autopilot.xml"/>
+    <configure name="SETTINGS" value="settings/team10_custom_autopilot_withGateDet.xml"/>
 
   <!-- Subsystem section -->
     <module name="telemetry" type="transparent_udp"/>
@@ -82,7 +82,7 @@
 
     <!-- FIX: duplicate entry removed — was listed twice, which caused double
          ABI callback registration and double periodic execution.              -->
-    <module name="team10_custom_autopilot_control">
+    <module name="team10_custom_autopilot_withGateDet_control">
       <define name="ORANGE_AVOIDER_VISUAL_DETECTION_ID" value="COLOR_OBJECT_DETECTION1_ID"/>
     </module>
 
