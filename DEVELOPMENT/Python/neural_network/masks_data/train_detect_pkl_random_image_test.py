@@ -6,7 +6,7 @@ import glob
 import random
 
 # ── Load the saved model — instant, no retraining ────────────────────────────
-clf = joblib.load('../vase_detector.pkl')
+clf = joblib.load('../gate_detector.pkl')
 print('Model loaded.')
 
 # ── Folder of NEW images to test on ──────────────────────────────────────────
@@ -15,7 +15,7 @@ NEW_IMAGES_FOLDER = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW
 # ── Options ───────────────────────────────────────────────────────────────────
 NUM_IMAGES  = 16        # how many random images to pick, must be a perfect square (4, 9, 16, 25...)
 SAVE_FIGURE = True      # set to False to just display without saving
-SAVE_PATH   = '../vase_detection_results.png'  # filename to save the figure to
+SAVE_PATH   = '../gate_detection_results.png'  # filename to save the figure to
 
 # ── Same feature extractor as training — do not touch this ───────────────────
 def extract_features(yuv, hsv, lab, y, x):
