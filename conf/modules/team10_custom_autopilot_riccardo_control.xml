@@ -1,0 +1,45 @@
+<!DOCTYPE module SYSTEM "module.dtd">
+
+<module name="team10_custom_autopilot_riccardo_control" dir="orange_avoider">
+  <doc>
+    <description>
+This module is an example module for the course AE4317 Autonomous Flight of Micro Air Vehicles at the TU Delft.
+This module is used in combination with a color filter (cv_detect_color_object) and the navigation mode of the autopilot.
+The avoidance strategy is to simply count the total number of orange pixels. When above a certain percentage threshold,
+(given by color_count_frac) we assume that there is an obstacle and we turn.
+
+The color filter settings are set using the cv_detect_color_object. This module can run multiple filters simultaneously
+so you have to define which filter to use with the ORANGE_AVOIDER_VISUAL_DETECTION_ID setting.
+    </description>
+    <define name="ORANGE_AVOIDER_VISUAL_DETECTION_ID" value="ABI_BROADCAST" description="which VISUAL_DETECTION message to receive for orange pixel detection."/>
+  </doc>
+ <settings>
+    <dl_settings>
+      <dl_settings name="WIDTH THRESHOLD">
+        <dl_setting var="obstacle_width_threshold" min="0" step="0.01" max="1.0"/>
+      </dl_settings>
+      <dl_settings name="MAX DISTANCE">
+        <dl_setting var="maxDistance" min="0" step="0.1" max="5.0"/>
+      </dl_settings>
+      <dl_settings name="SPEED MULTIPLIER">
+        <dl_setting var="speed_multiplier" min="0" step="0.01" max="1.0"/>
+      </dl_settings>
+      <dl_settings name="RICCARDO VARS">
+        <dl_setting var="obstacle_width_threshold" min="0.0" max="1.0" step="0.01"/>
+        <dl_setting var="locked_state_cooldown_frames" min="0" max="30" step="1"/>
+        <dl_setting var="centerline_tolerance" min="0.0" max="0.5" step="0.01"/>
+      </dl_settings>
+    </dl_settings>
+  </settings> <dep>
+    <depends>team10_cv_detect_ground</depends>
+  </dep>
+
+  <header>
+    <file name="team10_custom_autopilot_withGateDet_riccardo.h"/>
+  </header>
+  <init fun="ground_obstacle_avoidance_init()"/>
+  <periodic fun="ground_obstacle_avoidance_periodic()" freq="10"/>
+  <makefile target="ap|nps">
+    <file name="team10_custom_autopilot_withGateDet_riccardo.c"/>
+  </makefile>
+</module>

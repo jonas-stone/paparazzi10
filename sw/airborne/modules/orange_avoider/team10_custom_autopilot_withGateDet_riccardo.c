@@ -18,7 +18,7 @@
  */
 
  // Team 10 inclusions
-#include "modules/orange_avoider/team10_custom_autopilot_withGateDet_riccardo.h"
+#include "modules/orange_avoider/team10_custom_autopilot_withGateDet.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
 #include "modules/computer_vision/team10_logic.h"
 
@@ -108,9 +108,16 @@ enum navigation_state_t {
   OUT_OF_BOUNDS
 };
 
+enum objective_location_t {
+  RIGHT_OF_CENTERLINE,
+  LEFT_OF_CENTERLINE,
+  CENTERLINE
+};
+
 // define and initialise global variables
 enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
 int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
+float setting_heading_increment = 5.f;  // to be changed inside the settings in PAPARAZZI
 float heading_increment = 5.f;          // heading angle increment [deg]
 float maxDistance = 2.25;               // max waypoint displacement [m]
 
@@ -123,6 +130,13 @@ static uint8_t                  obstacle_count = 0;
 static uint8_t                  plant_count    = 0;
 static uint16_t                 boundary_len   = 0;
 uint16_t  total_obstacle_width  = 0;
+
+// declare counter here -> the const. variable will be a slider
+uint8_t locked_state_cooldown_frames = 10;
+float   centerline_tolerance = 0.05;
+static uint8_t locked_state_cooldown = 0;
+static enum objective_location_t point_location = CENTERLINE;
+static enum objective_location_t target_location = CENTERLINE;
 
 // define threshold settings -> lower, drone is more scared
 float obstacle_width_threshold = 0.2f;
@@ -219,9 +233,13 @@ void ground_obstacle_avoidance_periodic(void)
     obstacle_free_confidence -= 2;
   }
 
+  // every frame decrease counter
+  if (locked_state_cooldown != 0) {
+    locked_state_cooldown -= 1;
+  }
+
   // bound obstacle_free_confidence
   Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
-
   float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
 
   switch (navigation_state){
@@ -235,41 +253,58 @@ void ground_obstacle_avoidance_periodic(void)
       } else {
         moveWaypointForward(WP_GOAL, moveDistance);
       }
-
       break;
+
     case OBSTACLE_FOUND:
       // stop
       waypoint_move_here_2d(WP_GOAL);
       waypoint_move_here_2d(WP_TRAJECTORY);
 
-      if (gate_seen) {
-        // gate detected: place waypoints through the gate centre
-        moveWaypointToImageColumn(WP_GOAL, gate_center_col, 1.0f, 0.8f);
-        moveWaypointToImageColumn(WP_TRAJECTORY, gate_center_col, 1.5f, 0.8f);
-
-        obstacle_free_confidence = 0;
-        navigation_state = SAFE;
-      } else {
-        // normal obstacle avoidance
+      // logically select new search direction if not on cooldown
+      int safe_col = MAX_IMAGE_WIDTH / 2;
+      if (locked_state_cooldown == 0) {
         int safe_col = motion_logic_normalised(obstacles, obstacle_count,
-                                              plants, plant_count,
-                                              boundary_rows_f,
-                                              boundary_len, MAX_IMAGE_HEIGHT,
-                                              DEFAULT_OBS_BIAS_FRAC,
-                                              DEFAULT_PLANT_BIAS_FRAC);
-        chooseWiseIncrementAvoidance(safe_col);
-        navigation_state = SEARCH_FOR_SAFE_HEADING;
+                                                plants, plant_count,
+                                                boundary_rows_f,
+                                                boundary_len, MAX_IMAGE_HEIGHT,
+                                                DEFAULT_OBS_BIAS_FRAC,
+                                                DEFAULT_PLANT_BIAS_FRAC);
       }
 
+      // assign objective location -> rotation direction
+      if (safe_col / (float)MAX_IMAGE_WIDTH < 0.5f - centerline_tolerance) {
+        point_location = LEFT_OF_CENTERLINE;
+      } else if (safe_col / (float)MAX_IMAGE_WIDTH > 0.5f + centerline_tolerance) {
+        point_location = RIGHT_OF_CENTERLINE;
+      }
+
+      chooseWiseIncrementAvoidance(safe_col);
+      navigation_state = SEARCH_FOR_SAFE_HEADING;
+      locked_state_cooldown = locked_state_cooldown_frames;
       break;
+
     case SEARCH_FOR_SAFE_HEADING:
-      increase_nav_heading(heading_increment);
 
-      // make sure we have a couple of good readings before declaring the way safe
-      if (obstacle_free_confidence >= 2){
-        navigation_state = SAFE;
-      }
-      break;
+    // re-evaluate safe direction each frame
+    int current_safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                                   plants, plant_count,
+                                                   boundary_rows_f,
+                                                   boundary_len, MAX_IMAGE_HEIGHT,
+                                                   DEFAULT_OBS_BIAS_FRAC,
+                                                   DEFAULT_PLANT_BIAS_FRAC);
+
+    float col_frac = current_safe_col / (float)MAX_IMAGE_WIDTH;
+
+    // Check if safe column is now near center, after being released from cooldown
+    if (locked_state_cooldown == 0 &&
+        col_frac >= 0.5f - centerline_tolerance && 
+        col_frac <= 0.5f + centerline_tolerance) {
+      target_location = CENTERLINE;
+      obstacle_free_confidence = 0;
+      navigation_state = SAFE;
+    } else increase_nav_heading(heading_increment);
+    break;
+
     case OUT_OF_BOUNDS:
       increase_nav_heading(heading_increment);
       moveWaypointForward(WP_TRAJECTORY, 1.5f);
@@ -285,6 +320,7 @@ void ground_obstacle_avoidance_periodic(void)
         navigation_state = SEARCH_FOR_SAFE_HEADING;
       }
       break;
+
     default:
       break;
   }

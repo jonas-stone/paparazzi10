@@ -18,7 +18,7 @@
  */
 
  // Team 10 inclusions
-#include "modules/orange_avoider/team10_autopilot.h"
+#include "modules/orange_avoider/team10_custom_autopilot.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
 #include "modules/computer_vision/team10_logic.h"
 
