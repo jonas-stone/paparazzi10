@@ -97,12 +97,13 @@ uint8_t centerline_tolerance = 0.1 * MAX_IMAGE_WIDTH;
 float   heading_increment_degrees_setting     = 1;
 uint8_t locked_rotate_cooldown_frames_setting = 10;
 uint8_t locked_go_cooldown_frames_setting     = 40;
-float   obstacle_width_threshold  = 0.2f;
+float   obstacle_width_threshold  = 0.3f;
 uint8_t max_trajectory_confidence = 5;
 
-// cooldowns
+// counters
 uint8_t locked_rotate_cooldown;
 uint8_t locked_go_cooldown;
+uint8_t obstacle_found_countdown;
 
 /*
  * This next section defines an ABI messaging event (http://wiki.paparazziuav.org/wiki/ABI), necessary
@@ -135,10 +136,15 @@ static void ground_detection_callback(
 
     for (uint16_t i = 0; i < boundary_len; i++)
     boundary_rows_f[i] = (float)in_br[i];
+
+    // update for obstacle detection
+    for (uint8_t i = 0; i < in_oc; i++) {
+      total_obstacle_width += in_obs[i]->width + in_plants[i]->width;
+    }
 }
 
 uint8_t gate_seen;
-int gate_center_col;
+int     gate_center_col;
 static void gate_detection_callback(
     uint8_t __attribute__((unused)) sender_id,
     uint8_t in_gate_detected,
@@ -155,6 +161,10 @@ void ground_obstacle_avoidance_init(void) {
   nav_state       = ROTATE;
   target_location = RIGHT;
   point_location  = CENTERLINE;
+
+  // initialize necessary obstacle variables
+  total_obstacle_width = 0;
+  obstacle_found_countdown = 0; 
 
   // srand(time(NULL));
   // int safe_col = motion_logic_normalised(obstacles, obstacle_count,
@@ -198,6 +208,15 @@ void ground_obstacle_avoidance_periodic(void)
     heading_increment = +heading_increment_degrees_setting; // dummy setting
   }
 
+  if (total_obstacle_width > obstacle_width_threshold) {
+      obstacle_found_countdown += 1;
+    }
+
+  // obstacles > threshold for 5 consecutive frames
+  if (obstacle_found_countdown == 5) {
+    nav_state = OBSTACLE_FOUND;
+  }
+  
   // state machine
   switch (nav_state) 
   {
@@ -237,6 +256,8 @@ void ground_obstacle_avoidance_periodic(void)
     waypoint_move_here_2d(WP_TRAJECTORY);
     printf("Obstacle found.\n");
     nav_state = ROTATE;
+    obstacle_found_countdown = 0;
+    break;
 
   case OUT_OF_BOUNDS:
     increase_nav_heading(heading_increment);
