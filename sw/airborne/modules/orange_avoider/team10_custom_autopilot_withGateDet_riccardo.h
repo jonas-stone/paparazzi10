@@ -14,13 +14,15 @@
 #ifndef TEAM10_AUTOPILOT_H
 #define TEAM10_AUTOPILOT_H
 
-extern float obstacle_width_threshold;
-extern float maxDistance;
-extern float speed_multiplier;
-
-extern float setting_heading_increment;
-extern uint8_t locked_state_cooldown_frames;
-extern float centerline_tolerance;
+// GCS settings
+extern float   speed_multiplier;
+extern float   maxDistance;    // meters
+extern uint8_t centerline_tolerance;
+extern uint8_t heading_increment_degrees_setting;
+extern uint8_t locked_rotate_cooldown_frames_setting;
+extern uint8_t locked_go_cooldown_frames_setting ;
+extern float   obstacle_width_threshold;
+extern uint8_t max_trajectory_confidence;
 
 // functions (TEAM 10 GROUND DETECTION)
 extern void ground_obstacle_avoidance_init(void);
