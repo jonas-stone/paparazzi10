@@ -73,7 +73,7 @@ enum ObjectiveLocation {
   CENTERLINE
 };
 
-// define obstacle global variables
+// obstacle global variables
 static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
 static struct obstacle_region_t plants[MAX_PLANT_REGIONS];
 static uint16_t boundary_rows[MAX_IMAGE_HEIGHT];
@@ -82,17 +82,15 @@ static uint8_t  obstacle_count = 0;
 static uint8_t  plant_count    = 0;
 static uint16_t boundary_len   = 0;
 uint16_t total_obstacle_width  = 0;
-
-// pre-declare safe_col
 int safe_col;
 
-// define navigation global variables
+// navigation global variables
 static enum ObjectiveLocation point_location;
 static enum ObjectiveLocation target_location;
 static enum NavigationState   nav_state;
 float  heading_increment;      // degrees
 
-// declare settings
+// settings
 float   speed_multiplier     = 1;
 float   maxDistance          = 2.5;    // meters
 uint8_t centerline_tolerance = 0.1 * MAX_IMAGE_WIDTH;
@@ -102,7 +100,7 @@ uint8_t locked_go_cooldown_frames_setting     = 40;
 float   obstacle_width_threshold  = 0.2f;
 uint8_t max_trajectory_confidence = 5;
 
-// define cooldowns
+// cooldowns
 uint8_t locked_rotate_cooldown;
 uint8_t locked_go_cooldown;
 
