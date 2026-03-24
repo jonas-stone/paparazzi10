@@ -354,7 +354,7 @@ import multiprocessing as mp
 IMAGE_FOLDER = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\downloads from drone\20260320'
 
 # Where the three mask sub-folders will be created
-MASKS_OUTPUT_ROOT = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\generated_masks_new_test'
+MASKS_OUTPUT_ROOT = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\latest_flight_all_generated_masks'
 
 # .pkl model files
 GROUND_MODEL_PATH = 'ground_detector.pkl'
@@ -362,12 +362,12 @@ POLE_MODEL_PATH   = 'pole_detector.pkl'
 TREE_MODEL_PATH   = 'tree_detector.pkl'
 
 # ── Test mode ─────────────────────────────────────────────────────────────────
-TEST_MODE       = True    # <- flip to False to run on everything
-TEST_NUM_IMAGES = 10
+TEST_MODE       = False    # <- flip to False to run on everything
+TEST_NUM_IMAGES = 30
 
 # ── Parallelism ───────────────────────────────────────────────────────────────
 # Number of worker processes — None means use all available CPU cores
-NUM_WORKERS = None   # e.g. set to 4 if you want to cap it
+NUM_WORKERS = 10   # e.g. set to 4 if you want to cap it
 
 # ── Tree edge-filter settings (mirrors your existing tree script) ─────────────
 EDGE_FILTER_ON         = True
@@ -404,38 +404,83 @@ def extract_features(yuv, hsv, lab, y, x):
     ]
 
 
+# def run_classifier(clf, img):
+    # """
+    # Fully vectorised replacement for the pixel-by-pixel loop.
+    # Produces identical features to extract_features() for every valid pixel
+    # but uses numpy array operations instead — ~50x faster than the loop.
+    # """
+    # h, w, _ = img.shape
+    # yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV).astype(np.float32)
+    # hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    #
+    # # Valid pixel region — identical to the original loop bounds
+    # y0, y1 = 4, h - 2
+    # x0, x1 = 2, w - 3
+    #
+    # # Per-pixel values (p_yuv, p_hsv, p_lab)
+    # yuv_px = yuv[y0:y1, x0:x1]
+    # hsv_px = hsv[y0:y1, x0:x1]
+    # lab_px = lab[y0:y1, x0:x1]
+    #
+    # # 3x3 patch mean and std over YUV
+    # neighbours = np.stack([
+    #     yuv[y0-1:y1-1, x0-1:x1-1], yuv[y0-1:y1-1, x0:x1], yuv[y0-1:y1-1, x0+1:x1+1],
+    #     yuv[y0:y1,     x0-1:x1-1], yuv[y0:y1,     x0:x1],  yuv[y0:y1,     x0+1:x1+1],
+    #     yuv[y0+1:y1+1, x0-1:x1-1], yuv[y0+1:y1+1, x0:x1],  yuv[y0+1:y1+1, x0+1:x1+1],
+    # ], axis=0)  # shape (9, H, W, 3)
+    #
+    # patch_mean = neighbours.mean(axis=0)  # (H, W, 3)
+    # patch_std  = neighbours.std(axis=0)   # (H, W, 3)
+    #
+    # # Gradient
+    # grad = np.abs(yuv[y0:y1, x0+1:x1+1] - yuv[y0:y1, x0-1:x1-1])  # (H, W, 3)
+    #
+    # # Concatenate all 18 features — same order as extract_features()
+    # pixels = np.concatenate([
+    #     yuv_px, hsv_px, lab_px,
+    #     patch_mean, patch_std, grad
+    # ], axis=2).reshape(-1, 18)
+    #
+    # pred_flat   = clf.predict(pixels)
+    # msk_cropped = pred_flat.reshape(y1 - y0, x1 - x0)
+    # msk         = np.zeros((h, w), dtype=np.uint8)
+    # msk[y0:y1, x0:x1] = msk_cropped
+    # return msk
+
+
 def run_classifier(clf, img):
     """
     Fully vectorised replacement for the pixel-by-pixel loop.
-    Produces identical features to extract_features() for every valid pixel
-    but uses numpy array operations instead — ~50x faster than the loop.
+    Keeps uint8 inputs so mean/std match training (float64) exactly.
     """
     h, w, _ = img.shape
-    yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV).astype(np.float32)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
 
-    # Valid pixel region — identical to the original loop bounds
     y0, y1 = 4, h - 2
     x0, x1 = 2, w - 3
 
-    # Per-pixel values (p_yuv, p_hsv, p_lab)
-    yuv_px = yuv[y0:y1, x0:x1]
-    hsv_px = hsv[y0:y1, x0:x1]
-    lab_px = lab[y0:y1, x0:x1]
+    # Per-pixel values
+    yuv_px = yuv[y0:y1, x0:x1].astype(np.float64)
+    hsv_px = hsv[y0:y1, x0:x1].astype(np.float64)
+    lab_px = lab[y0:y1, x0:x1].astype(np.float64)
 
-    # 3x3 patch mean and std over YUV
+    # 3x3 patch mean and std over YUV — uint8 stacked, numpy upcasts to float64
     neighbours = np.stack([
         yuv[y0-1:y1-1, x0-1:x1-1], yuv[y0-1:y1-1, x0:x1], yuv[y0-1:y1-1, x0+1:x1+1],
         yuv[y0:y1,     x0-1:x1-1], yuv[y0:y1,     x0:x1],  yuv[y0:y1,     x0+1:x1+1],
         yuv[y0+1:y1+1, x0-1:x1-1], yuv[y0+1:y1+1, x0:x1],  yuv[y0+1:y1+1, x0+1:x1+1],
-    ], axis=0)  # shape (9, H, W, 3)
+    ], axis=0).astype(np.float64)  # (9, H, W, 3)
 
     patch_mean = neighbours.mean(axis=0)  # (H, W, 3)
     patch_std  = neighbours.std(axis=0)   # (H, W, 3)
 
-    # Gradient
-    grad = np.abs(yuv[y0:y1, x0+1:x1+1] - yuv[y0:y1, x0-1:x1-1])  # (H, W, 3)
+    # Gradient — cast to float64 first to avoid uint8 underflow
+    grad = np.abs(yuv[y0:y1, x0+1:x1+1].astype(np.float64) -
+                  yuv[y0:y1, x0-1:x1-1].astype(np.float64))
 
     # Concatenate all 18 features — same order as extract_features()
     pixels = np.concatenate([
@@ -448,7 +493,6 @@ def run_classifier(clf, img):
     msk         = np.zeros((h, w), dtype=np.uint8)
     msk[y0:y1, x0:x1] = msk_cropped
     return msk
-
 
 def binary_to_bw(mask):
     """
@@ -500,6 +544,21 @@ def filter_tree_by_edge_density(raw_mask, img):
 
     return output_mask
 
+
+# def make_tree_mask(tree_clf, img):
+#     """
+#     Full tree mask pipeline:
+#       1. Run pixel classifier
+#       2. Apply edge-density filter to remove flat false positives
+#       3. Return clustered blob regions as white, everything else black
+#       No bounding boxes — just the raw clustered pixel regions.
+#     """
+#     raw_mask = run_classifier(tree_clf, img)
+#     if EDGE_FILTER_ON:
+#         filtered = filter_tree_by_edge_density(raw_mask, img)
+#     else:
+#         filtered = raw_mask
+#     return binary_to_bw(filtered)
 
 def make_tree_mask(tree_clf, img):
     """
