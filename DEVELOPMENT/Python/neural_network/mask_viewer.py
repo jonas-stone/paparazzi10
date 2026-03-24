@@ -58,8 +58,23 @@ BIEXP_EXP   = 0.7
 STRIP_ALPHA = 0.18
 
 # Hole filler defaults
-HOLE_CLOSING_RADIUS = 0.04   # kernel radius as fraction of image height — increase for larger holes
-HOLE_MIN_AREA       = 200    # min area of filled region in pixels
+HOLE_CLOSING_RADIUS = 0.04
+HOLE_MIN_AREA       = 200
+
+# Tree bounding-box padding tuning
+# TREE_PAD_W_INIT      = 0
+# TREE_PAD_H_INIT      = 0
+TREE_PAD_STEP        = 5
+# TREE_CLUSTER_MARGIN_INIT = 10   # initial dilation radius for blob clustering (px)
+TREE_CLUSTER_STEP        = 5    # step size for ,/. keys
+# TREE_MEAS_MODES      = ['pixels', 'ratio', 'aspect']
+
+
+TREE_PAD_W_INIT              = 0
+TREE_PAD_H_INIT              = 30
+TREE_CLUSTER_MARGIN_INIT     = 35
+TREE_MEAS_MODES              = ['pixels', 'ratio', 'aspect']
+# set initial mode to aspect (index 2)
 
 # Alternating strip shade colours (BGR) for the line-plot background
 STRIP_SHADES = [
@@ -413,6 +428,122 @@ def carve_poles_from_ground(ground_mask, pole_mask):
     return result
 
 
+def get_tree_bboxes(tree_mask, pad_w=0, pad_h=0, cluster_margin=10):
+    """
+    Clusters nearby tree blobs by dilating the mask by `cluster_margin` pixels
+    before finding connected components — blobs within that distance merge into
+    one.  The tight bounding box is then computed over the ORIGINAL (undilated)
+    pixels belonging to each cluster, so the margin only affects grouping, not
+    the box size.  Padding is then added on top of the tight box.
+
+    Parameters
+    ----------
+    tree_mask      : uint8 grayscale mask
+    pad_w          : extra pixels added to each horizontal side of tight box
+    pad_h          : extra pixels added to each vertical side of tight box
+    cluster_margin : dilation radius (px) used for merging nearby blobs
+    """
+    if tree_mask is None:
+        return []
+
+    H, W   = tree_mask.shape
+    binary = (tree_mask > 0).astype(np.uint8)
+
+    if binary.sum() == 0:
+        return []
+
+    # ── Cluster by dilation ───────────────────────────────────────────────────
+    if cluster_margin > 0:
+        k       = cluster_margin * 2 + 1
+        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(binary, kernel, iterations=1)
+    else:
+        dilated = binary
+
+    _, cluster_labels = cv2.connectedComponents(dilated, connectivity=8)
+
+    # ── For each cluster, get tight box over ORIGINAL pixels ─────────────────
+    boxes = []
+    for cid in np.unique(cluster_labels):
+        if cid == 0:
+            continue
+        # Original pixels that belong to this cluster
+        orig_pixels = (binary == 1) & (cluster_labels == cid)
+        if not orig_pixels.any():
+            continue
+
+        rows = np.where(orig_pixels.any(axis=1))[0]
+        cols = np.where(orig_pixels.any(axis=0))[0]
+        ty, by_ = int(rows[0]), int(rows[-1])
+        tx, bx_ = int(cols[0]), int(cols[-1])
+        tw = bx_ - tx + 1
+        th = by_ - ty + 1
+
+        # Padded box clamped to image
+        px  = max(0,     tx - pad_w)
+        py  = max(0,     ty - pad_h)
+        px2 = min(W - 1, tx + tw + pad_w)
+        py2 = min(H - 1, ty + th + pad_h)
+        pw  = px2 - px
+        ph  = py2 - py
+
+        boxes.append({
+            'tight':  (tx, ty, tw, th),
+            'padded': (px, py, pw, ph),
+        })
+    return boxes
+
+
+def draw_tree_bboxes(image, tree_mask, pad_w, pad_h, meas_mode, cluster_margin):
+    """
+    Draws padded tree bounding boxes onto image (already rotated).
+    tree_mask must be in the same (rotated) coordinate space as image.
+
+    meas_mode : 'pixels'  → show padded W×H in pixels
+                'ratio'   → show padded/tight ratio for W and H
+                'aspect'  → show W/H aspect ratio of padded box
+    """
+    boxes = get_tree_bboxes(tree_mask, pad_w, pad_h, cluster_margin)
+    out   = image.copy()
+
+    for b in boxes:
+        tx, ty, tw, th = b['tight']
+        px, py, pw, ph = b['padded']
+
+        # Tight box (grey)
+        cv2.rectangle(out, (tx, ty), (tx + tw, ty + th), (160, 160, 160), 1)
+
+        # Padded box (bright magenta)
+        cv2.rectangle(out, (px, py), (px + pw, py + ph), (255, 80, 255), 2)
+
+        # Measurement label
+        if meas_mode == 'pixels':
+            label = f'{pw}x{ph}px'
+        elif meas_mode == 'ratio':
+            rw = pw / tw if tw > 0 else 0
+            rh = ph / th if th > 0 else 0
+            label = f'W:{rw:.2f}x H:{rh:.2f}x'
+        else:  # aspect
+            label = f'AR:{pw/ph:.2f}' if ph > 0 else 'AR:--'
+
+        lx = px
+        ly = max(12, py - 4)
+        cv2.putText(out, label, (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 80, 255), 1, cv2.LINE_AA)
+
+    # HUD
+    H_img = out.shape[0]
+    cv2.putText(out,
+                f'TreeBox  pad_w={pad_w}  pad_h={pad_h}  margin={cluster_margin}  [{meas_mode}]',
+                (8, H_img - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 80, 255), 1, cv2.LINE_AA)
+    cv2.putText(out, '[/]=pad_w   ;/\'=pad_h   ,/.=margin   m=mode   t=toggle',
+                (8, H_img - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 180, 180), 1, cv2.LINE_AA)
+    return out
+
+
+
 def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
     """
     Builds a side-by-side (line plot | bar chart) analysis panel.
@@ -583,7 +714,9 @@ def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
 
 def build_frame(img, ground_mask, pole_mask, tree_mask,
                 gate_data,
-                show_ground, show_pole, show_tree, show_gate, opacity):
+                show_ground, show_pole, show_tree, show_gate, opacity,
+                show_tree_bbox=False, tree_pad_w=0, tree_pad_h=0,
+                tree_meas_mode='pixels', tree_cluster_margin=10):
     """
     img and all masks are in their ORIGINAL orientation.
     Everything is rotated 90° CCW before display.
@@ -621,6 +754,14 @@ def build_frame(img, ground_mask, pole_mask, tree_mask,
         cv2.putText(top_rot, str(si + 1),
                     (mid_x - 5, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # ── Tree bounding boxes (drawn on rotated image) ──────────────────────────
+    tree_rot = None
+    if tree_mask is not None:
+        tree_rot = cv2.rotate(tree_mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if show_tree_bbox:
+        top_rot = draw_tree_bboxes(top_rot, tree_rot, tree_pad_w, tree_pad_h,
+                                   tree_meas_mode, tree_cluster_margin)
 
     # ── Legend ────────────────────────────────────────────────────────────────
     legend_items = []
@@ -710,7 +851,7 @@ def main():
     gate_cfg = Config()
 
     WINDOW = ('Mask Viewer  |  a/d=prev/next  |  1/2/3/4=toggle  '
-              '|  5=hole-fill  |  +/-=opacity  |  q=quit')
+              '|  5=fill  t=treebox  [/]=pad_w  ;/\'=pad_h  ,/.=margin  m=mode  |  +/-=opacity  |  q=quit')
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
 
@@ -720,8 +861,13 @@ def main():
     show_pole    = True
     show_tree    = True
     show_gate    = True
-    show_fill    = False   # toggle with key '5' — fill carpet holes AFTER cleaning
-    needs_redraw = True
+    show_fill      = False
+    show_tree_bbox       = False
+    tree_pad_w           = TREE_PAD_W_INIT
+    tree_pad_h           = TREE_PAD_H_INIT
+    tree_cluster_margin  = TREE_CLUSTER_MARGIN_INIT
+    tree_meas_idx        = 0
+    needs_redraw         = True
 
     while True:
         if needs_redraw:
@@ -750,7 +896,10 @@ def main():
             frame = build_frame(img, display_ground, pole_mask, tree_mask,
                                 gate_data,
                                 show_ground, show_pole, show_tree, show_gate,
-                                opacity)
+                                opacity,
+                                show_tree_bbox, tree_pad_w, tree_pad_h,
+                                TREE_MEAS_MODES[tree_meas_idx],
+                                tree_cluster_margin)
 
             cv2.setWindowTitle(WINDOW,
                 f'[{idx+1}/{len(image_paths)}]  {stem}  |  {gate_str}  |  '
@@ -759,7 +908,10 @@ def main():
                 f'T={"ON" if show_tree else "off"}  '
                 f'Gate={"ON" if show_gate else "off"}  '
                 f'Fill={"ON" if show_fill else "off"}  '
-                f'opacity={opacity:.2f}')
+                f'TreeBox={"ON" if show_tree_bbox else "off"}'
+                + (f'  pw={tree_pad_w} ph={tree_pad_h} mg={tree_cluster_margin} [{TREE_MEAS_MODES[tree_meas_idx]}]'
+                   if show_tree_bbox else '') +
+                f'  opacity={opacity:.2f}')
             cv2.imshow(WINDOW, frame)
             needs_redraw = False
 
@@ -786,8 +938,32 @@ def main():
             show_gate    = not show_gate
             needs_redraw = True
         elif key == ord('5'):
-            show_fill    = not show_fill
-            needs_redraw = True
+            show_fill      = not show_fill
+            needs_redraw   = True
+        elif key == ord('t'):
+            show_tree_bbox = not show_tree_bbox
+            needs_redraw   = True
+        elif key == ord('['):
+            tree_pad_w     = max(0, tree_pad_w - TREE_PAD_STEP)
+            needs_redraw   = True
+        elif key == ord(']'):
+            tree_pad_w    += TREE_PAD_STEP
+            needs_redraw   = True
+        elif key == ord(';'):
+            tree_pad_h     = max(0, tree_pad_h - TREE_PAD_STEP)
+            needs_redraw   = True
+        elif key == ord("'"):
+            tree_pad_h    += TREE_PAD_STEP
+            needs_redraw   = True
+        elif key == ord(','):
+            tree_cluster_margin = max(0, tree_cluster_margin - TREE_CLUSTER_STEP)
+            needs_redraw   = True
+        elif key == ord('.'):
+            tree_cluster_margin += TREE_CLUSTER_STEP
+            needs_redraw   = True
+        elif key == ord('m'):
+            tree_meas_idx  = (tree_meas_idx + 1) % len(TREE_MEAS_MODES)
+            needs_redraw   = True
         elif key in (ord('+'), ord('=')):
             opacity      = min(1.0, opacity + OPACITY_STEP)
             needs_redraw = True
