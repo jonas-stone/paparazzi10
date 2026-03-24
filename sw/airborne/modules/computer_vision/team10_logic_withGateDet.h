@@ -5,86 +5,92 @@
 #include "modules/computer_vision/lib/vision/image.h"
 #include "team10_get_obstacle_info.h"
 
-#define DEFAULT_OBS_BIAS    50
-#define DEFAULT_PLANT_BIAS   70
-#define DEFAULT_OBS_BIAS_FRAC   0.05f
-#define DEFAULT_PLANT_BIAS_FRAC 0.1f
+/* ── Tunable parameters (exposed as GCS sliders via module XML) ───────────── */
+extern float    clear_frac;               /* baseline clear threshold, default 0.90  */
+extern int      min_corridor_width_px;    /* minimum passable corridor (px), default 60 */
+
+/* ── Legacy bias defaults (kept for callers that still use fixed values) ──── */
+#define DEFAULT_OBS_BIAS         50
+#define DEFAULT_PLANT_BIAS       70
+#define DEFAULT_OBS_BIAS_FRAC    0.05f
+#define DEFAULT_PLANT_BIAS_FRAC  0.1f
+
+/* ── Function declarations ────────────────────────────────────────────────── */
 
 /*
- * ══════════════════════════════════════════════════════════════════════════════
- *  GREENEST SECTION -- Column version
- *  Returns 1-based index of the greenest section out of ns sections.
- * ══════════════════════════════════
+ * greenest_section_column
+ * Returns 1-based index of the greenest section out of ns sections.
  */
 int greenest_section_column(const float gb[], int w, int ns);
 
 /*
- * ══════════════════════════════════════════════════════════════════════════════
- *  GREENEST PIXEL
- *  Returns the column index (0 to w-1) where the baseline is at its highest.
- * ══════════════════════════════════════════════════════════════════════════════ 
+ * greenest_pixel
+ * Returns the column index (0 to w-1) where the baseline is lowest.
+ * Now delegates to widest_corridor_centre internally.
  */
 int greenest_pixel(const float gb[], int w);
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  OBSTACLE TOUCHES THE IMAGE BOTTOM
- *  Fills touches_out[i] = 1 if obstacle i has no ground beneath it.
- *  Returns 1 if any obstacle touches, 0 otherwise.
- * ══════════════════════════════════════════════════════════════════════════════ */
+/*
+ * widest_corridor_centre
+ * Returns the centre column of the widest contiguous run of clear columns.
+ * A column is clear if gb[col] < clear_frac * h.
+ * Runs narrower than min_corridor_width_px are discarded.
+ * Falls back to the minimum-value plateau centre if no run qualifies.
+ */
+int widest_corridor_centre(const float gb[], int w, int h);
+
+/*
+ * obstacle_touches_ground
+ * Fills touches_out[i] = 1 if obstacle i has no ground beneath it.
+ * Returns 1 if any obstacle touches the ground, 0 otherwise.
+ */
 uint8_t obstacle_touches_ground(const struct obstacle_region_t oo[], uint8_t no,
                                 int h, uint8_t touches_out[], uint8_t *touch);
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  BIAS LOGIC
- *  Erases dangerous zones from a copy of gb[] and returns the safest column.
- * ══════════════════════════════════════════════════════════════════════════════ */
+/*
+ * normalised_bias
+ * Returns a bias in pixels as a fraction of the obstacle/plant width (min 1).
+ */
+int normalised_bias(const struct obstacle_region_t *o, float frac);
+
+/*
+ * bias_logic
+ * Erases dangerous zones from a copy of gb[] and returns the safest column.
+ */
 int bias_logic(const struct obstacle_region_t oo[], uint8_t no,
                const struct obstacle_region_t po[], uint8_t np,
                const float gb[], int w, int h,
                const uint8_t touches_out[],
                int obs_bias, int plant_bias);
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  NORMALISED BIAS
- *  Computes a bias in pixels as a fraction of the obstacle/plant width.
- *
- *  Inputs:
- *    o    - pointer to the obstacle/plant region
- *    frac - fraction of the width to use as bias (e.g. 0.5 = 50%)
- *
- *  Output:
- *    int  - bias in pixels (minimum 1)
- * ══════════════════════════════════════════════════════════════════════════════ */
-int normalised_bias(const struct obstacle_region_t *o, float frac);
-
-/* ══════════════════════════════════════════════════════════════════════════════
- *  MOTION LOGIC
- *  Main waypoint selection function. Returns column index (0 to w-1).
- * ══════════════════════════════════════════════════════════════════════════════ */
+/*
+ * motion_logic
+ * Main waypoint selection with fixed pixel bias values.
+ * Returns column index (0 to w-1).
+ */
 int motion_logic(const struct obstacle_region_t oo[], uint8_t no,
                  const struct obstacle_region_t po[], uint8_t np,
                  const float gb[], int w, int h,
                  int obs_bias, int plant_bias);
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  MOTION LOGIC NORMALISED
- *  Same as motion_logic but uses normalised_bias per obstacle/plant width
- *  instead of fixed pixel values.
- *
- *  Inputs:
- *    obs_bias_frac   - fraction of each obstacle width to use as bias
- *    plant_bias_frac - fraction of each plant width to use as bias
- * ══════════════════════════════════════════════════════════════════════════════ */
+/*
+ * motion_logic_normalised
+ * Same as motion_logic but bias is a fraction of each obstacle/plant width.
+ */
 int motion_logic_normalised(const struct obstacle_region_t oo[], uint8_t no,
                             const struct obstacle_region_t po[], uint8_t np,
                             const float gb[], int w, int h,
                             float obs_bias_frac, float plant_bias_frac);
 
-
+/*
+ * motion_logic_gate_aware
+ * Same as motion_logic_normalised but skips erasing the gate column if a
+ * gate is detected, so the drone can steer toward it instead of away.
+ */
 int motion_logic_gate_aware(const struct obstacle_region_t oo[], uint8_t no,
-const struct obstacle_region_t po[], uint8_t np,
-const float gb[], int w, int h,
-float obs_bias_frac, float plant_bias_frac,
-uint8_t gate_detected, int gate_center_col);
+                            const struct obstacle_region_t po[], uint8_t np,
+                            const float gb[], int w, int h,
+                            float obs_bias_frac, float plant_bias_frac,
+                            uint8_t gate_detected, int gate_center_col);
 
 #endif /* TEAM10_LOGIC_H */

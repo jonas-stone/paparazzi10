@@ -5,20 +5,23 @@
  *
  */
 /**
- * @file "modules/orange_avoider/orange_avoider.h"
- * @author Roland Meertens
- * Example on how to use the colours detected to avoid orange pole in the cyberzoo
+ * @file "modules/orange_avoider/team10_custom_autopilot.h"
+ * @author Roland Meertens / Team 10
  */
 
 #ifndef TEAM10_AUTOPILOT_H
 #define TEAM10_AUTOPILOT_H
 
-extern float obstacle_width_threshold;
-extern float maxDistance;
-extern float speed_multiplier;
-// functions (TEAM 10 GROUND DETECTION)
+/* ── Tunable parameters (exposed as GCS sliders via module XML) ───────────── */
+extern float    obstacle_width_threshold;  /* fraction of image width, default 0.15  */
+extern float    obs_bias_frac;             /* obstacle safety margin frac, default 0.50 */
+extern float    plant_bias_frac;           /* plant safety margin frac,    default 0.75 */
+extern int      wp_update_period_ticks;    /* WP_GOAL update interval (ticks), default 5 */
+extern float    maxDistance;               /* max waypoint displacement [m], default 2.25 */
+extern float    speed_multiplier;          /* overall speed multiplier, default 0.5   */
+
+/* ── Module entry points ──────────────────────────────────────────────────── */
 extern void ground_obstacle_avoidance_init(void);
 extern void ground_obstacle_avoidance_periodic(void);
 
-#endif
-
+#endif /* TEAM10_AUTOPILOT_H */
