@@ -54,8 +54,12 @@ OPACITY_STEP    = 0.05
 
 # Strip analysis
 N_STRIPS    = 7
-BIEXP_EXP   = 0.7          # lower = more aggressive narrowing at centre
-STRIP_ALPHA = 0.18         # shading opacity on line plot
+BIEXP_EXP   = 0.7
+STRIP_ALPHA = 0.18
+
+# Hole filler defaults
+HOLE_CLOSING_RADIUS = 0.04   # kernel radius as fraction of image height — increase for larger holes
+HOLE_MIN_AREA       = 200    # min area of filled region in pixels
 
 # Alternating strip shade colours (BGR) for the line-plot background
 STRIP_SHADES = [
@@ -290,8 +294,124 @@ def make_bw_panel(mask, label, W, H):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GROUND ANALYSIS PLOT
+# GROUND HOLE FILLER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def fill_ground_holes(ground_mask, closing_radius=0.04, min_hole_area=200):
+    """
+    Fills holes and carpet-like interruptions in the ground mask using
+    morphological closing, constrained to the region that is plausibly
+    ground (below the top of the existing ground region).
+
+    Strategy
+    --------
+    1. Find the topmost row that contains any ground pixel — everything
+       above that row is sky/obstacle and will never be filled.
+    2. Apply morphological closing with a large elliptical kernel.
+       Closing = dilation followed by erosion: it bridges gaps and fills
+       holes without expanding the overall ground boundary much.
+    3. The fill is only accepted in pixels that are BELOW the ground
+       top-row found in step 1, preventing false fills in the sky.
+    4. A minimum-area filter removes tiny isolated specks.
+
+    Parameters
+    ----------
+    ground_mask    : uint8 grayscale mask (255 = ground, 0 = non-ground)
+    closing_radius : kernel radius as fraction of image height (0.02–0.10)
+    min_hole_area  : connected non-ground regions smaller than this that
+                     sit inside the closed mask are filled regardless
+    """
+    if ground_mask is None:
+        return None
+
+    H, W   = ground_mask.shape
+    binary = (ground_mask > 0).astype(np.uint8)
+
+    # ── Step 1: find the top of the ground region ────────────────────────────
+    rows_with_ground = np.any(binary > 0, axis=1)
+    if not rows_with_ground.any():
+        return ground_mask   # no ground at all, nothing to do
+    top_ground_row = int(np.argmax(rows_with_ground))   # first True
+
+    # ── Step 2: morphological closing ────────────────────────────────────────
+    ksize  = max(3, int(H * closing_radius) | 1)        # odd, scales with H
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # ── Step 3: constrain fill to below ground top-row ───────────────────────
+    # Only accept new pixels (closed=1, binary=0) below the ground top
+    new_pixels        = ((closed == 1) & (binary == 0)).astype(np.uint8)
+    new_pixels[:top_ground_row, :] = 0     # mask out sky region
+
+    # ── Step 4: min-area filter on the new pixels ────────────────────────────
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(new_pixels,
+                                                           connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < min_hole_area:
+            new_pixels[labels == i] = 0
+
+    result = binary.copy()
+    result[new_pixels == 1] = 1
+    return (result * 255).astype(np.uint8)
+
+
+def clean_ground_blobs(ground_mask, bottom_frac=0.025):
+    """
+    Keeps only ground pixels connected to the "ground root" region.
+
+    The drone camera is rotated 90° CCW for display, so the floor appears
+    at the BOTTOM of the rotated view — which corresponds to the LEFT COLUMNS
+    of the original (unrotated) mask.  The seed region is therefore the
+    leftmost `bottom_frac` of columns in the original mask.
+
+    Everything in the seed band is always kept.
+    Everything outside the seed band is kept only if it is connected
+    (via a continuous path of ground pixels) to the seed band.
+
+    If cleaning removes all pixels (e.g. no ground reaches the seed band
+    at all), the original mask is returned unchanged as a safety fallback.
+    """
+    if ground_mask is None:
+        return None
+
+    H, W   = ground_mask.shape
+    binary = (ground_mask > 0).astype(np.uint8)
+
+    # Seed = leftmost columns of original mask (= bottom of rotated view)
+    seed_end = max(1, int(W * bottom_frac))
+
+    _, labels = cv2.connectedComponents(binary, connectivity=8)
+
+    seed_labels = set(np.unique(labels[:, :seed_end]))
+    seed_labels.discard(0)
+
+    if not seed_labels:
+        return ground_mask   # nothing touches seed band — return original
+
+    keep = np.isin(labels, list(seed_labels)).astype(np.uint8)
+
+    if keep.sum() == 0:
+        return ground_mask   # safety fallback
+
+    return (keep * 255).astype(np.uint8)
+
+
+
+
+
+def carve_poles_from_ground(ground_mask, pole_mask):
+    """
+    Removes ground pixels that are covered by the pole mask.
+    Applied last so the blob cleaner and hole filler are unaffected.
+    If either mask is None the ground mask is returned unchanged.
+    """
+    if ground_mask is None or pole_mask is None:
+        return ground_mask
+
+    result = ground_mask.copy()
+    result[pole_mask > 0] = 0
+    return result
+
 
 def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
     """
@@ -590,7 +710,7 @@ def main():
     gate_cfg = Config()
 
     WINDOW = ('Mask Viewer  |  a/d=prev/next  |  1/2/3/4=toggle  '
-              '|  +/-=opacity  |  q=quit')
+              '|  5=hole-fill  |  +/-=opacity  |  q=quit')
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
 
@@ -600,6 +720,7 @@ def main():
     show_pole    = True
     show_tree    = True
     show_gate    = True
+    show_fill    = False   # toggle with key '5' — fill carpet holes AFTER cleaning
     needs_redraw = True
 
     while True:
@@ -613,10 +734,20 @@ def main():
             tree_mask   = load_mask(TREE_MASK_DIR,   stem, 'tree')
             gate_data   = process_frame(img, gate_cfg)
 
+            # Step 1 (always): remove all ground blobs not touching the seed band
+            display_ground = clean_ground_blobs(ground_mask)
+            # Step 2 (toggle 5): fill carpet-like holes in the cleaned mask
+            if show_fill:
+                display_ground = fill_ground_holes(display_ground,
+                                                   HOLE_CLOSING_RADIUS,
+                                                   HOLE_MIN_AREA)
+            # Step 3 (always): carve pole footprints out of ground last
+            display_ground = carve_poles_from_ground(display_ground, pole_mask)
+
             mid      = gate_data[3]
             gate_str = f'GATE at {mid}' if mid is not None else 'no gate'
 
-            frame = build_frame(img, ground_mask, pole_mask, tree_mask,
+            frame = build_frame(img, display_ground, pole_mask, tree_mask,
                                 gate_data,
                                 show_ground, show_pole, show_tree, show_gate,
                                 opacity)
@@ -627,6 +758,7 @@ def main():
                 f'P={"ON" if show_pole else "off"}  '
                 f'T={"ON" if show_tree else "off"}  '
                 f'Gate={"ON" if show_gate else "off"}  '
+                f'Fill={"ON" if show_fill else "off"}  '
                 f'opacity={opacity:.2f}')
             cv2.imshow(WINDOW, frame)
             needs_redraw = False
@@ -652,6 +784,9 @@ def main():
             needs_redraw = True
         elif key == ord('4'):
             show_gate    = not show_gate
+            needs_redraw = True
+        elif key == ord('5'):
+            show_fill    = not show_fill
             needs_redraw = True
         elif key in (ord('+'), ord('=')):
             opacity      = min(1.0, opacity + OPACITY_STEP)
