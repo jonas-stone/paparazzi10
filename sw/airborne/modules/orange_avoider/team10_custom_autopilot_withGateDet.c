@@ -447,9 +447,9 @@ static uint8_t chooseHeadingToGate(int gate_col)
 uint8_t chooseWiseIncrementAvoidance(int safe_direction)
 {
     if (safe_direction > MAX_IMAGE_WIDTH / 2) {
-        heading_increment = 5.f;
-    } else if (safe_direction < MAX_IMAGE_WIDTH / 2) {
         heading_increment = -5.f;
+    } else if (safe_direction < MAX_IMAGE_WIDTH / 2) {
+        heading_increment = 5.f;
     }
     VERBOSE_PRINT("Safe col=%d  heading_increment=%.1f\n", safe_direction, heading_increment);
     return false;
