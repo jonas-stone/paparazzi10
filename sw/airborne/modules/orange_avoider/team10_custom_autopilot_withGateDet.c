@@ -1,22 +1,33 @@
 /*
- * team10_custom_autopilot.c
+ * team10_custom_autopilot.c — improved version
  *
- * Gate-aware obstacle avoidance for the Bebop2.
+ * Improvements applied vs. previous version:
  *
- * Changes vs. original:
- *   1. New GATE_APPROACH navigation state.
- *   2. ABI binding for TEAM10_GATE_DETECTION messages (gate_detected, gate_center_x).
- *   3. OBSTACLE_FOUND now checks gate_detected first:
- *        - gate present  → GATE_APPROACH (aim at gate centre, drive through)
- *        - no gate       → SEARCH_FOR_SAFE_HEADING  (original behaviour)
- *   4. chooseHeadingToGate() converts gate_center_x (pixel column, native res)
- *      to a heading increment so the drone faces the gate opening.
+ *  #1  Corridor-width picker  — motion_logic_normalised (via team10_logic.c)
+ *      now returns the centre of the widest clear corridor rather than the
+ *      single deepest pixel.  No autopilot changes needed; inherited from logic.
  *
- * Coordinate note:
- *   After the 90° CCW rotation applied in ground_detection, column 0 = RIGHT side
- *   and column W-1 = LEFT side of the drone's physical view.  gate_center_x is in
- *   the same native (rotated) space, so pixel > W/2 → gate is to the drone's right
- *   → positive heading increment (CW yaw).
+ *  #2  total_obstacle_width is now computed correctly inside
+ *      ground_detection_callback from the actual per-frame obstacle data.
+ *      Previously it was a module-level variable that was never written,
+ *      so obstacle_free_confidence climbed every tick and OBSTACLE_FOUND
+ *      was unreachable from SAFE via the confidence path.
+ *
+ *  #3  SEARCH_FOR_SAFE_HEADING re-evaluates the safe direction every tick
+ *      instead of committing to the direction chosen in OBSTACLE_FOUND.
+ *
+ *  #4  Gate yaw uses proportional control — yaw rate scales with angular
+ *      error so large offsets rotate fast and small offsets do fine correction.
+ *
+ *  #5  plant_bias_frac > obs_bias_frac — plants are narrower than walls so
+ *      they need a larger relative safety margin.  Separate constants defined.
+ *
+ *  #6  Plateau centre tie-breaking — inherited from widest_corridor_centre
+ *      in team10_logic.c; no autopilot change needed.
+ *
+ *  #7  Gate hysteresis — OBSTACLE_FOUND only commits to GATE_APPROACH after
+ *      GATE_CONFIRM_STREAK consecutive frames with gate_detected == 1,
+ *      preventing a single missed frame from sending the drone into avoidance.
  */
 
 #include "modules/orange_avoider/team10_custom_autopilot.h"
@@ -31,6 +42,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>    /* fabsf */
 
 #include "generated/flight_plan.h"
 
@@ -48,11 +60,31 @@ static uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters);
 static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters);
 static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
 static uint8_t increase_nav_heading(float incrementDegrees);
-static uint8_t chooseRandomIncrementAvoidance(void);
 static uint8_t chooseWiseIncrementAvoidance(int safe_col);
+static uint8_t chooseRandomIncrementAvoidance(void);
 static uint8_t chooseHeadingToGate(int gate_col);
 
 float speed_multiplier = 0.5f;
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ *  TUNING CONSTANTS
+ * ══════════════════════════════════════════════════════════════════════════════ */
+
+/* Obstacle / plant bias fractions passed to motion_logic_normalised.
+ * IMPROVEMENT #5: plant bias is larger than obstacle bias because plant pots
+ * are narrow objects that need proportionally more clearance than wide walls. */
+#define DEFAULT_OBS_BIAS_FRAC    0.50f
+#define DEFAULT_PLANT_BIAS_FRAC  0.75f   /* was same as obs in previous version */
+
+/* Gate approach */
+#define GATE_HEADING_MAX_DEG     15.0f   /* proportional yaw clamp             */
+#define GATE_ALIGN_COLUMN_TOL    20      /* px: |gate_col - centre| for aligned */
+#define GATE_APPROACH_DISTANCE_M 1.5f
+
+/* IMPROVEMENT #7: number of consecutive gate-detected frames required before
+ * committing to GATE_APPROACH.  Prevents a single noisy frame from overriding
+ * the avoidance path.                                                          */
+#define GATE_CONFIRM_STREAK      2
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  NAVIGATION STATE MACHINE
@@ -61,7 +93,7 @@ enum navigation_state_t {
     SAFE,
     OBSTACLE_FOUND,
     SEARCH_FOR_SAFE_HEADING,
-    GATE_APPROACH,          /* NEW: obstacle is a gate — fly through it */
+    GATE_APPROACH,
     OUT_OF_BOUNDS
 };
 
@@ -70,14 +102,7 @@ int16_t obstacle_free_confidence = 0;
 float   heading_increment        = 5.f;
 float   maxDistance              = 2.25f;
 
-/* ── Gate approach tuning ──────────────────────────────────────────────────── */
-/* How many degrees per step to yaw toward the gate centre.                    */
-#define GATE_HEADING_INCREMENT_DEG  5.f
-/* How close the heading must be to "aligned" before we commit to driving
-   forward through the gate (degrees, expressed as fraction of image width).   */
-#define GATE_ALIGN_COLUMN_TOLERANCE 20   /* px: |gate_col - img_centre| < this */
-/* Distance to push the TRAJECTORY waypoint when aligned with the gate.        */
-#define GATE_APPROACH_DISTANCE_M    1.5f
+const int16_t max_trajectory_confidence = 5;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  MODULE-LEVEL STATE
@@ -86,18 +111,18 @@ static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
 static struct obstacle_region_t plants[MAX_PLANT_REGIONS];
 static int16_t                  boundary_rows[MAX_IMAGE_HEIGHT];
 static float                    boundary_rows_f[MAX_IMAGE_HEIGHT];
-static uint8_t                  obstacle_count  = 0;
-static uint8_t                  plant_count     = 0;
-static uint16_t                 boundary_len    = 0;
-uint16_t                        total_obstacle_width = 0;
-
-/* Gate state — written by ABI callback, read by periodic */
-static uint8_t  cur_gate_detected  = 0;
-static int      cur_gate_center_x  = 0;
+static uint8_t                  obstacle_count       = 0;
+static uint8_t                  plant_count          = 0;
+static uint16_t                 boundary_len         = 0;
+uint16_t                        total_obstacle_width = 0;   /* #2: now written */
 
 float obstacle_width_threshold = 0.2f;
 
-const int16_t max_trajectory_confidence = 5;
+/* Gate state */
+static uint8_t  cur_gate_detected  = 0;
+static int      cur_gate_center_x  = 0;
+/* IMPROVEMENT #7: consecutive-detection streak counter                        */
+static uint8_t  gate_seen_streak   = 0;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  ABI — GROUND DETECTION
@@ -126,10 +151,23 @@ static void ground_detection_callback(
 
     for (uint16_t i = 0; i < boundary_len; i++)
         boundary_rows_f[i] = (float)in_br[i];
+
+    /* ── IMPROVEMENT #2 ────────────────────────────────────────────────────
+     * Compute total_obstacle_width here, directly from the freshly received
+     * obstacle data, counting only obstacles that touch the ground (those are
+     * the ones that actually block the drone's path).
+     * Previously this variable was declared but never written, so the
+     * confidence counter always incremented and OBSTACLE_FOUND was never
+     * reached from SAFE via the confidence threshold.                        */
+    total_obstacle_width = 0;
+    for (uint8_t i = 0; i < in_oc; i++) {
+        if (in_obs[i].baseline_height >= MAX_IMAGE_HEIGHT)
+            total_obstacle_width += in_obs[i].width;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  ABI — GATE DETECTION  (NEW)
+ *  ABI — GATE DETECTION
  * ══════════════════════════════════════════════════════════════════════════════ */
 #ifndef TEAM10_GATE_DETECTION_ID
 #define TEAM10_GATE_DETECTION_ID ABI_BROADCAST
@@ -144,6 +182,13 @@ static void gate_detection_callback(
 {
     cur_gate_detected = in_gate_detected;
     cur_gate_center_x = in_gate_center_x;
+
+    /* IMPROVEMENT #7: maintain a consecutive-detection streak so OBSTACLE_FOUND
+     * requires GATE_CONFIRM_STREAK frames before trusting the gate flag.      */
+    if (in_gate_detected)
+        gate_seen_streak++;
+    else
+        gate_seen_streak = 0;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -156,8 +201,7 @@ void ground_obstacle_avoidance_init(void)
     int safe_col = motion_logic_normalised(
             obstacles, obstacle_count,
             plants,    plant_count,
-            boundary_rows_f,
-            boundary_len, MAX_IMAGE_HEIGHT,
+            boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
             DEFAULT_OBS_BIAS_FRAC,
             DEFAULT_PLANT_BIAS_FRAC);
     chooseWiseIncrementAvoidance(safe_col);
@@ -166,7 +210,6 @@ void ground_obstacle_avoidance_init(void)
             TEAM10_GROUND_DETECTION_ID, &ground_detection_ev,
             ground_detection_callback);
 
-    /* NEW: bind gate detection ABI */
     AbiBindMsgTEAM10_GATE_DETECTION(
             TEAM10_GATE_DETECTION_ID, &gate_detection_ev,
             gate_detection_callback);
@@ -184,7 +227,7 @@ void ground_obstacle_avoidance_periodic(void)
            obstacle_width_threshold,
            obstacle_width_threshold * MAX_IMAGE_WIDTH);
 
-    /* Update confidence */
+    /* ── Confidence update (now meaningful — see improvement #2) ────────── */
     if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
         obstacle_free_confidence++;
     } else {
@@ -210,30 +253,23 @@ void ground_obstacle_avoidance_periodic(void)
 
     /* ── OBSTACLE_FOUND ──────────────────────────────────────────────────── */
     case OBSTACLE_FOUND:
-        /* Stop in place */
         waypoint_move_here_2d(WP_GOAL);
         waypoint_move_here_2d(WP_TRAJECTORY);
 
-        if (cur_gate_detected) {
-            /*
-             * The obstacle in front is a gate.
-             * Switch to gate approach: align heading with the gate opening,
-             * then drive straight through.
-             */
-            VERBOSE_PRINT("Gate detected at col %d — entering GATE_APPROACH\n",
-                          cur_gate_center_x);
+        /* IMPROVEMENT #7: require GATE_CONFIRM_STREAK consecutive detections
+         * before trusting the gate flag and committing to GATE_APPROACH.
+         * A single noisy frame can no longer override the avoidance path.    */
+        if (cur_gate_detected && gate_seen_streak >= GATE_CONFIRM_STREAK) {
+            VERBOSE_PRINT("Gate confirmed (streak=%d) at col %d — GATE_APPROACH\n",
+                          gate_seen_streak, cur_gate_center_x);
             chooseHeadingToGate(cur_gate_center_x);
             navigation_state = GATE_APPROACH;
         } else {
-            /*
-             * Regular obstacle — find a safe direction and rotate toward it
-             * (original behaviour).
-             */
+            /* Regular obstacle — find safe corridor and rotate toward it */
             int safe_col = motion_logic_normalised(
                     obstacles, obstacle_count,
                     plants,    plant_count,
-                    boundary_rows_f,
-                    boundary_len, MAX_IMAGE_HEIGHT,
+                    boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
                     DEFAULT_OBS_BIAS_FRAC,
                     DEFAULT_PLANT_BIAS_FRAC);
             chooseWiseIncrementAvoidance(safe_col);
@@ -241,19 +277,8 @@ void ground_obstacle_avoidance_periodic(void)
         }
         break;
 
-    /* ── GATE_APPROACH (NEW) ─────────────────────────────────────────────── */
+    /* ── GATE_APPROACH ───────────────────────────────────────────────────── */
     case GATE_APPROACH:
-        /*
-         * Keep turning toward the gate centre until aligned, then push the
-         * waypoint forward through the gate opening.
-         *
-         * Alignment check: if the gate centre column is within
-         * GATE_ALIGN_COLUMN_TOLERANCE pixels of the image centre, the drone
-         * is facing the gate — commit to the approach.
-         *
-         * If the gate is lost (cur_gate_detected == 0) mid-approach we fall
-         * back to OBSTACLE_FOUND to re-evaluate.
-         */
         if (!cur_gate_detected) {
             VERBOSE_PRINT("Gate lost during approach — re-evaluating\n");
             navigation_state = OBSTACLE_FOUND;
@@ -262,30 +287,48 @@ void ground_obstacle_avoidance_periodic(void)
 
         {
             int img_centre = MAX_IMAGE_WIDTH / 2;
-            int gate_err   = cur_gate_center_x - img_centre;   /* +ve = gate right */
+            int gate_err   = cur_gate_center_x - img_centre;
 
-            if (abs(gate_err) <= GATE_ALIGN_COLUMN_TOLERANCE) {
-                /* Aligned: drive forward through the gate */
+            if (abs(gate_err) <= GATE_ALIGN_COLUMN_TOL) {
+                /* Aligned: drive through */
                 VERBOSE_PRINT("Aligned with gate (err=%d px) — approaching\n", gate_err);
-                obstacle_free_confidence = max_trajectory_confidence;   /* trust the path */
+                obstacle_free_confidence = max_trajectory_confidence;
                 moveWaypointForward(WP_TRAJECTORY, GATE_APPROACH_DISTANCE_M);
                 moveWaypointForward(WP_GOAL,       GATE_APPROACH_DISTANCE_M);
                 navigation_state = SAFE;
             } else {
-                /* Still rotating toward the gate */
-                VERBOSE_PRINT("Gate err=%d px — yawing\n", gate_err);
-                chooseHeadingToGate(cur_gate_center_x);
-                increase_nav_heading(heading_increment);
+                /* IMPROVEMENT #4: proportional yaw — larger error → faster turn.
+                 * Normalise gate_err to [-1, +1] then scale to max yaw rate.
+                 * This replaces the previous fixed ±5°/tick regardless of error. */
+                float err_norm = (float)gate_err / (float)img_centre;   /* -1..+1 */
+                float yaw_deg  = err_norm * GATE_HEADING_MAX_DEG;
+                /* clamp (already bounded by construction, but be safe) */
+                if (yaw_deg >  GATE_HEADING_MAX_DEG) yaw_deg =  GATE_HEADING_MAX_DEG;
+                if (yaw_deg < -GATE_HEADING_MAX_DEG) yaw_deg = -GATE_HEADING_MAX_DEG;
+                VERBOSE_PRINT("Gate err=%d px  yaw=%.1f deg\n", gate_err, yaw_deg);
+                increase_nav_heading(yaw_deg);
             }
         }
         break;
 
     /* ── SEARCH_FOR_SAFE_HEADING ─────────────────────────────────────────── */
     case SEARCH_FOR_SAFE_HEADING:
-        increase_nav_heading(heading_increment);
-        if (obstacle_free_confidence >= 2) {
-            navigation_state = SAFE;
+        /* IMPROVEMENT #3: re-evaluate the safe direction every tick so that
+         * a new obstacle entering from the side during rotation does not leave
+         * the drone committed to a stale heading choice made in OBSTACLE_FOUND. */
+        {
+            int safe_col = motion_logic_normalised(
+                    obstacles, obstacle_count,
+                    plants,    plant_count,
+                    boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
+                    DEFAULT_OBS_BIAS_FRAC,
+                    DEFAULT_PLANT_BIAS_FRAC);
+            chooseWiseIncrementAvoidance(safe_col);
         }
+        increase_nav_heading(heading_increment);
+
+        if (obstacle_free_confidence >= 2)
+            navigation_state = SAFE;
         break;
 
     /* ── OUT_OF_BOUNDS ───────────────────────────────────────────────────── */
@@ -308,11 +351,6 @@ void ground_obstacle_avoidance_periodic(void)
 /* ══════════════════════════════════════════════════════════════════════════════
  *  HEADING HELPERS
  * ══════════════════════════════════════════════════════════════════════════════ */
-
-/*
- * increase_nav_heading
- * Adds incrementDegrees to the current heading and normalises to [-π, π].
- */
 uint8_t increase_nav_heading(float incrementDegrees)
 {
     float new_heading = stateGetNedToBodyEulers_f()->psi + RadOfDeg(incrementDegrees);
@@ -323,65 +361,55 @@ uint8_t increase_nav_heading(float incrementDegrees)
 }
 
 /*
- * chooseHeadingToGate  (NEW)
+ * chooseHeadingToGate
  *
- * Sets heading_increment so the drone yaws toward the gate centre.
+ * Sets heading_increment for the initial coarse turn when first entering
+ * GATE_APPROACH.  Once inside that state, improvement #4 takes over with
+ * proportional control — this function only sets the sign for the first tick.
  *
- * After the 90° CCW rotation applied by ground_detection:
- *   column 0       = physical RIGHT of the drone
- *   column W-1     = physical LEFT  of the drone
- *   column W/2     = straight ahead
- *
- * Therefore:
- *   gate_col > W/2  →  gate is to the RIGHT  →  positive yaw (CW, +deg)
- *   gate_col < W/2  →  gate is to the LEFT   →  negative yaw (CCW, -deg)
+ * Coordinate convention (90° CCW rotation):
+ *   col 0   = physical RIGHT  →  gate_col > W/2  →  CW yaw  (+deg)
+ *   col W-1 = physical LEFT   →  gate_col < W/2  →  CCW yaw (-deg)
  */
 static uint8_t chooseHeadingToGate(int gate_col)
 {
     if (gate_col > MAX_IMAGE_WIDTH / 2) {
-        heading_increment = GATE_HEADING_INCREMENT_DEG;
-        VERBOSE_PRINT("Gate RIGHT: yaw +%.1f deg\n", heading_increment);
+        heading_increment = 5.f;
+        VERBOSE_PRINT("Gate RIGHT: initial yaw +%.1f deg\n", heading_increment);
     } else if (gate_col < MAX_IMAGE_WIDTH / 2) {
-        heading_increment = -GATE_HEADING_INCREMENT_DEG;
-        VERBOSE_PRINT("Gate LEFT: yaw %.1f deg\n", heading_increment);
+        heading_increment = -5.f;
+        VERBOSE_PRINT("Gate LEFT: initial yaw %.1f deg\n", heading_increment);
     }
-    /* If gate_col == centre exactly, keep current heading_increment */
     return false;
 }
 
 /*
  * chooseWiseIncrementAvoidance
- * Sets heading_increment based on which side of the image has the safe column.
+ * Sets heading_increment based on which side of the image the safe corridor is.
  */
 uint8_t chooseWiseIncrementAvoidance(int safe_direction)
 {
     if (safe_direction > MAX_IMAGE_WIDTH / 2) {
         heading_increment = 5.f;
-        VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
     } else if (safe_direction < MAX_IMAGE_WIDTH / 2) {
         heading_increment = -5.f;
-        VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
     }
+    VERBOSE_PRINT("Safe col=%d  heading_increment=%.1f\n", safe_direction, heading_increment);
     return false;
 }
 
 /*
- * chooseRandomIncrementAvoidance
- * Fallback: random CW / CCW direction.
+ * chooseRandomIncrementAvoidance — fallback, kept for completeness.
  */
 uint8_t chooseRandomIncrementAvoidance(void)
 {
-    if (rand() % 2 == 0) {
-        heading_increment = 5.f;
-    } else {
-        heading_increment = -5.f;
-    }
-    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+    heading_increment = (rand() % 2 == 0) ? 5.f : -5.f;
+    VERBOSE_PRINT("Random avoidance increment: %.1f\n", heading_increment);
     return false;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  WAYPOINT HELPERS  (unchanged from original)
+ *  WAYPOINT HELPERS
  * ══════════════════════════════════════════════════════════════════════════════ */
 uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
 {
@@ -396,16 +424,17 @@ uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
     float heading = stateGetNedToBodyEulers_f()->psi;
     new_coor->x = stateGetPositionEnu_i()->x + POS_BFP_OF_REAL(sinf(heading) * distanceMeters);
     new_coor->y = stateGetPositionEnu_i()->y + POS_BFP_OF_REAL(cosf(heading) * distanceMeters);
-    VERBOSE_PRINT("Calculated %f m forward position. x: %f  y: %f based on pos(%f, %f) and heading(%f)\n",
+    VERBOSE_PRINT("Calculated %f m forward: x=%f y=%f  pos=(%f,%f)  hdg=%f\n",
                   distanceMeters,
                   POS_FLOAT_OF_BFP(new_coor->x), POS_FLOAT_OF_BFP(new_coor->y),
-                  stateGetPositionEnu_f()->x, stateGetPositionEnu_f()->y, DegOfRad(heading));
+                  stateGetPositionEnu_f()->x, stateGetPositionEnu_f()->y,
+                  DegOfRad(heading));
     return false;
 }
 
 uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
 {
-    VERBOSE_PRINT("Moving waypoint %d to x:%f y:%f\n", waypoint,
+    VERBOSE_PRINT("Moving WP %d to x=%f y=%f\n", waypoint,
                   POS_FLOAT_OF_BFP(new_coor->x), POS_FLOAT_OF_BFP(new_coor->y));
     waypoint_move_xy_i(waypoint, new_coor->x, new_coor->y);
     return false;
