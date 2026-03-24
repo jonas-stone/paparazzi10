@@ -77,8 +77,5 @@ Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
   <makefile target="ap|nps">
     <file name="team10_custom_autopilot_withGateDet.c"/>
   </makefile>
-  <makefile target="ap|nps" dir="computer_vision">
-    <file name="team10_logic_withGateDet.c"/>
-  </makefile>
 
 </module>
