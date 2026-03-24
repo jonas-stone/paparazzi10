@@ -74,12 +74,9 @@ float speed_multiplier = 0.5f;
 #define GATE_HEADING_MAX_DEG     15.0f
 #define GATE_ALIGN_COLUMN_TOL    20
 #define GATE_APPROACH_DISTANCE_M 1.5f
-#define GATE_CONFIRM_STREAK      2
-
-/* IMPROVEMENT #7: number of consecutive gate-detected frames required before
- * committing to GATE_APPROACH.  Prevents a single noisy frame from overriding
- * the avoidance path.                                                          */
-#define GATE_CONFIRM_STREAK      2
+/* Consecutive gate-detected frames required before committing to GATE_APPROACH.
+ * Raised to 4 to reduce false positives from noisy single-frame detections.  */
+#define GATE_CONFIRM_STREAK      4
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  NAVIGATION STATE MACHINE
@@ -237,7 +234,9 @@ void ground_obstacle_avoidance_init(void)
             boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
             obs_bias_frac,
             plant_bias_frac);
-    chooseWiseIncrementAvoidance(safe_col);
+    if (safe_col >= 0)
+        chooseWiseIncrementAvoidance(safe_col);
+    /* else: no data yet at init — heading_increment stays at default 5° */
 
     AbiBindMsgTEAM10_GROUND_DETECTION(
             TEAM10_GROUND_DETECTION_ID, &ground_detection_ev,
@@ -309,14 +308,20 @@ void ground_obstacle_avoidance_periodic(void)
             chooseHeadingToGate(cur_gate_center_x);
             navigation_state = GATE_APPROACH;
         } else {
-            /* Regular obstacle — find safe corridor and rotate toward it */
+            /* Regular obstacle — find safe corridor and rotate toward it.
+             * If motion_logic_normalised returns -1 no qualifying corridor
+             * exists yet.  Keep heading_increment unchanged so the drone
+             * continues rotating in the same direction until one opens up.   */
             int safe_col = motion_logic_normalised(
                     obstacles, obstacle_count,
                     plants,    plant_count,
                     boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
                     obs_bias_frac,
                     plant_bias_frac);
-            chooseWiseIncrementAvoidance(safe_col);
+            if (safe_col >= 0)
+                chooseWiseIncrementAvoidance(safe_col);
+            /* safe_col == -1: no corridor yet — heading_increment unchanged,
+             * drone keeps rotating in its current direction                  */
             navigation_state = SEARCH_FOR_SAFE_HEADING;
         }
         break;
@@ -357,9 +362,12 @@ void ground_obstacle_avoidance_periodic(void)
 
     /* ── SEARCH_FOR_SAFE_HEADING ─────────────────────────────────────────── */
     case SEARCH_FOR_SAFE_HEADING:
-        /* IMPROVEMENT #3: re-evaluate the safe direction every tick so that
-         * a new obstacle entering from the side during rotation does not leave
-         * the drone committed to a stale heading choice made in OBSTACLE_FOUND. */
+        /* Re-evaluate the safe direction every tick (improvement #3).
+         * If -1 is returned no qualifying corridor exists yet:
+         *   - keep heading_increment unchanged (keep rotating same direction)
+         *   - do NOT let confidence rise (obstacle_free_confidence is already
+         *     being decremented above by the total_obstacle_width check, so
+         *     we just avoid the transition-to-SAFE guard below)              */
         {
             int safe_col = motion_logic_normalised(
                     obstacles, obstacle_count,
@@ -367,12 +375,17 @@ void ground_obstacle_avoidance_periodic(void)
                     boundary_rows_f, boundary_len, MAX_IMAGE_HEIGHT,
                     obs_bias_frac,
                     plant_bias_frac);
-            chooseWiseIncrementAvoidance(safe_col);
+            if (safe_col >= 0) {
+                chooseWiseIncrementAvoidance(safe_col);
+                increase_nav_heading(heading_increment);
+                if (obstacle_free_confidence >= 2)
+                    navigation_state = SAFE;
+            } else {
+                /* No passable corridor yet — keep rotating, never advance   */
+                increase_nav_heading(heading_increment);
+                /* Do not check confidence or transition to SAFE             */
+            }
         }
-        increase_nav_heading(heading_increment);
-
-        if (obstacle_free_confidence >= 2)
-            navigation_state = SAFE;
         break;
 
     /* ── OUT_OF_BOUNDS ───────────────────────────────────────────────────── */

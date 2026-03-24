@@ -3,15 +3,23 @@
 #include <stdlib.h>   /* abs() */
 
 /* ══════════════════════════════════════════════════════════════════════════════
- *  CORRIDOR CLEAR THRESHOLD
- *  A column is considered "clear" (passable) if its baseline value is less than
- *  CLEAR_FRAC * image_height.  0.75 means the ground must be visible for at
- *  least the bottom 25 % of the image in that column.
+ *  RUNTIME-TUNABLE CORRIDOR PARAMETERS
  *
- *  IMPROVEMENT #1 — replaces the raw greenest_pixel call with a corridor-aware
- *  picker that prefers wide passable gaps over single deep pixels.
+ *  Exposed as non-static globals so Paparazzi <dl_setting> sliders in the GCS
+ *  can adjust them in flight without recompiling.
+ *
+ *  clear_frac            — fraction of image height a column's baseline must be
+ *                          below to count as "clear".  Range [0.5, 1.0].
+ *                          Higher = stricter (drone demands deeper green).
+ *
+ *  min_corridor_width_px — minimum contiguous clear-column run (pixels) that
+ *                          qualifies as a usable corridor.  Runs shorter than
+ *                          this are silently discarded so the drone never tries
+ *                          to thread a gap too narrow for its body.
+ *                          Range [10, 200].
  * ══════════════════════════════════════════════════════════════════════════════ */
-#define CLEAR_FRAC 0.75f
+float clear_frac             = 0.90f;
+int   min_corridor_width_px  = 60;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  WIDEST CORRIDOR CENTRE  [replaces greenest_pixel as the final picker]
@@ -19,19 +27,22 @@
  *  Scans gb[] for contiguous runs of columns whose value is < CLEAR_FRAC*h
  *  ("clear" columns).  Returns the centre column of the widest such run.
  *
+ *  Runs shorter than MIN_CORRIDOR_WIDTH_PX are rejected outright — the drone
+ *  would not physically fit through them regardless of the baseline depth.
+ *
  *  Tie-break: if two runs share the same width the first (leftmost) one wins —
  *  but because we scan the whole array the returned column is always the true
  *  centre, never the edge of a plateau (fixes improvement #6).
  *
- *  Fallback: if no column clears the threshold (everything blocked) we fall
- *  back to the single column with the smallest baseline value so the drone
- *  still picks a direction to rotate toward.
+ *  Fallback: if no run passes both the threshold and the width guard we fall
+ *  back to the centre of the minimum-value plateau so the drone still picks a
+ *  direction to rotate toward.
  * ══════════════════════════════════════════════════════════════════════════════ */
 int widest_corridor_centre(const float gb[], int w, int h)
 {
     if (!gb || w <= 0) return 0;
 
-    float threshold = CLEAR_FRAC * (float)h;
+    float threshold = clear_frac * (float)h;
 
     int best_centre  = -1;
     int best_width   = 0;
@@ -44,7 +55,8 @@ int widest_corridor_centre(const float gb[], int w, int h)
             run_start = i;                              /* start new run      */
         } else if (!clear && run_start >= 0) {
             int run_w = i - run_start;
-            if (run_w > best_width) {
+            /* Reject runs narrower than the minimum passable corridor width  */
+            if (run_w >= min_corridor_width_px && run_w > best_width) {
                 best_width  = run_w;
                 best_centre = run_start + run_w / 2;   /* true centre        */
             }
@@ -55,30 +67,13 @@ int widest_corridor_centre(const float gb[], int w, int h)
     if (best_centre >= 0)
         return best_centre;
 
-    /* ── Fallback: no clear corridor — return centre of minimum-value plateau ── */
-    /* Find global minimum */
-    float min_val = gb[0];
-    for (int i = 1; i < w; i++)
-        if (gb[i] < min_val) min_val = gb[i];
-
-    /* Find centre of the widest run at that minimum (improvement #6) */
-    best_centre = 0;
-    best_width  = 0;
-    run_start   = -1;
-    for (int i = 0; i <= w; i++) {
-        int at_min = (i < w) && (gb[i] <= min_val + 0.5f);
-        if (at_min && run_start < 0) {
-            run_start = i;
-        } else if (!at_min && run_start >= 0) {
-            int run_w = i - run_start;
-            if (run_w > best_width) {
-                best_width  = run_w;
-                best_centre = run_start + run_w / 2;
-            }
-            run_start = -1;
-        }
-    }
-    return best_centre;
+    /* ── No qualifying corridor found ────────────────────────────────────────
+     * Return -1 so the autopilot knows to keep rotating rather than committing
+     * to a direction that doesn't actually have a passable gap.
+     * Previously this fell back to the minimum-value plateau centre, which
+     * looked like a valid waypoint to the autopilot and caused it to drive
+     * toward a gap that was too narrow or not truly clear.                   */
+    return -1;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -93,9 +88,9 @@ int widest_corridor_centre(const float gb[], int w, int h)
  * ══════════════════════════════════════════════════════════════════════════════ */
 int greenest_pixel(const float gb[], int w)
 {
-    /* h is not available here; pass MAX_IMAGE_HEIGHT as the height reference.
-     * widest_corridor_centre only uses h to compute the clear threshold, so
-     * using the compile-time constant is correct. */
+    /* Propagates -1 when no qualifying corridor exists so callers can detect
+     * the "keep rotating" condition.  Callers that previously assumed a valid
+     * column index must check for -1 before using the return value.          */
     return widest_corridor_centre(gb, w, MAX_IMAGE_HEIGHT);
 }
 
