@@ -208,19 +208,22 @@ void ground_obstacle_avoidance_periodic(void)
     heading_increment = +heading_increment_degrees_setting; // dummy setting
   }
 
+  // keep pooping obstacles every frame
   if (total_obstacle_width > obstacle_width_threshold) {
       obstacle_found_countdown += 1;
     }
 
-  // obstacles > threshold for 5 consecutive frames
-  if (obstacle_found_countdown == 5) {
-    nav_state = OBSTACLE_FOUND;
-  }
-  
   // state machine
   switch (nav_state) 
   {
   case ROTATE:
+
+    // obstacles > threshold for 5 consecutive frames
+    if (obstacle_found_countdown == 5) {
+      nav_state = OBSTACLE_FOUND;
+      break;
+    }
+
     if (locked_rotate_cooldown != 0) {
       locked_rotate_cooldown -= 1;
       increase_nav_heading(heading_increment);
@@ -234,6 +237,13 @@ void ground_obstacle_avoidance_periodic(void)
     break;
   
   case GO:
+
+    // obstacles > threshold for 5 consecutive frames
+    if (obstacle_found_countdown == 5) {
+      nav_state = OBSTACLE_FOUND;
+      break;
+    }
+
     if (locked_go_cooldown == locked_go_cooldown_frames_setting - 1) {
       printf("=====================================\n");
     }
