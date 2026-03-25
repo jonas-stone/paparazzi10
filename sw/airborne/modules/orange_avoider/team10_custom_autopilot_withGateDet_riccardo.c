@@ -35,7 +35,7 @@
 // flight plan inclusions
 #include "generated/flight_plan.h"
 
-#define ORANGE_AVOIDER_VERBOSE FALSE
+#define ORANGE_AVOIDER_VERBOSE TRUE
 
 #define PRINT(string,...) fprintf(stderr, "[orange_avoider->%s()] " string,__FUNCTION__ , ##__VA_ARGS__)
 #if ORANGE_AVOIDER_VERBOSE
@@ -92,11 +92,11 @@ float  heading_increment;      // degrees
 
 // settings
 float   speed_multiplier     = 1;
-float   maxDistance          = 2.5;    // meters
+float   maxDistance          = 1.5;    // meters
 uint8_t centerline_tolerance = 0.1 * MAX_IMAGE_WIDTH;
-float   heading_increment_degrees_setting     = 1;
-uint8_t locked_rotate_cooldown_frames_setting = 10;
-uint8_t locked_go_cooldown_frames_setting     = 40;
+float   heading_increment_degrees_setting     = 3;
+uint8_t locked_rotate_cooldown_frames_setting = 30;
+uint8_t locked_go_cooldown_frames_setting     = 30;
 float   obstacle_width_threshold  = 0.3f;
 uint8_t max_trajectory_confidence = 5;
 
@@ -138,6 +138,7 @@ static void ground_detection_callback(
     boundary_rows_f[i] = (float)in_br[i];
 
     // update for obstacle detection
+    total_obstacle_width = 0;
     for (uint8_t i = 0; i < in_oc; i++) {
       total_obstacle_width += in_obs[i].width + in_plants[i].width;
     }
@@ -192,9 +193,10 @@ void ground_obstacle_avoidance_periodic(void)
   best_col = motion_logic_normalised(obstacles, obstacle_count,
                                      plants, plant_count,
                                      boundary_rows_f, boundary_len, 
-                                     MAX_IMAGE_HEIGHT,
+                                     boundary_len, //  MAX_IMAGE_HEIGHT,
                                      DEFAULT_OBS_BIAS_FRAC,
                                      DEFAULT_PLANT_BIAS_FRAC);
+  best_col = best_col * MAX_IMAGE_WIDTH / boundary_len; // re scale
 
   // map pixel to ObjectiveLocation
   if (best_col < (MAX_IMAGE_WIDTH/2) - centerline_tolerance) {
@@ -210,19 +212,20 @@ void ground_obstacle_avoidance_periodic(void)
 
   // keep pooping obstacles every frame
   if (total_obstacle_width > obstacle_width_threshold) {
-      obstacle_found_countdown += 1;
-    }
+    obstacle_found_countdown += 1;
+  }
+
+  // obstacles > threshold for 5 consecutive frames
+  if (obstacle_found_countdown == 5 && nav_state != OUT_OF_BOUNDS) {
+    nav_state = OBSTACLE_FOUND;
+  } else {
+    obstacle_found_countdown -= 1;
+  }
 
   // state machine
   switch (nav_state) 
   {
   case ROTATE:
-
-    // obstacles > threshold for 5 consecutive frames
-    if (obstacle_found_countdown == 5) {
-      nav_state = OBSTACLE_FOUND;
-      break;
-    }
 
     if (locked_rotate_cooldown != 0) {
       locked_rotate_cooldown -= 1;
@@ -238,19 +241,13 @@ void ground_obstacle_avoidance_periodic(void)
   
   case GO:
 
-    // obstacles > threshold for 5 consecutive frames
-    if (obstacle_found_countdown == 5) {
-      nav_state = OBSTACLE_FOUND;
-      break;
-    }
-
     if (locked_go_cooldown == locked_go_cooldown_frames_setting - 1) {
       printf("=====================================\n");
     }
     // keep updating waypoint position every frame, 
     // because the drone computes its relative position
     // w.r.t . the waypoint to compute its speed.
-    moveWaypointForward(WP_TRAJECTORY, maxDistance);  
+    moveWaypointForward(WP_TRAJECTORY, 0.5 * maxDistance);  
 
     // check if out of bounds
     if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
@@ -276,23 +273,27 @@ void ground_obstacle_avoidance_periodic(void)
     waypoint_move_here_2d(WP_GOAL);
     waypoint_move_here_2d(WP_TRAJECTORY);
     printf("Obstacle found.\n");
+    if (obstacle_found_countdown < 2) {
     nav_state = ROTATE;
-    obstacle_found_countdown = 0;
+    locked_rotate_cooldown = locked_rotate_cooldown_frames_setting;
+    }
+    // obstacle_found_countdown = 0;
     break;
 
   case OUT_OF_BOUNDS:
-    increase_nav_heading(heading_increment);
-    moveWaypointForward(WP_TRAJECTORY, 1.5f);
+    printf("OUT OF BOUNDS.\n");
+    increase_nav_heading(3);
+    moveWaypointForward(WP_TRAJECTORY, 0.5 * maxDistance);
 
     if (InsideObstacleZone(WaypointX(WP_TRAJECTORY), WaypointY(WP_TRAJECTORY))) {
-        increase_nav_heading(heading_increment);
+        increase_nav_heading(3);
         nav_state = ROTATE;
+        locked_rotate_cooldown = 1.5 * locked_rotate_cooldown_frames_setting;
     }
     break;
     
   default: break;
   }
-
   return;
 }
 
