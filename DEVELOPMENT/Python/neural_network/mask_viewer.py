@@ -54,12 +54,15 @@ OPACITY_STEP    = 0.05
 
 # Strip analysis
 N_STRIPS    = 7
-BIEXP_EXP   = 0.7
+BIEXP_EXP   = 0.9
 STRIP_ALPHA = 0.18
 
 # Hole filler defaults
 HOLE_CLOSING_RADIUS = 0.04
 HOLE_MIN_AREA       = 200
+
+# Gate ground boost
+GATE_BOOST_FRACTION = 0.5   # fraction of strip height added as synthetic ground when gate is clear
 
 # Tree bounding-box padding tuning
 TREE_PAD_W_INIT          = 0
@@ -583,6 +586,99 @@ def carve_trees_from_ground(ground_mask, tree_mask, pad_w, pad_h, cluster_margin
     return result
 
 
+def apply_gate_boost(ground_rot, raw_ground_mask, gate_data,
+                     W_rot, H_rot, partitions, orig_shape):
+    """
+    Returns (boosted_ground_rot, gate_strip_idx or None, inner_rect or None).
+    inner_rect: (x0, y0, x1, y1) in original coords for visualisation.
+    Uses INNER edges of the two gate blobs to define the sampling region.
+    Boost is multiplicative: strips with zero real ground stay zero.
+    """
+    _, _, pair, mid = gate_data
+    if mid is None or pair is None:
+        return ground_rot, None, None
+
+    H_orig, W_orig = orig_shape
+    b1, b2 = pair
+
+    # Sort by y_min: b1 = top blob, b2 = bottom blob (original coords)
+    if b1['y_min'] > b2['y_min']:
+        b1, b2 = b2, b1
+
+    # Inner gap in Y (becomes left-right gap after CCW rotation)
+    inner_y0 = b1['y_max']   # bottom of top blob
+    inner_y1 = b2['y_min']   # top of bottom blob
+    if inner_y0 >= inner_y1:
+        inner_y0 = min(b1['y_min'], b2['y_min'])
+        inner_y1 = max(b1['y_max'], b2['y_max'])
+
+    # X span: overlap of both blobs
+    inner_x0 = max(b1['x_min'], b2['x_min'])
+    inner_x1 = min(b1['x_max'], b2['x_max'])
+    if inner_x0 >= inner_x1:
+        inner_x0 = min(b1['x_min'], b2['x_min'])
+        inner_x1 = max(b1['x_max'], b2['x_max'])
+
+    inner_x0  = max(0, min(inner_x0,  W_orig - 1))
+    inner_x1  = max(0, min(inner_x1,  W_orig - 1))
+    inner_y0  = max(0, min(inner_y0,  H_orig - 1))
+    inner_y1  = max(0, min(inner_y1,  H_orig - 1))
+
+    inner_rect = (inner_x0, inner_y0, inner_x1, inner_y1)
+
+    if inner_x0 >= inner_x1 or inner_y0 >= inner_y1:
+        return ground_rot, None, inner_rect
+
+    # ── Check for floating ground below/inside the gate rect ─────────────────
+    if raw_ground_mask is not None:
+        check_y0 = inner_y0
+        check_y1 = min(H_orig - 1, inner_y1 + (inner_y1 - inner_y0))
+        check_x0 = inner_x0
+        check_x1 = inner_x1
+
+        raw_region   = raw_ground_mask[check_y0:check_y1, check_x0:check_x1]
+        raw_px       = int((raw_region > 0).sum())
+        cleaned_mask = clean_ground_blobs(raw_ground_mask)
+        clean_region = cleaned_mask[check_y0:check_y1, check_x0:check_x1]
+        clean_px     = int((clean_region > 0).sum())
+        removed_px   = raw_px - clean_px
+        MIN_REMOVED  = 30
+
+        print(f'[GATE BOOST] check region raw={raw_px} clean={clean_px} removed={removed_px}')
+
+        if removed_px < MIN_REMOVED:
+            print(f'[GATE BOOST] not enough floating ground removed ({removed_px} < {MIN_REMOVED})')
+            return ground_rot, None, inner_rect
+    else:
+        print(f'[GATE BOOST] no raw ground mask — skipping float check, boosting anyway')
+
+    # Strip lookup in rotated coords
+    orig_x, orig_y = mid
+    rot_col = H_orig - 1 - orig_y
+    gate_strip = None
+    for si, (x0, x1) in enumerate(partitions):
+        if x0 <= rot_col < x1:
+            gate_strip = si
+            break
+    if gate_strip is None:
+        return ground_rot, None, inner_rect
+
+    sx0, sx1 = partitions[gate_strip]
+    print(f'[GATE BOOST] FIRING strip {gate_strip} cols ({sx0}-{sx1})')
+
+    # Create boosted mask — if ground_rot is None or has no ground in this strip,
+    # we create synthetic ground from scratch for the gate strip only
+    if ground_rot is not None:
+        boosted = ground_rot.copy()
+    else:
+        boosted = np.zeros((H_rot, W_rot), dtype=np.uint8)
+
+    # Unconditionally fill the entire gate strip — gate always wins
+    boosted[:, sx0:sx1] = 255
+
+    return boosted, gate_strip, inner_rect
+
+
 def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
     """
     Builds a side-by-side (line plot | bar chart) analysis panel.
@@ -751,7 +847,7 @@ def build_analysis_panel(ground_mask_rot, W_rot, H_rot, panel_w, panel_h):
 # FRAME BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_frame(img, ground_mask, pole_mask, tree_mask,
+def build_frame(img, ground_mask, raw_ground_mask, pole_mask, tree_mask,
                 gate_data,
                 show_ground, show_pole, show_tree, show_gate, opacity,
                 show_tree_bbox=False, tree_pad_w=0, tree_pad_h=0,
@@ -768,6 +864,41 @@ def build_frame(img, ground_mask, pole_mask, tree_mask,
     if show_gate:
         gate_mask, blobs, pair, mid = gate_data
         top = draw_gate_overlay(top, gate_mask, blobs, pair, mid, opacity)
+
+    # ── Visualise inner gate sampling region on original image ───────────────
+    # The image is rotated 90° CCW for display. In original coords the two gate
+    # blobs are stacked vertically (top/bottom), so the inner gap is a Y-gap.
+    _inner_rect = None
+    _, _, _pair_pre, _ = gate_data
+    if _pair_pre is not None:
+        _b1, _b2 = _pair_pre
+        # Sort by y_min: _b1 = top blob, _b2 = bottom blob (in original coords)
+        if _b1['y_min'] > _b2['y_min']:
+            _b1, _b2 = _b2, _b1
+        # Inner gap: from bottom of top blob to top of bottom blob
+        _iy0 = _b1['y_max']   # bottom edge of top blob
+        _iy1 = _b2['y_min']   # top edge of bottom blob
+        if _iy0 >= _iy1:      # blobs overlap vertically — use full span
+            _iy0 = min(_b1['y_min'], _b2['y_min'])
+            _iy1 = max(_b1['y_max'], _b2['y_max'])
+        # X span: the overlap of both blobs horizontally
+        _ix0 = max(_b1['x_min'], _b2['x_min'])
+        _ix1 = min(_b1['x_max'], _b2['x_max'])
+        if _ix0 >= _ix1:      # no x overlap — use full width span
+            _ix0 = min(_b1['x_min'], _b2['x_min'])
+            _ix1 = max(_b1['x_max'], _b2['x_max'])
+        _H, _W = img.shape[:2]
+        _ix0 = max(0, min(_ix0, _W-1));  _ix1 = max(0, min(_ix1, _W-1))
+        _iy0 = max(0, min(_iy0, _H-1));  _iy1 = max(0, min(_iy1, _H-1))
+        if _ix0 < _ix1 and _iy0 < _iy1:
+            _inner_rect = (_ix0, _iy0, _ix1, _iy1)
+
+    if _inner_rect is not None:
+        rx0, ry0, rx1, ry1 = _inner_rect
+        ov = top.copy()
+        cv2.rectangle(ov, (rx0, ry0), (rx1, ry1), (0, 0, 255), -1)
+        cv2.addWeighted(ov, 0.4, top, 0.6, 0, top)
+        cv2.rectangle(top, (rx0, ry0), (rx1, ry1), (0, 0, 255), 2)
 
     # ── Rotate 90° CCW ───────────────────────────────────────────────────────
     top_rot = cv2.rotate(top, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -834,21 +965,57 @@ def build_frame(img, ground_mask, pole_mask, tree_mask,
 
     # ── Analysis panel ────────────────────────────────────────────────────────
     analysis_h    = max(120, H_rot // 3)
+
+    # Apply gate boost to ground_rot before scoring
+    ground_rot_boosted, boost_strip, inner_rect = apply_gate_boost(
+        ground_rot, raw_ground_mask, gate_data,
+        W_rot, H_rot, partitions, img.shape[:2])
+
+    # Draw cyan GATE BOOST band and update rect to green if boost fired
+    if boost_strip is not None:
+        bsx0, bsx1 = partitions[boost_strip]
+        indicator = top_rot.copy()
+        cv2.rectangle(indicator, (bsx0, 0), (bsx1, H_rot), (255, 255, 0), -1)
+        cv2.addWeighted(indicator, 0.18, top_rot, 0.82, 0, top_rot)
+        cv2.line(top_rot, (bsx0, 0), (bsx0, H_rot), (255, 255, 0), 2)
+        cv2.line(top_rot, (bsx1, 0), (bsx1, H_rot), (255, 255, 0), 2)
+        cv2.putText(top_rot, 'GATE BOOST', (bsx0 + 4, H_rot // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+
     analysis_panel, best_idx, _ = build_analysis_panel(
-        ground_rot, W_rot, H_rot, W_rot, analysis_h)
+        ground_rot_boosted, W_rot, H_rot, W_rot, analysis_h)
 
     if analysis_panel.shape[1] != W_rot:
         analysis_panel = cv2.resize(analysis_panel,
                                     (W_rot, analysis_panel.shape[0]),
                                     interpolation=cv2.INTER_NEAREST)
 
-    # Highlight best strip on the rotated image (vertical band)
-    bx0, bx1 = partitions[best_idx]
-    highlight = top_rot.copy()
-    cv2.rectangle(highlight, (bx0, 0), (bx1, H_rot), BAR_BEST_COLOUR, -1)
-    cv2.addWeighted(highlight, 0.15, top_rot, 0.85, 0, top_rot)
-    cv2.line(top_rot, (bx0, 0), (bx0, H_rot), BAR_BEST_COLOUR, 2)
-    cv2.line(top_rot, (bx1, 0), (bx1, H_rot), BAR_BEST_COLOUR, 2)
+    # ── Spin detection: all strips red if max ground < 5% ────────────────────
+    if ground_rot_boosted is not None:
+        col_counts  = (ground_rot_boosted > 0).astype(np.int32).sum(axis=0).astype(float)
+        part_data   = partition_ground_counts(col_counts, partitions, H_rot)
+        max_pct     = max(pct for (_, pct) in part_data)
+    else:
+        max_pct = 0.0
+
+    must_spin = max_pct < 5.0
+
+    # Highlight best strip OR paint all strips red for spin
+    if must_spin:
+        red_overlay = top_rot.copy()
+        cv2.rectangle(red_overlay, (0, 0), (W_rot, H_rot), (0, 0, 200), -1)
+        cv2.addWeighted(red_overlay, 0.35, top_rot, 0.65, 0, top_rot)
+        cv2.putText(top_rot, 'TURN AROUND', (W_rot // 2 - 70, H_rot // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+        for si, (x0, x1) in enumerate(partitions):
+            cv2.line(top_rot, (x0, 0), (x0, H_rot), (0, 0, 255), 2)
+    else:
+        bx0, bx1 = partitions[best_idx]
+        highlight = top_rot.copy()
+        cv2.rectangle(highlight, (bx0, 0), (bx1, H_rot), BAR_BEST_COLOUR, -1)
+        cv2.addWeighted(highlight, 0.15, top_rot, 0.85, 0, top_rot)
+        cv2.line(top_rot, (bx0, 0), (bx0, H_rot), BAR_BEST_COLOUR, 2)
+        cv2.line(top_rot, (bx1, 0), (bx1, H_rot), BAR_BEST_COLOUR, 2)
 
     # ── Force all panels to identical width before stacking ──────────────────
     def _fix_w(arr, w):
@@ -910,58 +1077,61 @@ def main():
 
     while True:
         if needs_redraw:
-            path = image_paths[idx]
-            stem = os.path.splitext(os.path.basename(path))[0]
+            try:
+                path = image_paths[idx]
+                stem = os.path.splitext(os.path.basename(path))[0]
 
-            img         = cv2.imread(path)
-            ground_mask = load_mask(GROUND_MASK_DIR, stem, 'ground')
-            pole_mask   = load_mask(POLE_MASK_DIR,   stem, 'pole')
-            tree_mask   = load_mask(TREE_MASK_DIR,   stem, 'tree')
-            gate_data   = process_frame(img, gate_cfg)
+                img         = cv2.imread(path)
+                ground_mask = load_mask(GROUND_MASK_DIR, stem, 'ground')
+                pole_mask   = load_mask(POLE_MASK_DIR,   stem, 'pole')
+                tree_mask   = load_mask(TREE_MASK_DIR,   stem, 'tree')
+                gate_data   = process_frame(img, gate_cfg)
 
-            # Step 1 (always): remove all ground blobs not touching the seed band
-            display_ground = clean_ground_blobs(ground_mask)
-            # Step 2 (toggle 5): fill carpet-like holes in the cleaned mask
-            if show_fill:
-                display_ground = fill_ground_holes(display_ground,
-                                                   HOLE_CLOSING_RADIUS,
-                                                   HOLE_MIN_AREA)
-            # Step 3 (always): carve pole footprints out of ground last
-            display_ground = carve_poles_from_ground(display_ground, pole_mask)
-            # Step 4 (always): carve padded tree bounding boxes out of ground
-            # Must operate in rotated space to match the visual bbox coordinates
-            if tree_mask is not None and display_ground is not None:
-                tree_mask_rot    = cv2.rotate(tree_mask,    cv2.ROTATE_90_COUNTERCLOCKWISE)
-                ground_mask_rot  = cv2.rotate(display_ground, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                ground_mask_rot  = carve_trees_from_ground(ground_mask_rot, tree_mask_rot,
-                                                           tree_pad_w, tree_pad_h,
-                                                           tree_cluster_margin)
-                display_ground   = cv2.rotate(ground_mask_rot, cv2.ROTATE_90_CLOCKWISE)
+                # Step 1 (always): remove all ground blobs not touching the seed band
+                display_ground = clean_ground_blobs(ground_mask)
+                # Step 2 (toggle 5): fill carpet-like holes in the cleaned mask
+                if show_fill:
+                    display_ground = fill_ground_holes(display_ground,
+                                                       HOLE_CLOSING_RADIUS,
+                                                       HOLE_MIN_AREA)
+                # Step 3 (always): carve pole footprints out of ground last
+                display_ground = carve_poles_from_ground(display_ground, pole_mask)
+                # Step 4 (always): carve padded tree bounding boxes out of ground
+                if tree_mask is not None and display_ground is not None:
+                    tree_mask_rot   = cv2.rotate(tree_mask,       cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    ground_mask_rot = cv2.rotate(display_ground,  cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    ground_mask_rot = carve_trees_from_ground(ground_mask_rot, tree_mask_rot,
+                                                               tree_pad_w, tree_pad_h,
+                                                               tree_cluster_margin)
+                    display_ground  = cv2.rotate(ground_mask_rot, cv2.ROTATE_90_CLOCKWISE)
 
-            mid      = gate_data[3]
-            gate_str = f'GATE at {mid}' if mid is not None else 'no gate'
+                mid      = gate_data[3]
+                gate_str = f'GATE at {mid}' if mid is not None else 'no gate'
 
-            frame = build_frame(img, display_ground, pole_mask, tree_mask,
-                                gate_data,
-                                show_ground, show_pole, show_tree, show_gate,
-                                opacity,
-                                show_tree_bbox, tree_pad_w, tree_pad_h,
-                                TREE_MEAS_MODES[tree_meas_idx],
-                                tree_cluster_margin)
+                frame = build_frame(img, display_ground, ground_mask, pole_mask, tree_mask,
+                                    gate_data,
+                                    show_ground, show_pole, show_tree, show_gate,
+                                    opacity,
+                                    show_tree_bbox, tree_pad_w, tree_pad_h,
+                                    TREE_MEAS_MODES[tree_meas_idx],
+                                    tree_cluster_margin)
 
-            cv2.setWindowTitle(WINDOW,
-                f'[{idx+1}/{len(image_paths)}]  {stem}  |  {gate_str}  |  '
-                f'G={"ON" if show_ground else "off"}  '
-                f'P={"ON" if show_pole else "off"}  '
-                f'T={"ON" if show_tree else "off"}  '
-                f'Gate={"ON" if show_gate else "off"}  '
-                f'Fill={"ON" if show_fill else "off"}  '
-                f'TreeBox={"ON" if show_tree_bbox else "off"}'
-                + (f'  pw={tree_pad_w} ph={tree_pad_h} mg={tree_cluster_margin} [{TREE_MEAS_MODES[tree_meas_idx]}]'
-                   if show_tree_bbox else '') +
-                f'  opacity={opacity:.2f}')
-            cv2.imshow(WINDOW, frame)
-            needs_redraw = False
+                cv2.setWindowTitle(WINDOW,
+                    f'[{idx+1}/{len(image_paths)}]  {stem}  |  {gate_str}  |  '
+                    f'G={"ON" if show_ground else "off"}  '
+                    f'P={"ON" if show_pole else "off"}  '
+                    f'T={"ON" if show_tree else "off"}  '
+                    f'Gate={"ON" if show_gate else "off"}  '
+                    f'Fill={"ON" if show_fill else "off"}  '
+                    f'TreeBox={"ON" if show_tree_bbox else "off"}'
+                    + (f'  pw={tree_pad_w} ph={tree_pad_h} mg={tree_cluster_margin} [{TREE_MEAS_MODES[tree_meas_idx]}]'
+                       if show_tree_bbox else '') +
+                    f'  opacity={opacity:.2f}')
+                cv2.imshow(WINDOW, frame)
+            except Exception as e:
+                print(f'[ERROR] frame {idx} ({stem}): {e}')
+            finally:
+                needs_redraw = False
 
         key = cv2.waitKey(15)
 
