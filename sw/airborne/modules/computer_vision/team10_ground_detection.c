@@ -195,12 +195,14 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
 
     // RTP VISUALIZATION
     
-    draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
+    //draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
     draw_toolbar_vertical(img, img->w, img->h, result.gf, obstacle_count, local_obstacles);
     draw_safe_direction_bar(img, img->w, img->h,
                         obstacle_count, local_obstacles,
                         plant_count, local_plants,
                         ground_baseline);
+    draw_region_boundaries(img, img->w, img->h, obstacle_count, local_obstacles, REGION_OBSTACLE);
+    //draw_region_boundaries(img, img->w, img->h, plant_count,    local_plants,    REGION_PLANT);
     //draw_obstacle_detection_bar(img, img->w, img->h, obstacle_count, local_obstacles);
 
     return img;
