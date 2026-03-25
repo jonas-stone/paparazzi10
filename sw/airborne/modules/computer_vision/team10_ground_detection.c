@@ -189,13 +189,13 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
         printf("Plant    %d: start=%d width=%d\n", i, global_plants[i].start, global_plants[i].width);
     if (gate_detected)
         printf("Gate: detected  centre_x=%d px\n", gate_center_x);
-    else
-        printf("Gate: not detected\n");
+    // else
+        // printf("Gate: not detected\n");
     pthread_mutex_unlock(&mutex);
 
     // RTP VISUALIZATION
     
-    //draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
+    draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
     draw_toolbar_vertical(img, img->w, img->h, result.gf, obstacle_count, local_obstacles);
     draw_safe_direction_bar(img, img->w, img->h,
                         obstacle_count, local_obstacles,

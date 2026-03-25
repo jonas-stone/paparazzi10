@@ -139,7 +139,7 @@ static void ground_detection_callback(
 
     // update for obstacle detection
     for (uint8_t i = 0; i < in_oc; i++) {
-      total_obstacle_width += in_obs[i]->width + in_plants[i]->width;
+      total_obstacle_width += in_obs[i].width + in_plants[i].width;
     }
 }
 
@@ -148,7 +148,7 @@ int     gate_center_col;
 static void gate_detection_callback(
     uint8_t __attribute__((unused)) sender_id,
     uint8_t in_gate_detected,
-    int in_gate_center_x)
+    int     in_gate_center_x)
 {
     gate_seen = in_gate_detected;
     gate_center_col = (int16_t)in_gate_center_x;
@@ -236,8 +236,19 @@ void ground_obstacle_avoidance_periodic(void)
   case GO:
     if (locked_go_cooldown == locked_go_cooldown_frames_setting - 1) {
       printf("=====================================\n");
-      moveWaypointForward(WP_TRAJECTORY, maxDistance);
     }
+    // keep updating waypoint position every frame, 
+    // because the drone computes its relative position
+    // w.r.t . the waypoint to compute its speed.
+    moveWaypointForward(WP_TRAJECTORY, maxDistance);  
+
+    // check if out of bounds
+    if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
+      nav_state = OUT_OF_BOUNDS;
+    } else { // not OOB, actually move goal
+      moveWaypointForward(WP_GOAL, maxDistance);
+    }
+
     if (locked_go_cooldown != 0) { 
       locked_go_cooldown -= 1;
       printf("Going...\n");
@@ -261,7 +272,7 @@ void ground_obstacle_avoidance_periodic(void)
 
   case OUT_OF_BOUNDS:
     increase_nav_heading(heading_increment);
-    moveWaypointForward(WP_TRAJECTORY, 1.5f * maxDistance);
+    moveWaypointForward(WP_TRAJECTORY, 1.5f);
 
     if (InsideObstacleZone(WaypointX(WP_TRAJECTORY), WaypointY(WP_TRAJECTORY))) {
         increase_nav_heading(heading_increment);
