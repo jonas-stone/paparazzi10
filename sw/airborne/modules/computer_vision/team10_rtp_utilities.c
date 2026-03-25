@@ -177,3 +177,45 @@ void draw_safe_direction_bar(struct image_t *img, int w, int h,
         p[3] = 128;  /* Y1       */
     }
 }
+
+void draw_region_boundaries(struct image_t *img, int w, int h,
+                             uint8_t n, struct obstacle_region_t oo[],
+                             region_type_t type)
+{
+    uint8_t *src = (uint8_t *)img->buf;
+
+    // UYVY colour definitions: {U, Y, V, Y}
+    const uint8_t red[4]    = {85,  76,  255, 76 };
+    const uint8_t orange[4] = {44,  150, 212, 150};
+    const uint8_t green[4]  = {86,  150, 54,  150};
+    const uint8_t yellow[4] = {0,   210, 146, 210};
+
+    const uint8_t *inner = (type == REGION_OBSTACLE) ? red    : green;
+    const uint8_t *outer = (type == REGION_OBSTACLE) ? orange : yellow;
+    float          frac  = (type == REGION_OBSTACLE) ? DEFAULT_OBS_BIAS_FRAC : DEFAULT_PLANT_BIAS_FRAC;
+
+    for (int i = 0; i < n; i++) {
+        int bias            = normalised_bias(&oo[i], frac);
+        int col_left_outer  = (int)oo[i].start - bias;
+        int col_left_inner  = (int)oo[i].start;
+        int col_right_inner = (int)oo[i].start + (int)oo[i].width;
+        int col_right_outer = (int)oo[i].start + (int)oo[i].width + bias;
+
+        int            cols[4]   = {col_left_outer, col_left_inner,
+                                    col_right_inner, col_right_outer};
+        const uint8_t *colors[4] = {outer, inner, inner, outer};
+
+        for (int ci = 0; ci < 4; ci++) {
+            int y = cols[ci];   // era x, ora è y
+            if (y < 0 || y >= h) continue;
+
+            for (int x = 0; x < w; x += 2) {
+                uint8_t *p = &src[y * 2 * w + x * 2];
+                p[0] = colors[ci][0];
+                p[1] = colors[ci][1];
+                p[2] = colors[ci][2];
+                p[3] = colors[ci][3];
+            }
+        }
+    }
+}
