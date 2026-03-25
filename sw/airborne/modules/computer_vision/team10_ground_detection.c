@@ -183,14 +183,14 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     gate_detected         = (uint8_t)gate_result[0];
     gate_center_x         = gate_result[1];
     obstacles_updated     = true;
-    for (int i = 0; i < obstacle_count; i++)
-        printf("Obstacle %d: left=%d width=%d\n", i, global_obstacles[i].start, global_obstacles[i].width);
-    for (int i = 0; i < plant_count; i++)
-        printf("Plant    %d: start=%d width=%d\n", i, global_plants[i].start, global_plants[i].width);
-    if (gate_detected)
-        printf("Gate: detected  centre_x=%d px\n", gate_center_x);
+    // for (int i = 0; i < obstacle_count; i++)
+    //     printf("Obstacle %d: left=%d width=%d\n", i, global_obstacles[i].start, global_obstacles[i].width);
+    // for (int i = 0; i < plant_count; i++)
+    //     printf("Plant    %d: start=%d width=%d\n", i, global_plants[i].start, global_plants[i].width);
+    // if (gate_detected)
+    //     printf("Gate: detected  centre_x=%d px\n", gate_center_x);
     // else
-        // printf("Gate: not detected\n");
+    //     printf("Gate: not detected\n");
     pthread_mutex_unlock(&mutex);
 
     // RTP VISUALIZATION
