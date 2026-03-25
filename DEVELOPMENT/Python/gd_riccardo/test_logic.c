@@ -1,40 +1,58 @@
+/*
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 import time
 from enum import Enum
 from random import random, randint
+*/
 
-# general variable definition
-MAX_IMAGE_WIDTH = 520;
+// general variable definition
+#define MAX_IMAGE_WIDTH = 520;
 
+/*
 class NavigationState(Enum):
     GO = 1;
     ROTATE = 2;
     OUT_OF_BOUNDS = 3;
     OBSTACLE_FOUND = 4;
 
+
 class ObjectiveLocation(Enum):
     LEFT = 1;
     RIGHT = 2;
     CENTERLINE = 3;
+*/
 
-# set global variables
-locked_rotate_cooldown_setting_frames = 10;
-locked_rotate_cooldown = 0;
-locked_go_cooldown_setting_frames = 40;
-locked_go_cooldown = 0;
+enum NavigationState {
+  GO,
+  ROTATE,
+  OUT_OF_BOUNDS,
+  OBSTACLE_FOUND
+};
 
-centerline_tolerance = 0.1 * MAX_IMAGE_WIDTH;
-heading_increment = 1;   # degree
-waypoint_distance = 2.5; # meters
+enum ObjectiveLocation {
+  LEFT,
+  RIGHT,
+  CENTERLINE
+};
 
-# set static variables
-point_location = ObjectiveLocation.CENTERLINE;
-target_location = ObjectiveLocation.CENTERLINE;
+// set global variables
+uint8_t locked_rotate_cooldown_setting_frames = 10;
+uint8_t locked_rotate_cooldown = 0;
+uint8_t locked_go_cooldown_setting_frames = 40;
+uint8_t locked_go_cooldown = 0;
 
-# set nav state variable
-nav_state = NavigationState.ROTATE;
+uint8_t centerline_tolerance = 0.1 * MAX_IMAGE_WIDTH;
+uint8_t heading_increment = 1;      // degrees
+float   maxDistance = 2.5;    // meters
+
+// set static variables
+enum ObjectiveLocation point_location;
+enum ObjectiveLocation target_location;
+
+// set nav state variable
+enum NavigationState nav_state;
 
 def get_best_column():
     return (randint(0, 519), random())
@@ -51,7 +69,7 @@ def stop():
 def out_of_bounds_logic():
     print(f"OUT OF BOUNDS! setting state to {NavigationState.ROTATE}")
 
-def main():
+def autopilot_periodic() {
 
     global nav_state, locked_rotate_cooldown, locked_go_cooldown;
     global target_location, point_location;
@@ -107,16 +125,16 @@ def main():
                 target_location = point_location; 
                 print(f"GO Finished. New Target Locked: {target_location}");
 
-        # unimportant case
+        // unimportant case
         case NavigationState.OBSTACLE_FOUND:
             stop();
             nav_state = NavigationState.ROTATE;
 
-        # unimportant case
+        // unimportant case
         case NavigationState.OUT_OF_BOUNDS:
             stop();
             nav_state = NavigationState.ROTATE;
-    
+}    
 
 if __name__ == "__main__":
     
