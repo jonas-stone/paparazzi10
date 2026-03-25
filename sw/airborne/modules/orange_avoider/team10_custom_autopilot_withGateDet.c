@@ -50,7 +50,7 @@ static uint8_t chooseWiseIncrementAvoidance(int safe_col);
 static uint8_t chooseRandomIncrementAvoidance(void);
 static uint8_t chooseHeadingToGate(int gate_col);
 
-float speed_multiplier = 0.5f;
+float speed_multiplier = 0.4f;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  GATE APPROACH CONSTANTS
@@ -110,6 +110,7 @@ int16_t obstacle_free_confidence = 0;
  * Positive = clockwise, negative = counter-clockwise.  Set by
  * chooseWiseIncrementAvoidance based on which side the safe corridor is on.   */
 float heading_increment = 5.f;
+float heading_increment_setting = 5.f;
 
 /* Maximum distance the waypoint can be pushed forward in one step.            */
 float maxDistance = 2.25f;
@@ -148,26 +149,26 @@ uint16_t total_obstacle_width = 0;
 /* Fraction of image width that ground-touching obstacles must cover before the
  * confidence counter starts decrementing.  Lower values make the drone react
  * to smaller or more distant obstacles sooner.                                */
-float obstacle_width_threshold = 0.15f;
+float obstacle_width_threshold = 0.10f;
 
 /* Safety margin added on each side of a detected obstacle, expressed as a
  * fraction of that obstacle's own column width.  A wall that is 40 columns
  * wide with obs_bias_frac = 0.5 will have 20 extra columns erased on each
  * side before the safe corridor search runs.                                  */
-float obs_bias_frac = 0.50f;
+float obs_bias_frac = 0.65f;
 
 /* Same as obs_bias_frac but applied to detected plant pots.  Set higher than
  * obs_bias_frac because plant pots are physically narrow, so a fraction of
  * their width produces a small absolute margin — they need proportionally
  * more clearance to be safe.                                                  */
-float plant_bias_frac = 0.75f;
+float plant_bias_frac = 1.5f;
 
 /* Number of 10 Hz periodic ticks between WP_GOAL advances while in SAFE.
  * WP_TRAJECTORY still moves every tick as a lookahead probe for the bounds
  * check, but WP_GOAL — the target the flight controller actually chases —
  * advances at this slower rate so the drone has time to physically reach each
  * waypoint before the next one is set.                                        */
-int wp_update_period_ticks = 5;
+int wp_update_period_ticks = 2;
 
 /* Fraction of image height that a column's baseline value must be below for
  * that column to count as clear.  Higher = stricter — the drone demands a
@@ -540,10 +541,10 @@ uint8_t increase_nav_heading(float incrementDegrees)
 static uint8_t chooseHeadingToGate(int gate_col)
 {
     if (gate_col > MAX_IMAGE_WIDTH / 2) {
-        heading_increment = 5.f;
+        heading_increment = heading_increment_setting;
         VERBOSE_PRINT("Gate RIGHT: initial yaw +%.1f deg\n", heading_increment);
     } else if (gate_col < MAX_IMAGE_WIDTH / 2) {
-        heading_increment = -5.f;
+        heading_increment = -heading_increment_setting;
         VERBOSE_PRINT("Gate LEFT: initial yaw %.1f deg\n", heading_increment);
     }
     return false;
@@ -556,9 +557,9 @@ static uint8_t chooseHeadingToGate(int gate_col)
 uint8_t chooseWiseIncrementAvoidance(int safe_direction)
 {
     if (safe_direction > MAX_IMAGE_WIDTH / 2) {
-        heading_increment = 5.f;
+        heading_increment = heading_increment_setting;
     } else if (safe_direction < MAX_IMAGE_WIDTH / 2) {
-        heading_increment = -5.f;
+        heading_increment = -heading_increment_setting;
     }
     VERBOSE_PRINT("Safe col=%d  heading_increment=%.1f\n", safe_direction, heading_increment);
     return false;
@@ -580,6 +581,7 @@ uint8_t chooseRandomIncrementAvoidance(void)
 /* Pushes a waypoint distanceMeters ahead of the current position and heading. */
 uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
 {
+    distanceMeters = distanceMeters * speed_multiplier;
     struct EnuCoor_i new_coor;
     calculateForwards(&new_coor, distanceMeters);
     moveWaypoint(waypoint, &new_coor);

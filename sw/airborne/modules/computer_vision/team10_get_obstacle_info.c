@@ -795,7 +795,7 @@ static void gate_make_blue_mask(const struct image_t *img, uint8_t *out_mask)
        reuse gate_eroded as scratch.  We implement erode/dilate as a
        simple box majority-vote (threshold = kernel_area, i.e. ALL pixels
        must be set for erode, ANY pixel for dilate). */
-    int k = 5, half = 2;
+    int k = 3, half = 2;
 
     /* erode: all 5×5 neighbours must be set */
     memset(gate_eroded, 0, total);

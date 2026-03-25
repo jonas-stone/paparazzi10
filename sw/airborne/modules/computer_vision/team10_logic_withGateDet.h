@@ -8,8 +8,8 @@
 /* ── Legacy bias defaults (kept for callers that still use fixed values) ──── */
 #define DEFAULT_OBS_BIAS         50
 #define DEFAULT_PLANT_BIAS       70
-#define DEFAULT_OBS_BIAS_FRAC    0.05f
-#define DEFAULT_PLANT_BIAS_FRAC  0.1f
+#define DEFAULT_OBS_BIAS_FRAC    0.065f
+#define DEFAULT_PLANT_BIAS_FRAC  0.15f
 
 /* ── Function declarations ────────────────────────────────────────────────── */
 

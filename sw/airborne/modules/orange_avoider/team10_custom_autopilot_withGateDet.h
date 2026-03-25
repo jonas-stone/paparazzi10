@@ -21,6 +21,7 @@ extern float    maxDistance;               /* max waypoint displacement [m], def
 extern float    speed_multiplier;          /* overall speed multiplier, default 0.5   */
 extern float    clear_frac;               /* corridor clear threshold, default 0.90  */
 extern int      min_corridor_width_px;    /* minimum passable corridor (px), default 60 */
+extern float    heading_increment_setting;
 
 /* ── Module entry points ──────────────────────────────────────────────────── */
 extern void ground_obstacle_avoidance_init(void);
