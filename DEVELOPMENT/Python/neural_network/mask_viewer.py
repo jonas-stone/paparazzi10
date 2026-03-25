@@ -53,9 +53,12 @@ INITIAL_OPACITY = 0.5
 OPACITY_STEP    = 0.05
 
 # Strip analysis
-N_STRIPS    = 7
-BIEXP_EXP   = 0.9
-STRIP_ALPHA = 0.18
+N_STRIPS              = 5
+BIEXP_EXP             = 0.9
+STRIP_ALPHA           = 0.18
+
+# Strip blocking — obstacle must penetrate fully through ground in a strip
+BLOCK_MIN_WIDTH_FRAC  = 0.05   # obstacle must cover >1% of strip width to block it
 
 # Hole filler defaults
 HOLE_CLOSING_RADIUS = 0.04
@@ -152,7 +155,7 @@ class Config:
     display_scale: float = 1.5
     num_preview:  int  = 16
     save_figure:  bool = True
-    save_path:    str  = 'results_figures/gate_detection_results.png'
+    save_path:    str  = 'gate_detection_results.png'
 
 
 def blue_mask(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:
@@ -424,6 +427,62 @@ def carve_poles_from_ground(ground_mask, pole_mask):
     return result
 
 
+def get_blocked_strips(ground_orig, ground_rot, partitions, W_rot, H_rot,
+                       boost_strip_idx=None, gate_pair=None, orig_shape=None):
+    """
+    A strip is BLOCKED if more than BLOCK_MIN_WIDTH_FRAC of its columns
+    (in rotated space) have zero ground pixels.
+
+    We check ground_rot (the rotated processed mask) column by column.
+    Gate strips are exempt. Gate blob column range is also exempt.
+    """
+    blocked = set()
+    if ground_rot is None:
+        return blocked
+
+    # Per-column ground presence in rotated space
+    col_has_ground = (ground_rot > 0).any(axis=0)  # (W_rot,) bool
+
+    # Gate-exempt column range in rotated space
+    gate_exempt_x0 = None
+    gate_exempt_x1 = None
+    if gate_pair is not None and orig_shape is not None:
+        b1, b2 = gate_pair
+        H_orig = orig_shape[0]
+        all_orig_y = [b1['y_min'], b1['y_max'], b2['y_min'], b2['y_max']]
+        rot_xs = [H_orig - 1 - y for y in all_orig_y]
+        gate_exempt_x0 = max(0,       min(rot_xs))
+        gate_exempt_x1 = min(W_rot-1, max(rot_xs))
+
+    for si, (x0, x1) in enumerate(partitions):
+        if si == boost_strip_idx:
+            continue
+        strip_w = x1 - x0
+        if strip_w <= 0:
+            continue
+
+        check_cols = np.ones(strip_w, dtype=bool)
+        if gate_exempt_x0 is not None:
+            lx0 = max(0,       gate_exempt_x0 - x0)
+            lx1 = min(strip_w, gate_exempt_x1 - x0 + 1)
+            if lx0 < lx1:
+                check_cols[lx0:lx1] = False
+
+        n_checked = check_cols.sum()
+        if n_checked == 0:
+            continue
+
+        strip_ground = col_has_ground[x0:x1]
+        empty_cols   = (~strip_ground[check_cols]).sum()
+        empty_frac   = empty_cols / n_checked
+        print(f'  strip{si+1} cols[{x0}:{x1}] empty={int(empty_cols)}/{int(n_checked)} frac={empty_frac*100:.1f}%')
+
+        if empty_frac > BLOCK_MIN_WIDTH_FRAC:
+            blocked.add(si)
+
+    return blocked
+
+
 def get_tree_bboxes(tree_mask, pad_w=0, pad_h=0, cluster_margin=10):
     """
     Clusters nearby tree blobs with two passes:
@@ -570,18 +629,21 @@ def draw_tree_bboxes(image, tree_mask, pad_w, pad_h, meas_mode, cluster_margin):
 def carve_trees_from_ground(ground_mask, tree_mask, pad_w, pad_h, cluster_margin):
     """
     Carves the padded tree bounding boxes out of the ground mask.
-    Uses the same clustering and padding logic as the visual overlay so
-    the carved region exactly matches what is shown on screen.
+    Extends the carve a small amount below the bbox bottom to remove
+    the thin root-line artifact left by ground segmentation.
     """
     if ground_mask is None or tree_mask is None:
         return ground_mask
 
+    H, W   = ground_mask.shape
+    ROOT_EXTRA = 2   # extra pixels below bbox to catch the root line
     boxes  = get_tree_bboxes(tree_mask, pad_w, pad_h, cluster_margin)
     result = ground_mask.copy()
 
     for b in boxes:
         px, py, pw, ph = b['padded']
-        result[py:py + ph, px:px + pw] = 0
+        carve_to = min(H, py + ph + ROOT_EXTRA)
+        result[py:carve_to, px:px + pw] = 0
 
     return result
 
@@ -990,17 +1052,39 @@ def build_frame(img, ground_mask, raw_ground_mask, pole_mask, tree_mask,
                                     (W_rot, analysis_panel.shape[0]),
                                     interpolation=cv2.INTER_NEAREST)
 
-    # ── Spin detection: all strips red if max ground < 5% ────────────────────
+    blocked_strips = get_blocked_strips(
+        ground_mask, ground_rot, partitions, W_rot, H_rot,
+        boost_strip_idx=boost_strip,
+        gate_pair=gate_data[2],
+        orig_shape=img.shape[:2])
+
+    # Draw red overlay on each blocked strip
+    for si in blocked_strips:
+        bkx0, bkx1 = partitions[si]
+        red_ov = top_rot.copy()
+        cv2.rectangle(red_ov, (bkx0, 0), (bkx1, H_rot), (0, 0, 180), -1)
+        cv2.addWeighted(red_ov, 0.35, top_rot, 0.65, 0, top_rot)
+        cv2.line(top_rot, (bkx0, 0), (bkx0, H_rot), (0, 0, 255), 2)
+        cv2.line(top_rot, (bkx1, 0), (bkx1, H_rot), (0, 0, 255), 2)
+        mid_x = (bkx0 + bkx1) // 2
+        cv2.putText(top_rot, 'X', (mid_x - 8, H_rot // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+    # ── Spin detection & best strip (excluding blocked strips) ────────────────
     if ground_rot_boosted is not None:
-        col_counts  = (ground_rot_boosted > 0).astype(np.int32).sum(axis=0).astype(float)
-        part_data   = partition_ground_counts(col_counts, partitions, H_rot)
-        max_pct     = max(pct for (_, pct) in part_data)
+        col_counts = (ground_rot_boosted > 0).astype(np.int32).sum(axis=0).astype(float)
+        part_data  = partition_ground_counts(col_counts, partitions, H_rot)
     else:
-        max_pct = 0.0
+        part_data  = [(0, 0.0)] * N_STRIPS
 
+    # Zero out blocked strips for selection
+    scores    = [pct if si not in blocked_strips else -1.0
+                 for si, (_, pct) in enumerate(part_data)]
+    available = [s for s in scores if s >= 0.0]
+    max_pct   = max(available) if available else 0.0
     must_spin = max_pct < 5.0
+    best_idx  = int(np.argmax(scores)) if not must_spin else 0
 
-    # Highlight best strip OR paint all strips red for spin
     if must_spin:
         red_overlay = top_rot.copy()
         cv2.rectangle(red_overlay, (0, 0), (W_rot, H_rot), (0, 0, 200), -1)
@@ -1100,9 +1184,12 @@ def main():
                 if tree_mask is not None and display_ground is not None:
                     tree_mask_rot   = cv2.rotate(tree_mask,       cv2.ROTATE_90_COUNTERCLOCKWISE)
                     ground_mask_rot = cv2.rotate(display_ground,  cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    before_px = int((ground_mask_rot > 0).sum())
                     ground_mask_rot = carve_trees_from_ground(ground_mask_rot, tree_mask_rot,
                                                                tree_pad_w, tree_pad_h,
                                                                tree_cluster_margin)
+                    after_px = int((ground_mask_rot > 0).sum())
+                    print(f'[TREE CARVE] removed {before_px - after_px} px  (before={before_px} after={after_px})')
                     display_ground  = cv2.rotate(ground_mask_rot, cv2.ROTATE_90_CLOCKWISE)
 
                 mid      = gate_data[3]
