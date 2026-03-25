@@ -42,7 +42,7 @@ static pthread_mutex_t mutex;
 /* ── Downscale settings ───────────────────────────────────────────────────── */
 /* Scale factor as fraction: 4/5 = 0.8×                                      */
 /* Bebop2 camera: 240×520 → scaled: 192×416                                  */
-#define SCALE_NUM  5
+#define SCALE_NUM  2
 #define SCALE_DEN  5
 
 #define MAX_SCALED_W  ((MAX_IMAGE_WIDTH  * SCALE_NUM / SCALE_DEN) + 2)
