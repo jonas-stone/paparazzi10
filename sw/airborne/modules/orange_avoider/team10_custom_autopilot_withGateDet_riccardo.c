@@ -35,7 +35,7 @@
 // flight plan inclusions
 #include "generated/flight_plan.h"
 
-#define ORANGE_AVOIDER_VERBOSE TRUE
+#define ORANGE_AVOIDER_VERBOSE FALSE
 
 #define PRINT(string,...) fprintf(stderr, "[orange_avoider->%s()] " string,__FUNCTION__ , ##__VA_ARGS__)
 #if ORANGE_AVOIDER_VERBOSE
@@ -44,104 +44,66 @@
 #define VERBOSE_PRINT(...)
 #endif
 
+static uint8_t moveWaypointToImageColumn(uint8_t waypoint, int image_col, float forward_distance, float lateral_range_m);
 static uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters);
 static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters);
 static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
 static uint8_t increase_nav_heading(float incrementDegrees);
 static uint8_t chooseRandomIncrementAvoidance(void);
 static uint8_t chooseWiseIncrementAvoidance(int safe_col);
-float speed_multiplier = 1.0f;
 
 #ifndef TEAM10_GATE_DETECTION_ID
 #define TEAM10_GATE_DETECTION_ID ABI_BROADCAST
 #endif
 
-static abi_event gate_detection_ev;
-static uint8_t gate_seen = 0;
-static int16_t gate_center_col = 0;
+#ifndef TEAM10_GROUND_DETECTION_ID
+#define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
+#endif
 
-static void gate_detection_callback(
-    uint8_t __attribute__((unused)) sender_id,
-    uint8_t in_gate_detected,
-    int in_gate_center_x);
-
-static uint8_t moveWaypointToImageColumn(uint8_t waypoint,
-                                         int image_col,
-                                         float forward_distance,
-                                         float lateral_range_m);
-static float clampf_local(float v, float lo, float hi)
-{
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
-static uint8_t moveWaypointToImageColumn(uint8_t waypoint,
-                                         int image_col,
-                                         float forward_distance,
-                                         float lateral_range_m)
-{
-  struct EnuCoor_i new_coor;
-  float heading = stateGetNedToBodyEulers_f()->psi;
-  float image_center = MAX_IMAGE_WIDTH / 2.0f;
-
-  float normalized = ((float)image_col - image_center) / image_center;
-  normalized = clampf_local(normalized, -1.0f, 1.0f);
-
-  float lateral = normalized * lateral_range_m;
-  float forward = forward_distance;
-
-  float dx = sinf(heading) * forward + cosf(heading) * lateral;
-  float dy = cosf(heading) * forward - sinf(heading) * lateral;
-
-  new_coor.x = stateGetPositionEnu_i()->x + POS_BFP_OF_REAL(dx);
-  new_coor.y = stateGetPositionEnu_i()->y + POS_BFP_OF_REAL(dy);
-
-  moveWaypoint(waypoint, &new_coor);
-  return false;
-}
-
-enum navigation_state_t {
-  SAFE,
+enum NavigationState {
+  GO,
+  ROTATE,
   OBSTACLE_FOUND,
-  SEARCH_FOR_SAFE_HEADING,
   OUT_OF_BOUNDS
 };
 
-enum objective_location_t {
-  RIGHT_OF_CENTERLINE,
-  LEFT_OF_CENTERLINE,
+enum ObjectiveLocation {
+  LEFT,
+  RIGHT,
   CENTERLINE
 };
 
-// define and initialise global variables
-enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
-int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
-float setting_heading_increment = 5.f;  // to be changed inside the settings in PAPARAZZI
-float heading_increment = 5.f;          // heading angle increment [deg]
-float maxDistance = 2.25;               // max waypoint displacement [m]
-
-// define script-level variables
+// obstacle global variables
 static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];
 static struct obstacle_region_t plants[MAX_PLANT_REGIONS];
-static int16_t                  boundary_rows[MAX_IMAGE_HEIGHT];
-static float boundary_rows_f[MAX_IMAGE_HEIGHT];
-static uint8_t                  obstacle_count = 0;
-static uint8_t                  plant_count    = 0;
-static uint16_t                 boundary_len   = 0;
-uint16_t  total_obstacle_width  = 0;
+static uint16_t boundary_rows[MAX_IMAGE_HEIGHT];
+static float    boundary_rows_f[MAX_IMAGE_HEIGHT];
+static uint8_t  obstacle_count = 0;
+static uint8_t  plant_count    = 0;
+static uint16_t boundary_len   = 0;
+uint16_t total_obstacle_width  = 0;
+int safe_col;
 
-// declare counter here -> the const. variable will be a slider
-uint8_t locked_state_cooldown_frames = 10;
-float   centerline_tolerance = 0.05;
-static uint8_t locked_state_cooldown = 0;
-static enum objective_location_t point_location = CENTERLINE;
-static enum objective_location_t target_location = CENTERLINE;
+// navigation global variables
+static enum ObjectiveLocation point_location;
+static enum ObjectiveLocation target_location;
+static enum NavigationState   nav_state;
+float  heading_increment;      // degrees
 
-// define threshold settings -> lower, drone is more scared
-float obstacle_width_threshold = 0.2f;
+// settings
+float   speed_multiplier     = 1;
+float   maxDistance          = 2.5;    // meters
+uint8_t centerline_tolerance = 0.1 * MAX_IMAGE_WIDTH;
+float   heading_increment_degrees_setting     = 1;
+uint8_t locked_rotate_cooldown_frames_setting = 10;
+uint8_t locked_go_cooldown_frames_setting     = 40;
+float   obstacle_width_threshold  = 0.3f;
+uint8_t max_trajectory_confidence = 5;
 
-const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
+// counters
+uint8_t locked_rotate_cooldown;
+uint8_t locked_go_cooldown;
+uint8_t obstacle_found_countdown;
 
 /*
  * This next section defines an ABI messaging event (http://wiki.paparazziuav.org/wiki/ABI), necessary
@@ -150,12 +112,10 @@ const int16_t max_trajectory_confidence = 5; // number of consecutive negative o
  * in different threads. The ABI event is triggered every time new data is sent out, and as such the function
  * defined in this file does not need to be explicitly called, only bound in the init function
  */
-#ifndef TEAM10_GROUND_DETECTION_ID
-#define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
-#endif
 
 // ABI event declaration (used to bind to callback function)
 static abi_event ground_detection_ev;
+static abi_event gate_detection_ev;
 
 // ABI video callback function, gets the data from the computer vision code
 static void ground_detection_callback(
@@ -176,8 +136,15 @@ static void ground_detection_callback(
 
     for (uint16_t i = 0; i < boundary_len; i++)
     boundary_rows_f[i] = (float)in_br[i];
+
+    // update for obstacle detection
+    for (uint8_t i = 0; i < in_oc; i++) {
+      total_obstacle_width += in_obs[i]->width + in_plants[i]->width;
+    }
 }
 
+uint8_t gate_seen;
+int     gate_center_col;
 static void gate_detection_callback(
     uint8_t __attribute__((unused)) sender_id,
     uint8_t in_gate_detected,
@@ -187,32 +154,32 @@ static void gate_detection_callback(
     gate_center_col = (int16_t)in_gate_center_x;
 }
 
-/*
- * Initialisation function, random seed and heading_increment
- */
+/* Initialization Function */
 void ground_obstacle_avoidance_init(void) {
-  srand(time(NULL));
 
-  int safe_col = motion_logic_normalised(obstacles, obstacle_count,
-                                         plants, plant_count,
-                                         boundary_rows_f,
-                                         boundary_len, MAX_IMAGE_HEIGHT,
-                                         DEFAULT_OBS_BIAS_FRAC,
-                                         DEFAULT_PLANT_BIAS_FRAC);
-  chooseWiseIncrementAvoidance(safe_col);
+  // initialize locations + nav. state
+  nav_state       = ROTATE;
+  target_location = RIGHT;
+  point_location  = CENTERLINE;
 
-  AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID,
-                                    &ground_detection_ev,
-                                    ground_detection_callback);
+  // initialize necessary obstacle variables
+  total_obstacle_width = 0;
+  obstacle_found_countdown = 0; 
 
-  AbiBindMsgTEAM10_GATE_DETECTION(TEAM10_GATE_DETECTION_ID,
-                                  &gate_detection_ev,
-                                  gate_detection_callback);
+  // srand(time(NULL));
+  // int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+  //                                        plants, plant_count,
+  //                                        boundary_rows_f, boundary_len, 
+  //                                        MAX_IMAGE_HEIGHT,
+  //                                        DEFAULT_OBS_BIAS_FRAC,
+  //                                        DEFAULT_PLANT_BIAS_FRAC);
+  // chooseWiseIncrementAvoidance(safe_col);
+
+  AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, &ground_detection_ev, ground_detection_callback);
+  AbiBindMsgTEAM10_GATE_DETECTION(TEAM10_GATE_DETECTION_ID, &gate_detection_ev, gate_detection_callback);
 }
 
-/*
- * Function that checks it is safe to move forwards, and then moves a waypoint forward or changes the heading
- */
+
 void ground_obstacle_avoidance_periodic(void)
 {
   // only evaluate our state machine if we are flying
@@ -220,116 +187,95 @@ void ground_obstacle_avoidance_periodic(void)
     return;
   }
 
-  // print stuff to terminal
-  printf("total obstacle width: %.2f\nthreshold (fraction): %.2f\nthreshold (total):    %.2f\n",
-       total_obstacle_width / (float)MAX_IMAGE_WIDTH,
-       obstacle_width_threshold,
-       obstacle_width_threshold * MAX_IMAGE_WIDTH);
+  int   best_col;
+  float confidence;
+  best_col = motion_logic_normalised(obstacles, obstacle_count,
+                                     plants, plant_count,
+                                     boundary_rows_f, boundary_len, 
+                                     MAX_IMAGE_HEIGHT,
+                                     DEFAULT_OBS_BIAS_FRAC,
+                                     DEFAULT_PLANT_BIAS_FRAC);
 
-  // update our confidence level
-  if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
-    obstacle_free_confidence++;
+  // map pixel to ObjectiveLocation
+  if (best_col < (MAX_IMAGE_WIDTH/2) - centerline_tolerance) {
+    point_location    = LEFT;
+    heading_increment = -heading_increment_degrees_setting;
+  } else if (best_col > (MAX_IMAGE_WIDTH/2) + centerline_tolerance) {
+    point_location    = RIGHT;
+    heading_increment = +heading_increment_degrees_setting;
   } else {
-    obstacle_free_confidence -= 2;
+    point_location    = CENTERLINE;
+    heading_increment = +heading_increment_degrees_setting; // dummy setting
   }
 
-  // every frame decrease counter
-  if (locked_state_cooldown != 0) {
-    locked_state_cooldown -= 1;
+  if (total_obstacle_width > obstacle_width_threshold) {
+      obstacle_found_countdown += 1;
+    }
+
+  // obstacles > threshold for 5 consecutive frames
+  if (obstacle_found_countdown == 5) {
+    nav_state = OBSTACLE_FOUND;
   }
-
-  // bound obstacle_free_confidence
-  Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
-  float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
-
-  switch (navigation_state){
-    case SAFE:
-      // Move waypoint forward
-      moveWaypointForward(WP_TRAJECTORY, 1.5f * moveDistance);
-      if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
-        navigation_state = OUT_OF_BOUNDS;
-      } else if (obstacle_free_confidence == 0){
-        navigation_state = OBSTACLE_FOUND;
-      } else {
-        moveWaypointForward(WP_GOAL, moveDistance);
-      }
+  
+  // state machine
+  switch (nav_state) 
+  {
+  case ROTATE:
+    if (locked_rotate_cooldown != 0) {
+      locked_rotate_cooldown -= 1;
+      increase_nav_heading(heading_increment);
+    }
+    if (point_location == CENTERLINE) {
+      nav_state = GO;
+      locked_go_cooldown = locked_go_cooldown_frames_setting;
+    } else {
+      increase_nav_heading(heading_increment);
+    }
+    break;
+  
+  case GO:
+    if (locked_go_cooldown == locked_go_cooldown_frames_setting - 1) {
+      printf("=====================================\n");
+      moveWaypointForward(WP_TRAJECTORY, maxDistance);
+    }
+    if (locked_go_cooldown != 0) { 
+      locked_go_cooldown -= 1;
+      printf("Going...\n");
       break;
-
-    case OBSTACLE_FOUND:
-      // stop
-      waypoint_move_here_2d(WP_GOAL);
-      waypoint_move_here_2d(WP_TRAJECTORY);
-
-      // logically select new search direction if not on cooldown
-      int safe_col = MAX_IMAGE_WIDTH / 2;
-      if (locked_state_cooldown == 0) {
-        int safe_col = motion_logic_normalised(obstacles, obstacle_count,
-                                                plants, plant_count,
-                                                boundary_rows_f,
-                                                boundary_len, MAX_IMAGE_HEIGHT,
-                                                DEFAULT_OBS_BIAS_FRAC,
-                                                DEFAULT_PLANT_BIAS_FRAC);
-      }
-
-      // assign objective location -> rotation direction
-      if (safe_col / (float)MAX_IMAGE_WIDTH < 0.5f - centerline_tolerance) {
-        point_location = LEFT_OF_CENTERLINE;
-      } else if (safe_col / (float)MAX_IMAGE_WIDTH > 0.5f + centerline_tolerance) {
-        point_location = RIGHT_OF_CENTERLINE;
-      }
-
-      chooseWiseIncrementAvoidance(safe_col);
-      navigation_state = SEARCH_FOR_SAFE_HEADING;
-      locked_state_cooldown = locked_state_cooldown_frames;
-      break;
-
-    case SEARCH_FOR_SAFE_HEADING:
-
-    // re-evaluate safe direction each frame
-    int current_safe_col = motion_logic_normalised(obstacles, obstacle_count,
-                                                   plants, plant_count,
-                                                   boundary_rows_f,
-                                                   boundary_len, MAX_IMAGE_HEIGHT,
-                                                   DEFAULT_OBS_BIAS_FRAC,
-                                                   DEFAULT_PLANT_BIAS_FRAC);
-
-    float col_frac = current_safe_col / (float)MAX_IMAGE_WIDTH;
-
-    // Check if safe column is now near center, after being released from cooldown
-    if (locked_state_cooldown == 0 &&
-        col_frac >= 0.5f - centerline_tolerance && 
-        col_frac <= 0.5f + centerline_tolerance) {
-      target_location = CENTERLINE;
-      obstacle_free_confidence = 0;
-      navigation_state = SAFE;
-    } else increase_nav_heading(heading_increment);
+    }
+    if (locked_go_cooldown == 0) {
+      nav_state = ROTATE;
+      locked_rotate_cooldown = locked_rotate_cooldown_frames_setting;
+      target_location = point_location;
+      printf("GO finished. Setting new target.\n");
+    }
+    break;
+  
+  case OBSTACLE_FOUND:
+    waypoint_move_here_2d(WP_GOAL);
+    waypoint_move_here_2d(WP_TRAJECTORY);
+    printf("Obstacle found.\n");
+    nav_state = ROTATE;
+    obstacle_found_countdown = 0;
     break;
 
-    case OUT_OF_BOUNDS:
-      increase_nav_heading(heading_increment);
-      moveWaypointForward(WP_TRAJECTORY, 1.5f);
+  case OUT_OF_BOUNDS:
+    increase_nav_heading(heading_increment);
+    moveWaypointForward(WP_TRAJECTORY, 1.5f * maxDistance);
 
-      if (InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
-        // add offset to head back into arena
+    if (InsideObstacleZone(WaypointX(WP_TRAJECTORY), WaypointY(WP_TRAJECTORY))) {
         increase_nav_heading(heading_increment);
-
-        // reset safe counter
-        obstacle_free_confidence = 0;
-
-        // ensure direction is safe before continuing
-        navigation_state = SEARCH_FOR_SAFE_HEADING;
-      }
-      break;
-
-    default:
-      break;
+        nav_state = ROTATE;
+    }
+    break;
+    
+  default: break;
   }
+
   return;
 }
 
-/*
- * Increases the NAV heading. Assumes heading is an INT32_ANGLE. It is bound in this function.
- */
+/* Increases the NAV heading. Assumes heading is an INT32_ANGLE. It is bound in this function. */
 uint8_t increase_nav_heading(float incrementDegrees)
 {
   float new_heading = stateGetNedToBodyEulers_f()->psi + RadOfDeg(incrementDegrees);
@@ -344,9 +290,7 @@ uint8_t increase_nav_heading(float incrementDegrees)
   return false;
 }
 
-/*
- * Calculates coordinates of distance forward and sets waypoint 'waypoint' to those coordinates
- */
+/* Calculates coordinates of distance forward and sets waypoint 'waypoint' to those coordinates */
 uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
 {
   struct EnuCoor_i new_coor;
@@ -355,9 +299,7 @@ uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
   return false;
 }
 
-/*
- * Calculates coordinates of a distance of 'distanceMeters' forward w.r.t. current position and heading
- */
+/* Calculates coordinates of a distance of 'distanceMeters' forward w.r.t. current position and heading */
 uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
 {
   float heading  = stateGetNedToBodyEulers_f()->psi;
@@ -371,9 +313,7 @@ uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
   return false;
 }
 
-/*
- * Sets waypoint 'waypoint' to the coordinates of 'new_coor'
- */
+/* Sets waypoint 'waypoint' to the coordinates of 'new_coor' */
 uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
 {
   VERBOSE_PRINT("Moving waypoint %d to x:%f y:%f\n", waypoint, POS_FLOAT_OF_BFP(new_coor->x),
@@ -382,9 +322,7 @@ uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
   return false;
 }
 
-/*
- * Sets the variable 'heading_increment' randomly positive/negative
- */
+/* Sets the variable 'heading_increment' randomly positive/negative */
 uint8_t chooseRandomIncrementAvoidance(void)
 {
   // Randomly choose CW or CCW avoiding direction
@@ -400,7 +338,6 @@ uint8_t chooseRandomIncrementAvoidance(void)
 
 uint8_t chooseWiseIncrementAvoidance(int safe_direction)
 {
-  
   if (safe_direction > MAX_IMAGE_WIDTH / 2) {
     heading_increment = 5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
@@ -408,5 +345,32 @@ uint8_t chooseWiseIncrementAvoidance(int safe_direction)
     heading_increment = -5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
   }
+  return false;
+}
+
+static float clampf_local(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static uint8_t moveWaypointToImageColumn(uint8_t waypoint, int image_col, float forward_distance, float lateral_range_m) {
+  struct EnuCoor_i new_coor;
+  float heading = stateGetNedToBodyEulers_f()->psi;
+  float image_center = MAX_IMAGE_WIDTH / 2.0f;
+
+  float normalized = ((float)image_col - image_center) / image_center;
+  normalized = clampf_local(normalized, -1.0f, 1.0f);
+
+  float lateral = normalized * lateral_range_m;
+  float forward = forward_distance;
+
+  float dx = sinf(heading) * forward + cosf(heading) * lateral;
+  float dy = cosf(heading) * forward - sinf(heading) * lateral;
+
+  new_coor.x = stateGetPositionEnu_i()->x + POS_BFP_OF_REAL(dx);
+  new_coor.y = stateGetPositionEnu_i()->y + POS_BFP_OF_REAL(dy);
+
+  moveWaypoint(waypoint, &new_coor);
   return false;
 }
