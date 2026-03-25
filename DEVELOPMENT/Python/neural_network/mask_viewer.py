@@ -152,7 +152,7 @@ class Config:
     display_scale: float = 1.5
     num_preview:  int  = 16
     save_figure:  bool = True
-    save_path:    str  = 'gate_detection_results.png'
+    save_path:    str  = 'results_figures/gate_detection_results.png'
 
 
 def blue_mask(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:

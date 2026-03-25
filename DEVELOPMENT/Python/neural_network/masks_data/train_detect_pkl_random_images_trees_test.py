@@ -16,7 +16,7 @@ NEW_IMAGES_FOLDER = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW
 # ── Options ───────────────────────────────────────────────────────────────────
 NUM_IMAGES  = 3 ** 2    # must be a perfect square (4, 9, 16, 25...)
 SAVE_FIGURE = True
-SAVE_PATH   = '../tree_filter_detection_extra_results.png'
+SAVE_PATH   = '../results_figures/tree_filter_detection_extra_results.png'
 
 # ── Edge filter options ───────────────────────────────────────────────────────
 EDGE_FILTER_ON         = True

@@ -62,7 +62,7 @@ class Config:
     # ── Preview grid ──────────────────────────────────────────────────────────
     num_preview:  int  = 16        # must be perfect square: 4, 9, 16, 25 ...
     save_figure:  bool = True
-    save_path:    str  = 'gate_detection_results.png'
+    save_path:    str  = 'results_figures/gate_detection_results.png'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,7 +363,7 @@ if __name__ == "__main__":
     cfg = Config(
         num_preview = 16,       # change to 4, 9, 25 etc.
         save_figure = True,
-        save_path   = "gate_detection_results.png",
+        save_path   ="results_figures/gate_detection_results.png",
     )
 
     # ── Pick one mode ─────────────────────────────────────────────────────────
