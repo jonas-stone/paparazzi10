@@ -53,8 +53,8 @@ INITIAL_OPACITY = 0.5
 OPACITY_STEP    = 0.05
 
 # Strip analysis
-N_STRIPS              = 5
-BIEXP_EXP             = 0.9
+N_STRIPS              = 3
+BIEXP_EXP             = 1.1
 STRIP_ALPHA           = 0.18
 
 # Strip blocking — obstacle must penetrate fully through ground in a strip
