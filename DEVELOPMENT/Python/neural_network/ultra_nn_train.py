@@ -2,14 +2,14 @@
 train_nn.py
 ===========
 Trains a two-layer neural network (input → hidden ReLU → softmax output)
-to predict the drone's direction (1-7 = strip, 8 = turn around) from a
+to predict the drone's direction (1-5 = strip, 6 = turn around) from a
 downscaled 64x48 YUV image (all 3 channels).
 
 Architecture (Option 5)
 -----------------------
   Input  : 64 x 48 x 3 = 9216 features  (YUV, normalised 0-1)
   Hidden : 64 units, ReLU activation
-  Output : 8 units, softmax
+  Output : 6 units, softmax
 
 Split
 -----
@@ -21,9 +21,9 @@ Output files
 ------------
   model_W1.npy      — hidden layer weights  (64, 9216)
   model_b1.npy      — hidden layer biases   (64,)
-  model_W2.npy      — output layer weights  (8, 64)
-  model_b2.npy      — output layer biases   (8,)
-  model_classes.npy — class labels          [1,2,...,8]
+  model_W2.npy      — output layer weights  (6, 64)
+  model_b2.npy      — output layer biases   (6,)
+  model_classes.npy — class labels          [1,2,3,4,5,6]
   training_report.txt
 
 Inference on drone (5 lines of numpy)
@@ -38,6 +38,7 @@ Inference on drone (5 lines of numpy)
         x   = yuv.astype(np.float32).flatten() / 255.0
         h   = np.maximum(0, W1 @ x + b1)      # ReLU hidden
         return int(classes[np.argmax(W2 @ h + b2)])
+        # Returns 1-5 (fly toward strip) or 6 (turn around)
 """
 
 import os, sys, json, time
@@ -49,7 +50,7 @@ from collections import Counter
 # CONFIG  — edit these
 # ══════════════════════════════════════════════════════════════════════════════
 
-LABELS_JSON    = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\labels_25_03_attempt.json'
+LABELS_JSON    = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\labels.json'
 OUTPUT_DIR     = r'C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\model'
 
 # ── Split ─────────────────────────────────────────────────────────────────────
@@ -74,8 +75,7 @@ RANDOM_SEED    = 42
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
 AUGMENT        = True
-AUG_FLIP       = True     # horizontal flip with mirrored label (1↔7, 2↔6, 3↔5)
-AUG_FLIP_SKIP  = {1, 7}   # skip flip for these classes (too few / ambiguous)
+AUG_FLIP       = True     # horizontal flip with mirrored label (1↔5, 2↔4, 3→3, 6→6)
 AUG_BRIGHTNESS = True
 AUG_NOISE      = True
 AUG_NOISE_STD  = 0.02
@@ -95,8 +95,10 @@ def load_and_preprocess(img_path):
     return yuv.astype(np.float32).flatten() / 255.0   # shape: (9216,)
 
 
-# Label mirror map for horizontal flip: strip 1↔7, 2↔6, 3↔5, 4→4, 8→8
-FLIP_LABEL = {1:7, 2:6, 3:5, 4:4, 5:3, 6:2, 7:1, 8:8}
+# Label mirror map for horizontal flip: strip 1↔5, 2↔4, 3→3, 6→6 (turn around)
+FLIP_LABEL = {1:5, 2:4, 3:3, 4:2, 5:1, 6:6}
+
+AUG_FLIP_SKIP  = {1, 5}   # skip flip for edge strips (too few / ambiguous)
 
 def flip_vec(vec):
     """Horizontally flip a flattened YUV image vector."""

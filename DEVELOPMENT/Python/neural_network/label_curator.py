@@ -33,18 +33,21 @@ GROUND_MASK_DIR = os.path.join(MASKS_OUTPUT_ROOT, 'ground_masks')
 POLE_MASK_DIR   = os.path.join(MASKS_OUTPUT_ROOT, 'pole_masks')
 TREE_MASK_DIR   = os.path.join(MASKS_OUTPUT_ROOT, 'tree_masks')
 
-GROUND_COLOUR = (0, 255, 0)
-POLE_COLOUR   = (0, 165, 255)
-TREE_COLOUR   = (255, 0, 200)
-GATE_COLOUR   = (255, 255, 0)
-OPACITY       = 0.5
-N_STRIPS      = 7
-BIEXP_EXP     = 0.9
-SPIN_THRESHOLD= 5.0
-TREE_PAD_W    = 0
-TREE_PAD_H    = 30
-TREE_CLUSTER_M= 35
-GATE_MIN_REM  = 30
+GROUND_COLOUR         = (0, 255, 0)
+POLE_COLOUR           = (0, 165, 255)
+TREE_COLOUR           = (255, 0, 200)
+GATE_COLOUR           = (255, 255, 0)
+OPACITY               = 0.5
+N_STRIPS              = 5
+BIEXP_EXP             = 0.9
+SPIN_THRESHOLD        = 5.0
+TREE_PAD_W            = 0
+TREE_PAD_H            = 30
+TREE_CLUSTER_M        = 35
+GATE_MIN_REM          = 30
+ROOT_EXTRA            = 2    # extra px below tree bbox to catch root-line artifact
+BLOCK_MIN_WIDTH_FRAC  = 0.05  # default; adjustable at runtime with [ and ] keys
+BLOCK_FRAC_STEP       = 0.01  # step size for adjusting threshold
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GATE DETECTION
@@ -190,10 +193,14 @@ def get_tree_boxes(tm, pw=0, ph=0, cm=10):
     return boxes
 
 def carve_trees_rot(g, tm, pw, ph, cm):
+    """Carve tree bboxes from ground. Extends ROOT_EXTRA px below bbox to kill root-line artifact."""
     if g is None or tm is None: return g
+    H = g.shape[0]
     boxes=get_tree_boxes(tm,pw,ph,cm); r=g.copy()
     for b in boxes:
-        px,py,pw_,ph_=b['padded']; r[py:py+ph_,px:px+pw_]=0
+        px,py,pw_,ph_=b['padded']
+        carve_to = min(H, py + ph_ + ROOT_EXTRA)
+        r[py:carve_to, px:px+pw_]=0
     return r
 
 def gate_boost_fn(ground_rot, raw, gate_data, W_rot, H_rot, parts, orig_shape):
@@ -225,14 +232,67 @@ def gate_boost_fn(ground_rot, raw, gate_data, W_rot, H_rot, parts, orig_shape):
     bst[:,sx0:sx1]=255
     return bst,gs,inner_rect
 
+def get_blocked_strips(ground_rot, partitions, W_rot, H_rot,
+                       boost_strip_idx=None, gate_pair=None, orig_shape=None,
+                       block_frac=None):
+    """
+    A strip is BLOCKED if >BLOCK_MIN_WIDTH_FRAC of its columns have zero
+    ground pixels. Gate strip and gate blob column range are exempt.
+    """
+    blocked = set()
+    if ground_rot is None:
+        return blocked
+
+    if block_frac is None:
+        block_frac = BLOCK_MIN_WIDTH_FRAC
+
+    col_has_ground = (ground_rot > 0).any(axis=0)
+
+    # Gate-exempt column range in rotated space
+    gate_exempt_x0 = None
+    gate_exempt_x1 = None
+    if gate_pair is not None and orig_shape is not None:
+        b1, b2 = gate_pair
+        H_orig = orig_shape[0]
+        all_orig_y = [b1['y_min'], b1['y_max'], b2['y_min'], b2['y_max']]
+        rot_xs = [H_orig - 1 - y for y in all_orig_y]
+        gate_exempt_x0 = max(0,       min(rot_xs))
+        gate_exempt_x1 = min(W_rot-1, max(rot_xs))
+
+    for si, (x0, x1) in enumerate(partitions):
+        if si == boost_strip_idx:
+            continue
+        strip_w = x1 - x0
+        if strip_w <= 0:
+            continue
+
+        check_cols = np.ones(strip_w, dtype=bool)
+        if gate_exempt_x0 is not None:
+            lx0 = max(0,       gate_exempt_x0 - x0)
+            lx1 = min(strip_w, gate_exempt_x1 - x0 + 1)
+            if lx0 < lx1:
+                check_cols[lx0:lx1] = False
+
+        n_checked = check_cols.sum()
+        if n_checked == 0:
+            continue
+
+        strip_ground = col_has_ground[x0:x1]
+        empty_cols   = (~strip_ground[check_cols]).sum()
+        empty_frac   = empty_cols / n_checked
+
+        if empty_frac > block_frac:
+            blocked.add(si)
+
+    return blocked
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FRAME BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_frame(img, gm, pm, tm):
+def build_frame(img, gm, pm, tm, block_frac=BLOCK_MIN_WIDTH_FRAC):
     """Build full annotated BGR frame at native resolution. Caller scales it."""
     top=img.copy()
-    # Apply same pipeline to ground for display
     gm_display = carve_poles(fill_ground_holes(clean_blobs(gm)), pm)
     for mask,col in [(gm_display,GROUND_COLOUR),(pm,POLE_COLOUR),(tm,TREE_COLOUR)]:
         if mask is not None:
@@ -264,6 +324,7 @@ def build_frame(img, gm, pm, tm):
     top_rot=cv2.rotate(top,cv2.ROTATE_90_COUNTERCLOCKWISE)
     Hr,Wr=top_rot.shape[:2]; Ho,Wo=img.shape[:2]
 
+    # Full ground pipeline (same order as mask_viewer)
     dg=clean_blobs(gm)
     dg=fill_ground_holes(dg)
     dg=carve_poles(dg,pm)
@@ -273,29 +334,56 @@ def build_frame(img, gm, pm, tm):
         gr=carve_trees_rot(gr,tr,TREE_PAD_W,TREE_PAD_H,TREE_CLUSTER_M)
         dg=cv2.rotate(gr,cv2.ROTATE_90_CLOCKWISE)
     ground_rot=cv2.rotate(dg,cv2.ROTATE_90_COUNTERCLOCKWISE) if dg is not None else None
+
     parts=get_partitions(Wr)
     grb,bs,_=gate_boost_fn(ground_rot,gm,gate_data,Wr,Hr,parts,(Ho,Wo))
+
+    # Blocked strip detection — on processed ground, before boost
+    blocked = get_blocked_strips(
+        ground_rot, parts, Wr, Hr,
+        boost_strip_idx=bs,
+        gate_pair=pair,
+        orig_shape=(Ho,Wo),
+        block_frac=block_frac)
 
     if grb is not None:
         cc=(grb>0).astype(np.int32).sum(axis=0).astype(float)
     else:
         cc=np.zeros(Wr,dtype=float)
     pd=part_counts(cc,parts,Hr)
-    mp=max(p for _,p in pd); must_spin=mp<SPIN_THRESHOLD
-    bi=int(np.argmax([p for _,p in pd]))
 
+    # Best strip excludes blocked ones
+    scores = [pct if si not in blocked else -1.0 for si,(_,pct) in enumerate(pd)]
+    avail  = [s for s in scores if s >= 0]
+    mp     = max(avail) if avail else 0.0
+    must_spin = mp < SPIN_THRESHOLD
+    bi = int(np.argmax(scores)) if not must_spin else 0
+
+    # Strip lines + numbers
     for si,(x0,_) in enumerate(parts):
         if si>0: cv2.line(top_rot,(x0,0),(x0,Hr),(160,160,160),1)
     for si,(x0,x1) in enumerate(parts):
         cv2.putText(top_rot,str(si+1),((x0+x1)//2-5,16),
                     cv2.FONT_HERSHEY_SIMPLEX,0.45,(200,200,200),1)
 
+    # Gate boost highlight
     if bs is not None:
         sx0,sx1=parts[bs]; ind=top_rot.copy()
         cv2.rectangle(ind,(sx0,0),(sx1,Hr),(255,255,0),-1)
         cv2.addWeighted(ind,0.18,top_rot,0.82,0,top_rot)
         cv2.line(top_rot,(sx0,0),(sx0,Hr),(255,255,0),2)
         cv2.line(top_rot,(sx1,0),(sx1,Hr),(255,255,0),2)
+
+    # Blocked strip overlays
+    for si in blocked:
+        bkx0,bkx1=parts[si]
+        red_ov=top_rot.copy()
+        cv2.rectangle(red_ov,(bkx0,0),(bkx1,Hr),(0,0,180),-1)
+        cv2.addWeighted(red_ov,0.35,top_rot,0.65,0,top_rot)
+        cv2.line(top_rot,(bkx0,0),(bkx0,Hr),(0,0,255),2)
+        cv2.line(top_rot,(bkx1,0),(bkx1,Hr),(0,0,255),2)
+        cv2.putText(top_rot,'X',((bkx0+bkx1)//2-8,Hr//2),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255),2,cv2.LINE_AA)
 
     if must_spin:
         ov=top_rot.copy(); cv2.rectangle(ov,(0,0),(Wr,Hr),(0,0,180),-1)
@@ -309,16 +397,14 @@ def build_frame(img, gm, pm, tm):
         cv2.line(top_rot,(bx0,0),(bx0,Hr),(0,220,80),2)
         cv2.line(top_rot,(bx1,0),(bx1,Hr),(0,220,80),2)
 
-    # ── Tree bounding boxes on rotated image ─────────────────────────────────
+    # Tree bounding boxes on rotated image
     if tm is not None:
         tree_rot_disp = cv2.rotate(tm, cv2.ROTATE_90_COUNTERCLOCKWISE)
         for b in get_tree_boxes(tree_rot_disp, TREE_PAD_W, TREE_PAD_H, TREE_CLUSTER_M):
             tx,ty,tw_,th_ = b['padded']
-            # tight box in grey
-            tb = get_tree_boxes(tree_rot_disp, 0, 0, TREE_CLUSTER_M)
             cv2.rectangle(top_rot, (tx,ty), (tx+tw_,ty+th_), (255,80,255), 2)
 
-    # Line plot: ground pixels per column with per-strip bar fills
+    # Bar chart with per-column line
     ph_ = max(80, Hr//4)
     bpanel = np.full((ph_, Wr, 3), (30,30,30), dtype=np.uint8)
     pad_t=12; pad_b=8; pad_l=4; pad_r=4
@@ -326,43 +412,39 @@ def build_frame(img, gm, pm, tm):
     dh = ph_ - pad_t - pad_b
     max_count = cc.max() if cc.max() > 0 else 1.0
 
-    # Strip backgrounds + filled bars showing strip ground %
     for si, (x0, x1) in enumerate(parts):
         px0 = pad_l + int(x0 / Wr * dw)
         px1 = pad_l + int(x1 / Wr * dw)
         shade = (50,50,50) if si%2==0 else (42,42,42)
         cv2.rectangle(bpanel, (px0, pad_t), (px1, pad_t+dh), shade, -1)
-
-        # Filled bar showing strip ground percentage
         _, pct = pd[si]
         bar_h = int(pct / 100.0 * dh)
-        bar_col = (0, 100, 40) if si == bi else (40, 70, 100)
+        if si in blocked:
+            bar_col = (30, 30, 100)
+        elif si == bi:
+            bar_col = (0, 100, 40)
+        else:
+            bar_col = (40, 70, 100)
         cv2.rectangle(bpanel, (px0, pad_t+dh-bar_h), (px1, pad_t+dh), bar_col, -1)
-
-        # Percentage label inside bar
         if bar_h > 14:
             lbl = f'{pct:.0f}%'
             lx = (px0+px1)//2 - len(lbl)*3
             cv2.putText(bpanel, lbl, (lx, pad_t+dh-bar_h+11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (180,255,180) if si==bi else (140,180,220), 1)
-
-        # Strip divider
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28,
+                        (180,255,180) if si==bi else (140,180,220), 1)
         if si > 0:
             cv2.line(bpanel, (px0, pad_t), (px0, pad_t+dh), (80,80,80), 1)
-
-        # Strip number above
         mid_px = (px0+px1)//2
         cv2.putText(bpanel, str(si+1), (mid_px-4, pad_t-2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, (160,160,160), 1)
 
-    # Per-column line overlaid on top of bars
     xs = np.linspace(0, len(cc)-1, len(cc))
     px_arr = (pad_l + xs / Wr * dw).astype(int)
     py_arr = (pad_t + dh - (cc / max_count) * dh).astype(int)
     pts = np.stack([px_arr, py_arr], axis=1).reshape(-1,1,2).astype(np.int32)
     cv2.polylines(bpanel, [pts], False, (0,255,100), 1, cv2.LINE_AA)
 
-    auto_lbl = 8 if must_spin else bi+1
+    auto_lbl = 6 if must_spin else bi+1
     return np.vstack((top_rot, bpanel)), pd, auto_lbl
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -384,17 +466,17 @@ class CuratorApp:
         self._tk_img     = None
         self._frame_bgr  = None
         self._auto_lbl   = 1
+        self._block_frac = BLOCK_MIN_WIDTH_FRAC
 
         self._load_images()
         self._load_json()
         self._build_ui()
-        self.root.after(150, self._render)   # defer like mask_painter
-
-    # ── Data ──────────────────────────────────────────────────────────────────
+        self.root.after(150, self._render)
 
     def _load_images(self):
         all_imgs=sorted(glob.glob(os.path.join(IMAGE_FOLDER,'*.jpg'))+
-                        glob.glob(os.path.join(IMAGE_FOLDER,'*.png')))
+                        glob.glob(os.path.join(IMAGE_FOLDER,'*.png')),
+                        key=lambda p: int(''.join(filter(str.isdigit, os.path.splitext(os.path.basename(p))[0])) or '0'))
         all_imgs=[p for p in all_imgs if '_mask' not in os.path.basename(p).lower()]
         def has_mask(p):
             stem=os.path.splitext(os.path.basename(p))[0]
@@ -412,8 +494,6 @@ class CuratorApp:
                     self.labels[e['path']]=e
         print(f'Loaded {len(self.labels)} existing labels.')
 
-    # ── UI ────────────────────────────────────────────────────────────────────
-
     def _build_ui(self):
         BTN_BASE = dict(fg='white', relief=tk.FLAT, padx=10, pady=5,
                         cursor='hand2', activeforeground='white',
@@ -423,7 +503,6 @@ class CuratorApp:
         BTN_R = dict(**BTN_BASE, bg='#5c1a1a', activebackground='#7a2626')
         BTN_O = dict(**BTN_BASE, bg='#5c3d0a', activebackground='#7a5210')
 
-        # Toolbar
         toolbar = tk.Frame(self.root, bg='#2d2d2d', pady=6)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
@@ -437,8 +516,8 @@ class CuratorApp:
         tk.Label(toolbar, text='  Override:', bg='#2d2d2d', fg='#aaa',
                  font=('Helvetica',11)).pack(side=tk.LEFT, padx=(12,4))
         self._strip_btns = []
-        for i in range(1,9):
-            lbl = str(i) if i<=7 else '↺8'
+        for i in range(1,7):
+            lbl = str(i) if i<=5 else '↺6'
             b = tk.Button(toolbar, text=lbl, width=3,
                           command=lambda n=i: self._set_override(n), **BTN)
             b.pack(side=tk.LEFT, padx=2)
@@ -452,12 +531,10 @@ class CuratorApp:
         tk.Label(toolbar, text='y=keep  n=disc  1-8=override  r=reset  z=undo  a/d=nav  s=save',
                  bg='#2d2d2d', fg='#555', font=('Helvetica',9)).pack(side=tk.RIGHT, padx=10)
 
-        # Status bar
         self._status_var = tk.StringVar(value='Loading...')
         tk.Label(self.root, textvariable=self._status_var, bg='#1e1e1e', fg='#aaa',
                  anchor='w', font=('Helvetica',10)).pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=3)
 
-        # Main area
         main = tk.Frame(self.root, bg='#1e1e1e')
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -465,7 +542,6 @@ class CuratorApp:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6,3), pady=6)
         self.canvas.bind('<Configure>', lambda _: self._display_frame())
 
-        # File list
         lf = tk.Frame(main, bg='#2d2d2d', width=300)
         lf.pack(side=tk.RIGHT, fill=tk.Y, padx=(3,6), pady=6)
         lf.pack_propagate(False)
@@ -497,8 +573,6 @@ class CuratorApp:
         self._populate_list()
         self.root.bind('<KeyPress>', self._on_key)
         self.root.focus_set()
-
-    # ── List ──────────────────────────────────────────────────────────────────
 
     def _populate_list(self, fs=''):
         self.listbox.delete(0, tk.END)
@@ -546,8 +620,6 @@ class CuratorApp:
             self.override = None
             self._render()
 
-    # ── Rendering ─────────────────────────────────────────────────────────────
-
     def _render(self):
         try:
             path = self.image_paths[self.idx]
@@ -559,7 +631,7 @@ class CuratorApp:
             pm  = load_mask(POLE_MASK_DIR,   stem, 'pole')
             tm  = load_mask(TREE_MASK_DIR,   stem, 'tree')
 
-            frame_bgr, pd, auto_lbl = build_frame(img, gm, pm, tm)
+            frame_bgr, pd, auto_lbl = build_frame(img, gm, pm, tm, self._block_frac)
             self._frame_bgr = frame_bgr
             self._auto_lbl  = auto_lbl
 
@@ -582,7 +654,7 @@ class CuratorApp:
             disc_tag = '  [DISCARDED]' if entry and entry.get('discarded') else ''
             kept = sum(1 for e in self.labels.values() if not e.get('discarded'))
             self._status_var.set(
-                f'[{self.idx+1}/{len(self.image_paths)}]  {name}{disc_tag}  | kept={kept}')
+                f'[{self.idx+1}/{len(self.image_paths)}]  {name}{disc_tag}  | kept={kept}  | block_thresh={self._block_frac:.2f} ([/])')
 
             self._populate_list(self._search_var.get())
             self._scroll_to_current()
@@ -605,8 +677,6 @@ class CuratorApp:
         self._tk_img = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.delete('all')
         self.canvas.create_image(cw//2, ch//2, anchor=tk.CENTER, image=self._tk_img)
-
-    # ── Actions ───────────────────────────────────────────────────────────────
 
     def _keep(self):
         path = self.image_paths[self.idx]
@@ -649,10 +719,10 @@ class CuratorApp:
 
     def _save(self):
         entries=[e for e in self.labels.values() if not e.get('discarded')]
-        with open(OUTPUT_JSON,'w') as f:
+        with open(OUTPUT_JSON,'w', encoding='utf-8') as f:
             json.dump(sorted(entries,key=lambda e:e['path']),f,indent=2)
         kept=len(entries); disc=sum(1 for e in self.labels.values() if e.get('discarded'))
-        print(f'[SAVED] {kept} kept, {disc} discarded → {OUTPUT_JSON}')
+        print(f'[SAVED] {kept} kept, {disc} discarded')
         messagebox.showinfo('Saved',f'Saved {kept} labels to:\n{OUTPUT_JSON}')
 
     def _on_key(self, event):
@@ -664,7 +734,13 @@ class CuratorApp:
         elif k=='z':              self._undo()
         elif k=='r':              self._reset_override()
         elif k=='s':              self._save()
-        elif k in ('1','2','3','4','5','6','7','8'): self._set_override(int(k))
+        elif k=='bracketleft':
+            self._block_frac = max(0.01, round(self._block_frac - BLOCK_FRAC_STEP, 2))
+            self._render()
+        elif k=='bracketright':
+            self._block_frac = min(0.99, round(self._block_frac + BLOCK_FRAC_STEP, 2))
+            self._render()
+        elif k in ('1','2','3','4','5','6'): self._set_override(int(k))
 
 
 def main():
