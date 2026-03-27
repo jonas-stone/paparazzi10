@@ -1,699 +1,633 @@
-import cv2
-import numpy as np
-from scipy.ndimage import median_filter
+"""
+optical_flow.py
+───────────────
+Computes optical flow between consecutive frames in a folder.
+Follows the same structure as the obstacle-detection pipeline:
+  - scale helpers (scale_int / scale_odd / get_scaled_params)
+  - a FlowResult dataclass returned from the core function
+  - an interactive __main__ viewer (a / d to navigate, q to quit)
+
+Public API
+──────────
+    result = get_optical_flow(prev_bgr, curr_bgr,
+                              scale_factor=0.5,
+                              method="farneback")   # or "lucas_kanade"
+
+    result.magnitude      – np.ndarray (H, W)  per-pixel motion magnitude
+    result.angle          – np.ndarray (H, W)  motion direction in degrees
+    result.mean_mag       – float              mean magnitude (≈ overall motion)
+    result.mean_flow_vec  – (float, float)     (dx, dy) mean flow vector
+    result.divergence     – np.ndarray (H, W)  div field (dense only, else zeros)
+    result.vectors        – dict               algorithm-specific extras
+                             dense  → {"flow": (H,W,2)}
+                             sparse → {"prev_pts", "curr_pts", "status"}
+
+    alert = check_obstacle_divergence(result,
+                                      div_threshold=0.3,
+                                      roi_fraction=0.5)
+    alert.triggered    – bool    threshold exceeded
+    alert.max_div      – float   peak divergence in ROI
+    alert.mean_div     – float   mean divergence in ROI
+    alert.roi_mask     – (H, W)  bool array marking the ROI used
+"""
+
 import os
 import random
+from dataclasses import dataclass, field
 from glob import glob
-import colored_blob_separator as cds
+from typing import Optional
+
+import cv2
+import numpy as np
 
 
-# ── scale helpers ─────────────────────────────────────────────────────────────
+# ── scale helpers (mirrors obstacle_detection.py) ─────────────────────────────
 
-def scale_int(value, scale_factor):
-    """Scale a pixel-count value, minimum 1."""
+def scale_int(value: int, scale_factor: float) -> int:
+    """Scale a pixel-count value; minimum 1."""
     return max(1, int(round(value * scale_factor)))
 
-def scale_odd(value, scale_factor):
-    """Scale a kernel size (must be odd, minimum 3)."""
+
+def scale_odd(value: int, scale_factor: float) -> int:
+    """Scale a kernel size; result is always odd, minimum 3."""
     n = max(3, int(round(value * scale_factor)))
     return n if n % 2 == 1 else n + 1
 
-def get_scaled_params(scale_factor):
+
+def get_scaled_params(scale_factor: float) -> dict:
     """
-    All pixel-space thresholds and display parameters in one place.
-    Calibrated at scale_factor=1.0 (full resolution).
+    All pixel-space thresholds in one place.
+    Calibrated at scale_factor = 1.0 (full resolution).
     """
     return dict(
-        # ── pipeline ──────────────────────────────────────────────────────────
-        min_ground_pixels  = scale_int(5,   scale_factor),
-        max_gap            = scale_int(10,  scale_factor),
-        smooth_kernel      = scale_odd(5,   scale_factor),
-        min_width          = scale_int(20,  scale_factor),
-        max_col_gap        = scale_int(5,   scale_factor),
-        obstacle_threshold = scale_int(50,  scale_factor),
-        no_ground_baseline = scale_int(220, scale_factor),
-        median_ksize       = scale_odd(5,   scale_factor),
-        blur_ksize         = scale_odd(5,   scale_factor),
+        # ── preprocessing ─────────────────────────────────────────────────
+        blur_ksize          = scale_odd(5,   scale_factor),
 
-        # ── display ───────────────────────────────────────────────────────────
-        box_bottom_pad     = scale_int(15,  scale_factor),
-        box_thickness      = max(1, scale_int(2,   scale_factor)),
-        status_font_scale  = max(0.3, scale_factor * 1.0),
-        status_thickness   = max(1, scale_int(2,   scale_factor)),
-        status_x           = scale_int(20,  scale_factor),
-        status_y           = scale_int(40,  scale_factor),
-        label_font_scale   = max(0.2, scale_factor * 0.4),
-        label_thickness    = max(1, scale_int(1,   scale_factor)),
-        label_y_offset     = scale_int(5,   scale_factor),
-        label_y_top        = scale_int(20,  scale_factor),
+        # ── Farnebäck dense flow ───────────────────────────────────────────
+        fb_pyr_scale        = 0.5,          # dimensionless, do NOT scale
+        fb_levels           = 3,            # pyramid levels
+        fb_winsize          = scale_int(15, scale_factor),
+        fb_iterations       = 3,
+        fb_poly_n           = 5,            # neighbourhood size
+        fb_poly_sigma       = 1.2,          # Gaussian std for poly expansion
+
+        # ── Lucas–Kanade sparse flow ───────────────────────────────────────
+        lk_max_corners      = 200,          # Shi-Tomasi corner count
+        lk_quality_level    = 0.3,
+        lk_min_distance     = scale_int(7,  scale_factor),
+        lk_block_size       = scale_int(7,  scale_factor),
+        lk_win_size         = (scale_odd(15, scale_factor),
+                               scale_odd(15, scale_factor)),
+        lk_max_level        = 2,            # pyramid levels for LK
+
+        # ── display ───────────────────────────────────────────────────────
+        status_font_scale   = max(0.3, scale_factor * 1.0),
+        status_thickness    = max(1, scale_int(2, scale_factor)),
+        status_x            = scale_int(20, scale_factor),
+        status_y            = scale_int(40, scale_factor),
+        arrow_step          = scale_int(16, scale_factor),   # grid spacing for vector overlay
+        arrow_scale         = scale_factor * 3.0,            # visual amplification
     )
 
 
-# ── Detection type flag ───────────────────────────────────────────────────────
-# Each row in the detections matrix: [left_x, width, det_type]
-#   det_type: 0 = obstacle, 1 = plant
-DET_OBSTACLE = 0
-DET_PLANT    = 1
+# ── result containers ─────────────────────────────────────────────────────────
 
-
-# ── core pipeline functions ───────────────────────────────────────────────────
-
-def find_ground_boundary(mask_rotated,
-                         min_ground_pixels=5,
-                         max_gap=10,
-                         smooth_kernel=5):
-    image_height = mask_rotated.shape[1]
-    n_rows = mask_rotated.shape[0]
-    boundary_rows = np.full(n_rows, image_height, dtype=int)
-
-    for idx, row in enumerate(mask_rotated):
-        green_pos = np.where(row > 0)[0]
-
-        if green_pos.size == 0:
-            continue
-
-        ground_valid = np.sum(row[-min_ground_pixels:] > 0) >= min_ground_pixels
-
-        if not ground_valid:
-            diffs = np.diff(green_pos)
-            runs = np.split(green_pos, np.where(diffs > 1)[0] + 1)
-            if max(len(r) for r in runs) < max_gap:
-                continue
-
-        gp = green_pos[::-1]
-
-        if gp.size == 1:
-            boundary_rows[idx] = gp[0]
-            continue
-
-        gaps = -np.diff(gp) - 1
-        big_gap_indices = np.where(gaps > max_gap)[0]
-
-        if big_gap_indices.size == 0:
-            boundary_rows[idx] = gp[-1]
-            continue
-
-        fg = big_gap_indices[0]
-        pending_boundary = gp[fg]
-
-        after_gap = gp[fg + 1:]
-        if after_gap.size >= max_gap:
-            after_gaps = -np.diff(after_gap) - 1
-            split_points = np.where(after_gaps > 0)[0]
-            runs = np.split(after_gap, split_points + 1)
-            if max(len(r) for r in runs) >= max_gap:
-                boundary_rows[idx] = gp[-1]
-                continue
-
-        boundary_rows[idx] = pending_boundary
-
-    valid_mask = boundary_rows < image_height
-    if valid_mask.sum() > smooth_kernel:
-        smoothed = median_filter(boundary_rows.astype(float), size=smooth_kernel)
-        boundary_rows[valid_mask] = smoothed[valid_mask].astype(int)
-
-    return boundary_rows
-
-
-def get_obstacle_regions(obstacle_cols, min_width=20, max_col_gap=5):
-    if len(obstacle_cols) == 0:
-        return []
-
-    regions = []
-    start = obstacle_cols[0]
-    end   = obstacle_cols[0]
-
-    for col in obstacle_cols[1:]:
-        if col - end <= max_col_gap:
-            end = col
-        else:
-            regions.append((start, end, end - start + 1))
-            start = col
-            end   = col
-
-    regions.append((start, end, end - start + 1))
-
-    return [(s, e, w) for s, e, w in regions if w >= min_width]
-
-
-def update_and_detect(boundary_row, h, ground_baseline,
-                      min_width=20,
-                      obstacle_threshold=50,
-                      no_ground_baseline=220,
-                      max_col_gap=5):
-    alpha = 0.6
-
-    valid     = boundary_row < h
-    no_ground = boundary_row >= h
-
-    if ground_baseline is None:
-        baseline = boundary_row.astype(float).copy()
-        baseline[no_ground] = no_ground_baseline
-        return [], baseline
-
-    deviation          = boundary_row - ground_baseline
-    deviation_obstacle = valid & (deviation > obstacle_threshold)
-    obstacle_mask      = deviation_obstacle | no_ground
-
-    obstacle_cols    = np.where(obstacle_mask)[0]
-    obstacle_regions = get_obstacle_regions(obstacle_cols,
-                                            min_width=min_width,
-                                            max_col_gap=max_col_gap)
-
-    no_obstacle_mask = valid & ~deviation_obstacle
-    ground_baseline  = ground_baseline.copy()
-    ground_baseline[no_obstacle_mask] = (
-        (1 - alpha) * ground_baseline[no_obstacle_mask]
-        + alpha     * boundary_row[no_obstacle_mask]
-    )
-
-    last_good = no_ground_baseline
-    for i in range(len(ground_baseline)):
-        if no_obstacle_mask[i]:
-            last_good = ground_baseline[i]
-        else:
-            ground_baseline[i] = last_good
-
-    return obstacle_regions, ground_baseline
-
-
-# ── colour classifiers ────────────────────────────────────────────────────────
-
-def is_ground(Y, U, V):
-    if U <= 115.50:
-        if V <= 145.00:
-            if Y <= 85.50:
-                if Y <= 78.50:
-                    return 0
-                else:
-                    return 0
-            else:
-                if U <= 92.50:
-                    return 0
-                else:
-                    return 255
-        else:
-            if V <= 152.50:
-                if Y <= 177.00:
-                    return 255
-                else:
-                    return 0
-            else:
-                return 0
-    else:
-        if U <= 121.50:
-            if V <= 137.50:
-                if Y <= 87.50:
-                    return 0
-                else:
-                    return 255
-            else:
-                if U <= 116.50:
-                    return 0
-                else:
-                    return 0
-        else:
-            if U <= 122.50:
-                if V <= 126.00:
-                    return 0
-                else:
-                    return 0
-            else:
-                if Y <= 62.50:
-                    return 0
-                else:
-                    return 0
-
-
-<<<<<<< HEAD
-def is_ground_sim(Y, U, V):
-    if U <= 96.50:
-        if Y <= 102.50:
-            return 255
-        else:
-            if V <= 152.50:
-                if Y <= 177.00:
-                    return 255
-                else:
-                    return 0
-            else:
-                return 0
-    else:
-        if U <= 121.50:
-            if V <= 137.50:
-                if Y <= 87.50:
-                    return 0
-                else:
-                    return 255
-            else:
-                if U <= 116.50:
-                    return 0
-                else:
-                    return 0
-        else:
-            if U <= 122.50:
-                if V <= 126.00:
-                    return 0
-                else:
-                    return 0
-            else:
-                if Y <= 62.50:
-                    return 0
-                else:
-                    return 0
-
-
-=======
->>>>>>> origin/Vito_Fantastic_RTPs
-# def is_ground(Y, U, V):
-#     if U <= 96.50:
-#         if Y <= 102.50:
-#             return 255
-#         else:
-#             return 0
-#     else:
-#         if U <= 97.50:
-#             if V <= 126.00:
-#                 return 255
-#             else:
-#                 return 0
-#         else:
-#             return 0
-
-
-vectorized_is_ground     = np.vectorize(is_ground)
-# vectorized_is_ground_sim = np.vectorize(is_ground_sim)
-
-
-# ── detection helper functions ────────────────────────────────────────────────
-
-def detect_green_ground_ml(image_bgr, threshold, median_ksize=5):
-    image_yuv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YUV)
-    Y_channel, U_channel, V_channel = cv2.split(image_yuv)
-
-    mask = vectorized_is_ground(Y_channel, U_channel, V_channel).astype(np.uint8)
-
-    if median_ksize is not None and median_ksize >= 3 and median_ksize % 2 == 1:
-        mask = cv2.medianBlur(mask, median_ksize)
-
-    green_pixel_count = cv2.countNonZero(mask)
-    total_pixels      = image_bgr.shape[0] * image_bgr.shape[1]
-    green_fraction    = green_pixel_count / total_pixels if total_pixels > 0 else 0.0
-
-    status = "GROUND FOUND" if green_fraction > threshold else "NO GROUND"
-    result = cv2.bitwise_and(image_bgr, image_bgr, mask=mask)
-
-    return mask, result, green_fraction, status
-
-
-def detect_all_green_lax(image_bgr, scale_factor=1.0, blur_ksize=5):
+@dataclass
+class FlowResult:
     """
-    Lax YUV green filter at a (further) downscaled resolution.
-    Returns: (small_mask, full_res_mask, downscaled_bgr)
+    Returned by get_optical_flow().
+
+    magnitude     : (H, W) float32 — per-pixel motion magnitude in pixels
+    angle         : (H, W) float32 — motion direction in degrees [0, 360)
+    mean_mag      : float           — mean magnitude across valid pixels
+    mean_flow_vec : (float, float)  — (dx, dy) mean flow vector
+    divergence    : (H, W) float32 — optical divergence field (dense only)
+    vectors       : dict            — method-specific raw data:
+                      "farneback"    → {"flow": ndarray (H, W, 2)}
+                      "lucas_kanade" → {"prev_pts", "curr_pts", "status"}
     """
+    magnitude     : np.ndarray
+    angle         : np.ndarray
+    mean_mag      : float
+    mean_flow_vec : tuple = (0.0, 0.0)
+    divergence    : np.ndarray = field(default_factory=lambda: np.zeros((1, 1), np.float32))
+    vectors       : dict = field(default_factory=dict)
+
+
+@dataclass
+class DivergenceAlert:
+    """
+    Returned by check_obstacle_divergence().
+
+    triggered : bool          — True when max_div exceeds the threshold
+    max_div   : float         — peak divergence inside the ROI
+    mean_div  : float         — mean divergence inside the ROI
+    roi_mask  : np.ndarray    — (H, W) bool mask of the region that was checked
+    """
+    triggered : bool
+    max_div   : float
+    mean_div  : float
+    roi_mask  : np.ndarray
+
+
+# ── preprocessing ─────────────────────────────────────────────────────────────
+
+def _preprocess(image_bgr: np.ndarray,
+                scale_factor: float,
+                blur_ksize: int) -> np.ndarray:
+    """Downscale → grayscale → optional blur."""
     H, W = image_bgr.shape[:2]
-
-    small_w    = max(1, int(W * scale_factor))
-    small_h    = max(1, int(H * scale_factor))
-    downscaled = cv2.resize(image_bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
-
-    yuv = cv2.cvtColor(downscaled, cv2.COLOR_BGR2YUV)
-    Y, U, V = cv2.split(yuv)
-
-    # YUV colour thresholds — colour-space values (0-255), do NOT scale
-    green_mask_small = (
-        (U >= 0)  & (U <= 116) &
-        (V >= 0)  & (V <= 141) &
-        (Y >= 29) & (Y <= 140)
-    ).astype(np.uint8) * 255
-
-    green_mask_small[:, :int(small_w / 3)] = 0
-
+    tW = max(1, int(W * scale_factor))
+    tH = max(1, int(H * scale_factor))
+    small = cv2.resize(image_bgr, (tW, tH), interpolation=cv2.INTER_AREA)
+    gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     if blur_ksize >= 3:
-        green_mask_small = cv2.GaussianBlur(
-            green_mask_small, (blur_ksize, blur_ksize), 0)
-        _, green_mask_small = cv2.threshold(
-            green_mask_small, 127, 255, cv2.THRESH_BINARY)
-
-    mask_full = cv2.resize(green_mask_small, (W, H), interpolation=cv2.INTER_NEAREST)
-
-    return green_mask_small, mask_full, downscaled
+        gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+    return gray
 
 
-def detect_plant_regions(plant_mask, min_width=10, min_pixels_per_col=2, max_col_gap=3):
-    plant_mask_flipped = plant_mask[:, ::-1]   # match obstacle pipeline convention
-    n_rows = plant_mask_flipped.shape[0]
-    active_rows = []
+# ── divergence computation ────────────────────────────────────────────────────
 
-    for row_idx in range(n_rows):
-        row = plant_mask_flipped[row_idx, :]
-        green_pos = np.where(row > 0)[0]
-        if green_pos.size == 0:
-            continue
-        diffs = np.diff(green_pos)
-        runs = np.split(green_pos, np.where(diffs > 1)[0] + 1)
-        if max(len(r) for r in runs) > min_pixels_per_col:
-            active_rows.append(row_idx)
-
-    return get_obstacle_regions(active_rows, min_width=min_width, max_col_gap=max_col_gap)
-
-
-# ── unified detection function ────────────────────────────────────────────────
-
-def get_obstacle_info(image_bgr,
-                      ground_baseline,
-                      # obstacle params
-                      oa_color_count_frac=0.05,
-                      median_ksize=5,
-                      min_width=20,
-                      max_col_gap=5,
-                      min_ground_pixels=5,
-                      max_gap=10,
-                      smooth_kernel=5,
-                      obstacle_threshold=50,
-                      no_ground_baseline=220,
-                      # plant params
-                      plant_scale_factor=0.15,
-                      plant_blur_ksize=3,
-                      plant_min_width=30,
-                      plant_min_pixels_per_col=2,
-                      plant_max_col_gap=5):
+def _compute_divergence(flow: np.ndarray) -> np.ndarray:
     """
-    Unified obstacle + plant detection.
+    Compute the optical divergence of a dense flow field.
+
+    div = dFx/dx + dFy/dy
+
+    Positive divergence at a pixel means flow is expanding outward from that
+    point — the signature of an approaching obstacle (looming).
+    Negative divergence means flow converging inward (receding object).
+
+    Returns a (H, W) float32 array, same spatial size as `flow`.
+    """
+    fx = flow[..., 0]
+    fy = flow[..., 1]
+    # Central-difference gradients; Sobel gives smoother result than np.gradient
+    dFx_dx = cv2.Sobel(fx, cv2.CV_32F, 1, 0, ksize=3)
+    dFy_dy = cv2.Sobel(fy, cv2.CV_32F, 0, 1, ksize=3)
+    return dFx_dx + dFy_dy
+
+
+
+def _farneback_flow(prev_gray: np.ndarray,
+                    curr_gray: np.ndarray,
+                    p: dict) -> FlowResult:
+    """Dense Farnebäck optical flow."""
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, curr_gray,
+        None,
+        p["fb_pyr_scale"],
+        p["fb_levels"],
+        p["fb_winsize"],
+        p["fb_iterations"],
+        p["fb_poly_n"],
+        p["fb_poly_sigma"],
+        0,
+    )
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1], angleInDegrees=True)
+    mean_dx  = float(flow[..., 0].mean())
+    mean_dy  = float(flow[..., 1].mean())
+    div      = _compute_divergence(flow)
+    return FlowResult(
+        magnitude     = mag,
+        angle         = ang,
+        mean_mag      = float(mag.mean()),
+        mean_flow_vec = (mean_dx, mean_dy),
+        divergence    = div,
+        vectors       = {"flow": flow},
+    )
+
+
+def _lucas_kanade_flow(prev_gray: np.ndarray,
+                       curr_gray: np.ndarray,
+                       p: dict) -> FlowResult:
+    """Sparse Lucas–Kanade optical flow on Shi-Tomasi corners."""
+    H, W = prev_gray.shape
+
+    prev_pts = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners   = p["lk_max_corners"],
+        qualityLevel = p["lk_quality_level"],
+        minDistance  = p["lk_min_distance"],
+        blockSize    = p["lk_block_size"],
+    )
+
+    mag = np.zeros((H, W), dtype=np.float32)
+    ang = np.zeros((H, W), dtype=np.float32)
+    mean_mag = 0.0
+    result_prev = result_curr = result_status = None
+
+    if prev_pts is not None and len(prev_pts) > 0:
+        lk_params = dict(
+            winSize  = p["lk_win_size"],
+            maxLevel = p["lk_max_level"],
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
+        )
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, prev_pts, None, **lk_params)
+
+        good_prev = prev_pts[status.ravel() == 1]
+        good_curr = curr_pts[status.ravel() == 1]
+
+        if len(good_prev) > 0:
+            diff = good_curr - good_prev          # (N, 1, 2)
+            dx   = diff[:, 0, 0]
+            dy   = diff[:, 0, 1]
+            mags = np.sqrt(dx**2 + dy**2)
+            angs = np.degrees(np.arctan2(dy, dx)) % 360
+            mean_mag = float(mags.mean())
+
+            # Scatter magnitudes / angles onto the pixel grid
+            for pt, m, a in zip(good_prev.reshape(-1, 2), mags, angs):
+                x, y = int(pt[0]), int(pt[1])
+                if 0 <= y < H and 0 <= x < W:
+                    mag[y, x] = m
+                    ang[y, x] = a
+
+        result_prev   = good_prev
+        result_curr   = good_curr
+        result_status = status
+
+    mean_dx = float(np.mean(good_curr[:, 0, 0] - good_prev[:, 0, 0])) if (result_prev is not None and len(result_prev) > 0) else 0.0
+    mean_dy = float(np.mean(good_curr[:, 0, 1] - good_prev[:, 0, 1])) if (result_prev is not None and len(result_prev) > 0) else 0.0
+
+    return FlowResult(
+        magnitude     = mag,
+        angle         = ang,
+        mean_mag      = mean_mag,
+        mean_flow_vec = (mean_dx, mean_dy),
+        divergence    = np.zeros_like(mag),   # sparse flow → no dense div field
+        vectors       = {
+            "prev_pts": result_prev,
+            "curr_pts": result_curr,
+            "status"  : result_status,
+        },
+    )
+
+
+# ── public API ────────────────────────────────────────────────────────────────
+
+def get_optical_flow(prev_bgr       : np.ndarray,
+                     curr_bgr       : np.ndarray,
+                     scale_factor   : float = 0.5,
+                     method         : str   = "farneback") -> FlowResult:
+    """
+    Compute optical flow between two BGR frames.
+
+    Parameters
+    ----------
+    prev_bgr     : Previous frame (BGR, any resolution).
+    curr_bgr     : Current frame  (BGR, same resolution as prev_bgr).
+    scale_factor : Downscale factor applied before flow computation.
+                   Smaller → faster; 0.5 is a good default.
+    method       : "farneback"    – dense flow, best for full field analysis
+                   "lucas_kanade" – sparse flow, faster, keypoints only
 
     Returns
     -------
-    detections : np.ndarray, shape (N, 3), dtype int32
-        Each row is [left_x, width, det_type].
-        det_type: 0 = obstacle, 1 = plant.
-        Empty detections → shape (0, 3).
-    new_ground_baseline : np.ndarray or None
-    debug : dict
-        Intermediate data for visualisation.
+    FlowResult
     """
-    mask, _, green_frac, status = detect_green_ground_ml(
-        image_bgr, threshold=oa_color_count_frac, median_ksize=median_ksize)
+    p = get_scaled_params(scale_factor)
 
-    H, W  = image_bgr.shape[:2]
-    rows  = []     # accumulate [left_x, width, det_type] rows
-    debug = {"status": status, "green_frac": green_frac}
+    prev_gray = _preprocess(prev_bgr, scale_factor, p["blur_ksize"])
+    curr_gray = _preprocess(curr_bgr, scale_factor, p["blur_ksize"])
 
-    # ── obstacle detection ─────────────────────────────────────────────────
-    if status == "GROUND FOUND":
-        clean_mask = cds.isolate_ground_blob(binary_img=mask)
-        clean_mask = cds.fill_holes(clean_mask)
-
-        mask_flipped  = clean_mask[:, ::-1]
-        boundary_rows = find_ground_boundary(
-            mask_rotated      = mask_flipped,
-            min_ground_pixels = min_ground_pixels,
-            max_gap           = max_gap,
-            smooth_kernel     = smooth_kernel,
-        )
-        obstacle_regions, new_ground_baseline = update_and_detect(
-            boundary_rows,
-            W,
-            ground_baseline,
-            min_width          = min_width,
-            obstacle_threshold = obstacle_threshold,
-            no_ground_baseline = no_ground_baseline,
-            max_col_gap        = max_col_gap,
-        )
-
-        for (s, e, w) in obstacle_regions:
-            left = W - 1 - e
-            rows.append([int(left), int(w), DET_OBSTACLE])
-
-        debug.update({
-            "boundary_rows"       : boundary_rows,
-            "obstacle_regions_raw": obstacle_regions,
-            "clean_mask"          : clean_mask,
-        })
+    if method == "farneback":
+        return _farneback_flow(prev_gray, curr_gray, p)
+    elif method == "lucas_kanade":
+        return _lucas_kanade_flow(prev_gray, curr_gray, p)
     else:
-        new_ground_baseline = ground_baseline
-        clean_mask = np.zeros((H, W), dtype=np.uint8)
-        debug["boundary_rows"]        = np.full(W, W)
-        debug["obstacle_regions_raw"] = []
-        debug["clean_mask"]           = clean_mask
+        raise ValueError(f"Unknown method '{method}'. Use 'farneback' or 'lucas_kanade'.")
 
-    # ── plant detection ────────────────────────────────────────────────────
-    all_green_small, _, _ = detect_all_green_lax(
-        image_bgr,
-        scale_factor = plant_scale_factor,
-        blur_ksize   = plant_blur_ksize,
+
+
+# ── obstacle divergence checker ───────────────────────────────────────────────
+
+def check_obstacle_divergence(result        : FlowResult,
+                               div_threshold : float = 0.3,
+                               roi_fraction  : float = 0.5) -> "DivergenceAlert":
+    """
+    Check whether the divergence in the central ROI exceeds a threshold.
+
+    An approaching obstacle causes the flow field to *expand* (positive
+    divergence) from its centre.  By watching the central region of the frame
+    we can detect this looming signature before the obstacle fills the view.
+
+    Parameters
+    ----------
+    result        : FlowResult from get_optical_flow().
+    div_threshold : Alert fires when max divergence inside the ROI ≥ this value.
+                    Tune empirically; typical range 0.1 – 1.0.
+    roi_fraction  : Fraction of frame width/height used for the central ROI.
+                    0.5 = centre 50 % of each axis.
+
+    Returns
+    -------
+    DivergenceAlert
+    """
+    H, W  = result.divergence.shape
+    pad_y = int(H * (1 - roi_fraction) / 2)
+    pad_x = int(W * (1 - roi_fraction) / 2)
+    y0, y1 = pad_y, H - pad_y
+    x0, x1 = pad_x, W - pad_x
+
+    roi_mask = np.zeros((H, W), dtype=bool)
+    roi_mask[y0:y1, x0:x1] = True
+
+    roi_div  = result.divergence[roi_mask]
+    max_div  = float(roi_div.max())  if roi_div.size > 0 else 0.0
+    mean_div = float(roi_div.mean()) if roi_div.size > 0 else 0.0
+
+    return DivergenceAlert(
+        triggered = max_div >= div_threshold,
+        max_div   = max_div,
+        mean_div  = mean_div,
+        roi_mask  = roi_mask,
     )
 
-    plant_H, plant_W = all_green_small.shape[:2]
-    clean_mask_small = cv2.resize(
-        clean_mask, (plant_W, plant_H), interpolation=cv2.INTER_NEAREST)
 
-    plant_mask_small = cv2.subtract(all_green_small, clean_mask_small)
-    plant_mask = cv2.resize(
-        plant_mask_small, (W, H), interpolation=cv2.INTER_NEAREST)
+# ── visualisation helpers ─────────────────────────────────────────────────────
 
-    plant_regions = detect_plant_regions(
-        plant_mask,
-        min_width         = plant_min_width,
-        min_pixels_per_col = plant_min_pixels_per_col,
-        max_col_gap       = plant_max_col_gap,
-    )
+def flow_to_hsv_bgr(result: FlowResult) -> np.ndarray:
+    """
+    Convert a FlowResult to a colour-coded BGR image.
+    Hue = direction, Saturation = 255, Value = normalised magnitude.
+    """
+    mag = result.magnitude
+    ang = result.angle
 
-    for (s, e, w) in plant_regions:
-        rows.append([int(s), int(w), DET_PLANT])
+    hsv = np.zeros((*mag.shape, 3), dtype=np.uint8)
+    hsv[..., 0] = (ang / 2).astype(np.uint8)   # hue: 0–180
+    hsv[..., 1] = 255
+    max_mag = mag.max()
+    if max_mag > 0:
+        hsv[..., 2] = (mag / max_mag * 255).astype(np.uint8)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    debug["plant_mask"]           = plant_mask
-    debug["plant_regions_raw"]    = plant_regions
 
-    # ── build output matrix ────────────────────────────────────────────────
-    if rows:
-        detections = np.array(rows, dtype=np.int32)   # shape (N, 3)
+def draw_flow_arrows(image_bgr  : np.ndarray,
+                     result     : FlowResult,
+                     step       : int   = 16,
+                     scale      : float = 3.0,
+                     color      : tuple = (0, 200, 255),
+                     min_mag    : float = 0.5) -> np.ndarray:
+    """
+    Overlay motion arrows on a BGR image.
+    Works for both dense and sparse results.
+    """
+    out = image_bgr.copy()
+    H, W = result.magnitude.shape
+
+    if "flow" in result.vectors:
+        # Dense: sample on a regular grid
+        flow = result.vectors["flow"]
+        ys = range(step // 2, H, step)
+        xs = range(step // 2, W, step)
+        for y in ys:
+            for x in xs:
+                mag = result.magnitude[y, x]
+                if mag < min_mag:
+                    continue
+                fx, fy = flow[y, x]
+                x2 = int(x + fx * scale)
+                y2 = int(y + fy * scale)
+                cv2.arrowedLine(out, (x, y), (x2, y2),
+                                color, 1, tipLength=0.3)
     else:
-        detections = np.empty((0, 3), dtype=np.int32)
+        # Sparse: draw arrows between tracked points
+        prev_pts = result.vectors.get("prev_pts")
+        curr_pts = result.vectors.get("curr_pts")
+        if prev_pts is not None and curr_pts is not None:
+            for p0, p1 in zip(prev_pts.reshape(-1, 2),
+                               curr_pts.reshape(-1, 2)):
+                x0, y0 = int(p0[0]), int(p0[1])
+                x1, y1 = int(p1[0]), int(p1[1])
+                mag = result.magnitude[
+                    min(y0, H - 1), min(x0, W - 1)]
+                if mag < min_mag:
+                    continue
+                cv2.arrowedLine(out, (x0, y0), (x1, y1),
+                                color, 1, tipLength=0.3)
+    return out
 
-    return detections, new_ground_baseline, debug
+def draw_mean_flow_arrow(image_bgr  : np.ndarray,
+                         result     : FlowResult,
+                         scale      : float = 20.0,
+                         color      : tuple = (0, 255, 0),
+                         thickness  : int   = 2) -> np.ndarray:
+    """
+    Draw a single arrow at the image centre representing the mean flow vector.
+
+    The arrow length is proportional to mean_mag; `scale` controls how many
+    pixels one flow-pixel maps to on screen.  A circle is drawn at the tail.
+    """
+    out = image_bgr.copy()
+    H, W = out.shape[:2]
+    cx, cy = W // 2, H // 2
+
+    dx, dy = result.mean_flow_vec
+    ex = int(cx + dx * scale)
+    ey = int(cy + dy * scale)
+
+    cv2.circle(out, (cx, cy), thickness + 2, color, -1)
+    cv2.arrowedLine(out, (cx, cy), (ex, ey), color,
+                    thickness, tipLength=0.25)
+    mag_label = f"{result.mean_mag:.1f}px"
+    cv2.putText(out, mag_label,
+                (cx + 6, cy - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    return out
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+def draw_divergence_overlay(image_bgr : np.ndarray,
+                             result    : FlowResult,
+                             alert     : "DivergenceAlert",
+                             alpha     : float = 0.45) -> np.ndarray:
+    """
+    Overlay the divergence heatmap and ROI box on a BGR image.
+
+    Positive divergence (looming) → red tint.
+    Negative divergence (receding) → blue tint.
+    The ROI rectangle is drawn in yellow (safe) or red (alert triggered).
+    """
+    out  = image_bgr.copy()
+    H, W = out.shape[:2]
+
+    div = result.divergence
+    if div.shape != (H, W):
+        div = cv2.resize(div, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    # Normalise divergence to [0, 255] for display
+    max_abs = max(np.abs(div).max(), 1e-6)
+    norm    = np.clip(div / max_abs, -1.0, 1.0)   # [-1, 1]
+
+    heatmap = np.zeros((H, W, 3), dtype=np.uint8)
+    pos_mask = norm > 0
+    neg_mask = norm < 0
+    heatmap[pos_mask, 2] = (norm[pos_mask] * 255).astype(np.uint8)   # red channel
+    heatmap[neg_mask, 0] = (-norm[neg_mask] * 255).astype(np.uint8)  # blue channel
+
+    cv2.addWeighted(heatmap, alpha, out, 1 - alpha, 0, out)
+
+    # ROI rectangle
+    roi_color = (0, 0, 255) if alert.triggered else (0, 220, 255)
+    ys, xs = np.where(alert.roi_mask)
+    if ys.size > 0:
+        cv2.rectangle(out,
+                      (int(xs.min()), int(ys.min())),
+                      (int(xs.max()), int(ys.max())),
+                      roi_color, 2)
+
+    # Status text
+    status_txt = (f"DIV ALERT  max={alert.max_div:.2f}"
+                  if alert.triggered else
+                  f"div ok  max={alert.max_div:.2f}")
+    txt_color  = (0, 0, 255) if alert.triggered else (0, 220, 255)
+    cv2.putText(out, status_txt, (10, H - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, txt_color, 1)
+
+    return out
+
+
 
 if __name__ == "__main__":
 
-    import solidity_detection as sdd
+    # ── configuration ─────────────────────────────────────────────────────────
+    folder_path   = "DEVELOPMENT/downloads from drone/20260320/"
+    SCALE_FACTOR  = 0.5
+    METHOD        = "farneback"   # "farneback" or "lucas_kanade"
+    FRAME_DELAY   = 1             # ms between waitKey polls
+    DIV_THRESHOLD = 0.3           # divergence alert threshold (tune per scene)
+    ROI_FRACTION  = 0.5           # central ROI size (fraction of frame)
 
-    # ── run mode ─────────────────────────────────────────────
-    MODE = 1
-    # 1 = interactive navigation
-    # 2 = single image
-
-    SINGLE_IMAGE_PATH = "DEVELOPMENT/downloads from drone/20260306-095826/1352900896.jpg"
-    FRAME_DELAY = 1
-
-    cv2.destroyAllWindows()
-
-
-    if MODE == 2:
-        image_paths = [SINGLE_IMAGE_PATH]
-        start_idx   = 0
-    else:
-        #folder_path = "DEVELOPMENT/downloads from drone/20260306-095826/"
-        folder_path = "DEVELOPMENT/downloads from drone/20260313-100130/"
-        #folder_path = "DEVELOPMENT/downloads from drone/sim_images/"
-        image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
-
-        start_idx   = random.randint(0, len(image_paths) - 1)
-
-    oa_color_count_frac = 0.05
-
-    # ── scale factors ──────────────────────────────────────────────────────
-    SCALE_FACTOR       = 0.8
-    PLANT_SCALE_FACTOR = 0.15*0.8  
+    image_paths = sorted(glob(os.path.join(folder_path, "*.jpg")))
+    if not image_paths:
+        print("No images found in:", folder_path)
+        exit(1)
 
     p = get_scaled_params(SCALE_FACTOR)
-    plant_blur_ksize = scale_odd(5, PLANT_SCALE_FACTOR)
+    print(f"Method: {METHOD}  |  scale: {SCALE_FACTOR}  |  "
+          f"blur: {p['blur_ksize']}px  |  "
+          f"div_threshold: {DIV_THRESHOLD}  |  "
+          f"{len(image_paths)} frames found")
+    print("Keys: a/d = prev/next  |  m = toggle method  |  +/- = adjust threshold  |  q = quit")
 
-    print(f"Main scale:  {SCALE_FACTOR}  →  pipeline params: {p}")
-    print(f"Plant scale: {PLANT_SCALE_FACTOR} = "
-          f"{PLANT_SCALE_FACTOR:.2f}  →  plant blur_ksize: {plant_blur_ksize}")
+    idx = random.randint(1, len(image_paths) - 1)
 
-    # state
-    #ground_baseline = None
-
-    if len(image_paths) == 0:
-        print("No images found in the specified path.")
-        exit()
-
-    _probe         = cv2.imread(image_paths[0])
-    orig_H, orig_W = _probe.shape[:2]
-
-    target_W = max(1, int(orig_W * SCALE_FACTOR))
-    target_H = max(1, int(orig_H * SCALE_FACTOR))
-
-    boundary_rows = np.full(target_W, target_W)
-
-    WINDOW = 'Original (top) | Ground mask (mid) | Plants (bot)'
+    WINDOW = "Frame | HSV flow | Arrows+mean | Divergence"
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW, orig_W * 3, orig_H * 3)
 
-    
     needs_processing = True
-    idx = start_idx
-    ground_baseline = np.full(target_H, p['no_ground_baseline'], dtype=np.float32)
+    result: Optional[FlowResult] = None
 
     while True:
         try:
             if needs_processing:
-                image_path = image_paths[idx]
-                raw = cv2.imread(image_path)
-                if raw is None:
-                    print(f"Skipping: {image_path}")
-                    idx = (idx + 1) % len(image_paths) 
+                prev_path = image_paths[idx - 1]
+                curr_path = image_paths[idx]
+
+                prev_raw = cv2.imread(prev_path)
+                curr_raw = cv2.imread(curr_path)
+
+                if prev_raw is None or curr_raw is None:
+                    print(f"Skipping unreadable pair at index {idx}")
+                    idx = max(1, (idx + 1) % len(image_paths))
                     continue
 
-                # ── downscale to main resolution ───────────────────────────────────
-                image_bgr     = cv2.resize(raw, (target_W, target_H), interpolation=cv2.INTER_AREA)
-                image_display = image_bgr.copy()
-                
-                # If we are in single image mode, ALWAYS reset the baseline before processing
-                if MODE == 2:
-                    ground_baseline = np.full(target_H, p['no_ground_baseline'], dtype=np.float32)
+                orig_H, orig_W = curr_raw.shape[:2]
+                tW = max(1, int(orig_W * SCALE_FACTOR))
+                tH = max(1, int(orig_H * SCALE_FACTOR))
 
-                # ── single unified call ────────────────────────────────────────────
-                detections, ground_baseline, debug = get_obstacle_info(
-                    image_bgr,
-                    ground_baseline,
-                    oa_color_count_frac    = oa_color_count_frac,
-                    median_ksize           = p['median_ksize'],
-                    min_width              = p['min_width'],
-                    max_col_gap            = p['max_col_gap'],
-                    min_ground_pixels      = p['min_ground_pixels'],
-                    max_gap                = p['max_gap'],
-                    smooth_kernel          = p['smooth_kernel'],
-                    obstacle_threshold     = p['obstacle_threshold'],
-                    no_ground_baseline     = p['no_ground_baseline'],
-                    plant_scale_factor     = PLANT_SCALE_FACTOR,
-                    plant_blur_ksize       = plant_blur_ksize,
-                    plant_min_width        = 20,
-                    plant_min_pixels_per_col = 2,
-                    plant_max_col_gap      = 5,
+                prev_bgr = cv2.resize(prev_raw, (tW, tH), interpolation=cv2.INTER_AREA)
+                curr_bgr = cv2.resize(curr_raw, (tW, tH), interpolation=cv2.INTER_AREA)
+
+                result = get_optical_flow(
+                    prev_bgr,
+                    curr_bgr,
+                    scale_factor = 1.0,   # already downscaled above
+                    method       = METHOD,
                 )
 
-                # ── unpack debug info ──────────────────────────────────────────────
-                status               = debug["status"]
-                actual_frac          = debug["green_frac"]
-                boundary_rows        = debug["boundary_rows"]
-                obstacle_regions_raw = debug["obstacle_regions_raw"]
-                clean_mask           = debug["clean_mask"]
-                plant_mask           = debug["plant_mask"]
-                plant_regions_raw    = debug["plant_regions_raw"]
+                alert = check_obstacle_divergence(
+                    result,
+                    div_threshold = DIV_THRESHOLD,
+                    roi_fraction  = ROI_FRACTION,
+                )
 
-                # ── split detections by type for display ───────────────────────────
-                if detections.shape[0] > 0:
-                    obs_dets   = detections[detections[:, 2] == DET_OBSTACLE]
-                    plant_dets = detections[detections[:, 2] == DET_PLANT]
-                    print(f"obstacles: {obs_dets} ")
-                else:
-                    obs_dets   = np.empty((0, 3), dtype=np.int32)
-                    plant_dets = np.empty((0, 3), dtype=np.int32)
+                # ── build display panels ───────────────────────────────────
+                hsv_vis = flow_to_hsv_bgr(result)
 
-                n_obs   = obs_dets.shape[0]
-                n_plant = plant_dets.shape[0]
-                print(f"{os.path.basename(image_path)} -> {status} ({actual_frac:.2%}) "
-                      f"| obstacles: {n_obs}  plants: {n_plant}")
+                # Panel 3: grid arrows + mean flow arrow
+                arrows_vis = draw_flow_arrows(
+                    curr_bgr, result,
+                    step  = p["arrow_step"],
+                    scale = p["arrow_scale"],
+                )
+                arrows_vis = draw_mean_flow_arrow(
+                    arrows_vis, result,
+                    scale     = 20.0,
+                    color     = (0, 255, 0),
+                    thickness = max(1, scale_int(2, SCALE_FACTOR)),
+                )
 
-                # ── build display panels ───────────────────────────────────────────
-                result = np.zeros_like(image_bgr)
-                result[..., 0] = clean_mask
-                result[..., 1] = clean_mask
-                result[..., 2] = clean_mask
+                # Panel 4: divergence heatmap + ROI + alert
+                div_vis = draw_divergence_overlay(curr_bgr, result, alert)
 
-                plant_result = np.zeros_like(image_display)
-                plant_result[plant_mask > 0] = [0, 255, 0]
-                edges = sdd.get_blob_edge(plant_mask)
-                plant_result[edges > 0] = [0, 0, 255]
+                # ── rotate all panels 90° clockwise ───────────────────────
+                curr_rot   = cv2.rotate(curr_bgr,   cv2.ROTATE_90_COUNTERCLOCKWISE)
+                hsv_rot    = cv2.rotate(hsv_vis,    cv2.ROTATE_90_COUNTERCLOCKWISE)
+                arrows_rot = cv2.rotate(arrows_vis, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                div_rot    = cv2.rotate(div_vis,    cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-                image_rot  = cv2.rotate(image_display, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                result_rot = cv2.rotate(result,        cv2.ROTATE_90_COUNTERCLOCKWISE)
-                plant_rot  = cv2.rotate(plant_result,  cv2.ROTATE_90_COUNTERCLOCKWISE)
-                combined_view = np.vstack((image_rot, result_rot, plant_rot))
+                combined = np.hstack((curr_rot, hsv_rot, arrows_rot, div_rot))
 
-                cv2.putText(combined_view,
-                            f"{status} | {actual_frac:.2%}",
-                            (p['status_x'], p['status_y']),
+                # ── status label ──────────────────────────────────────────
+                alert_tag = "  !! DIV ALERT !!" if alert.triggered else ""
+                label = (f"[{idx}/{len(image_paths)-1}]  "
+                         f"{os.path.basename(curr_path)}  |  "
+                         f"mean mag: {result.mean_mag:.2f}px  "
+                         f"dx={result.mean_flow_vec[0]:.1f} dy={result.mean_flow_vec[1]:.1f}  |  "
+                         f"div max={alert.max_div:.2f} thr={DIV_THRESHOLD:.2f}  |  "
+                         f"{METHOD}{alert_tag}")
+                lbl_color = (0, 0, 255) if alert.triggered else (0, 255, 255)
+                cv2.putText(combined, label,
+                            (p["status_x"], p["status_y"]),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            p['status_font_scale'],
-                            (0, 0, 255),
-                            p['status_thickness'])
+                            p["status_font_scale"],
+                            lbl_color,
+                            p["status_thickness"])
 
-                h_rot = image_rot.shape[0]
+                cv2.imshow(WINDOW, combined)
+                # after 90° rotation width↔height swap; 4 panels wide
+                cv2.resizeWindow(WINDOW, orig_H * 4, orig_W)
+                print(label)
+                needs_processing = False
 
-                # ── draw obstacle boxes (red) ──────────────────────────────────────
-                if status == "GROUND FOUND":
-                    if ground_baseline is not None:
-                        valid_r = np.where(ground_baseline < combined_view.shape[0])[0]
-                        if len(valid_r) > 1:
-                            pts = np.array(
-                                [[int(r), int(ground_baseline[r]) + h_rot] for r in valid_r],
-                                dtype=np.int32)
-                            cv2.polylines(combined_view, [pts], False, (255, 0, 0), 1)
-
-                    for (start_col, end_col, width) in obstacle_regions_raw:
-                        y_top = int(min(boundary_rows[start_col:end_col + 1]))
-                        y_bot = int(max(boundary_rows[start_col:end_col + 1])) + p['box_bottom_pad']
-
-                        cv2.rectangle(combined_view,
-                                      (start_col, y_top + h_rot),
-                                      (end_col,   y_bot + h_rot),
-                                      (0, 0, 255), p['box_thickness'])
-                        cv2.putText(combined_view, f"w={width}",
-                                    (start_col, y_top + h_rot - p['label_y_offset']),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    p['label_font_scale'],
-                                    (0, 0, 255),
-                                    p['label_thickness'])
-
-                        cv2.rectangle(combined_view,
-                                      (start_col, 0),
-                                      (end_col,   h_rot - 1),
-                                      (0, 0, 255), p['box_thickness'])
-                        cv2.putText(combined_view, f"w={width}",
-                                    (start_col, p['label_y_top']),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    p['label_font_scale'],
-                                    (0, 0, 255),
-                                    p['label_thickness'])
-
-                # ── draw plant boxes (green) ───────────────────────────────────────
-                for (start_col, end_col, width) in plant_regions_raw:
-                    cv2.rectangle(combined_view,
-                                  (start_col, 0),
-                                  (end_col,   h_rot - 1),
-                                  (0, 255, 0), p['box_thickness'])
-                    cv2.putText(combined_view, f"p={width}",
-                                (start_col, p['label_y_top']),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                p['label_font_scale'],
-                                (0, 255, 0),
-                                p['label_thickness'])
-
-                cv2.imshow(WINDOW, combined_view)
-                
-                # Processing complete. Wait for user to trigger the next image.
-                needs_processing = False 
-
-            # ── Handle Input / Delay ───────────────────────────────────────────────
-            # Using FRAME_DELAY instead of 0 prevents OpenCV from blocking KeyboardInterrupt
             key = cv2.waitKey(FRAME_DELAY) & 0xFF
-
-            if key == ord('q'):
+            if key == ord("q"):
                 break
-            elif key == ord('d'):      # next image
-                idx = (idx + 1) % len(image_paths)
+            elif key == ord("d"):
+                idx = min(len(image_paths) - 1, idx + 1)
                 needs_processing = True
-            elif key == ord('a'):      # previous image
-                idx = (idx - 1) % len(image_paths)
+            elif key == ord("a"):
+                idx = max(1, idx - 1)
                 needs_processing = True
+            elif key == ord("m"):
+                METHOD = ("lucas_kanade"
+                          if METHOD == "farneback" else "farneback")
+                needs_processing = True
+                print(f"Switched to: {METHOD}")
+            elif key in (ord("+"), ord("=")):
+                DIV_THRESHOLD = round(DIV_THRESHOLD + 0.05, 3)
+                needs_processing = True
+                print(f"div_threshold → {DIV_THRESHOLD}")
+            elif key == ord("-"):
+                DIV_THRESHOLD = round(max(0.01, DIV_THRESHOLD - 0.05), 3)
+                needs_processing = True
+                print(f"div_threshold → {DIV_THRESHOLD}")
 
         except KeyboardInterrupt:
-            print("\nProcess interrupted by user (Ctrl+C). Exiting...")
+            print("\nInterrupted. Exiting.")
             break
 
     cv2.destroyAllWindows()
