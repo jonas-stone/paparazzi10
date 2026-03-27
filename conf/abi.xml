@@ -190,10 +190,6 @@
     </message>
 
     <message name="JOYSTICK" id="28">
-      <!--
-           This message can be used to send command inputs from a joystick or equivalent
-           either for the control of the airframe or the control of the payload
-      -->
       <field name="roll"      type="int16_t">Roll input in pprz_t [-9600;9600]</field>
       <field name="pitch"     type="int16_t">Pitch input in pprz_t [-9600;9600]</field>
       <field name="yaw"       type="int16_t">Yaw input in pprz_t [-9600;9600]</field>
@@ -265,6 +261,7 @@
       <field name="stamp" type="uint32_t" unit="us"/>
       <field name="relpos" type="struct RelPosNED *"/>
     </message>
+
     <message name="ACTUATORS_T4_OUT" id="40">
       <field name="actuators_t4_out_ptr" type="struct ActuatorsT4Out *">Pointer pointing at the actuators_t4_out struct</field>
       <field name="actuators_t4_extra_data_out_ptr" type="float *">Pointer pointing at the actuators_t4_extra_data_out array</field>
@@ -275,9 +272,18 @@
       <field name="actuators_t4_extra_data_in_ptr" type="float *">Pointer pointing at the actuators_t4_extra_data_in array</field>
     </message>
 
-    <message name="TEAM10_GROUND_DETECTION" id="250">
-    <field type="struct obstacle_region_t *" name="obstacles"/>
-    <field type="uint8_t" name="count"/>
+    <message name="TEAM10_GROUND_DETECTION" id="42">
+      <field name="obstacles"      type="struct obstacle_region_t *"/>
+      <field name="obstacle_count" type="uint8_t"/>
+      <field name="plants"         type="struct obstacle_region_t *"/>
+      <field name="plant_count"    type="uint8_t"/>
+      <field name="boundary_rows"  type="int16_t *"/>
+      <field name="boundary_len"   type="uint16_t"/>
+    </message>
+
+    <message name="TEAM10_GATE_DETECTION" id="43">
+      <field name="gd" type="float"/>
+      <field name="gx" type="float"/>
     </message>
 
   </msg_class>

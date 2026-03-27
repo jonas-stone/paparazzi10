@@ -1,4 +1,5 @@
 #include "team10_rtp_utilities.h"
+#include "team10_logic.h"
 #include <string.h>
 
 // ── 1. MASK PRINTER ───────────────────────────────────────────────────────────
@@ -133,7 +134,7 @@ void draw_obstacle_detection_bar(struct image_t *img, int w, int h,
     }
 
     for (int y = 0; y < h; y++) {
-        for (int x = w - 4; x < w - 2; x += 2) {
+        for (int x = w - 4; x < w; x += 2) {
             uint8_t *p = &src[y * 2 * w + 2 * x];
             if (is_obs_y[h - 1 - y]) {
                 p[0] = 85;   // U → red
@@ -150,73 +151,70 @@ void draw_obstacle_detection_bar(struct image_t *img, int w, int h,
     }
 }
 
-// ── GET SAFEST COLUMN (0=leftmost, 6=rightmost, -1=all blocked) ──────────────
-int get_safest_column(int h, uint8_t no, struct obstacle_region_t oo[])
-{
-    int col_width = h / 7;
-    uint8_t has_obstacle[7] = {0};
-
-    for (int col = 0; col < 7; col++) {
-        int y_start = col * col_width;
-        int y_end   = (col == 6) ? h : y_start + col_width;
-
-        for (int i = 0; i < no; i++) {
-            int s  = (int)oo[i].start;
-            int e  = s + (int)oo[i].width - 1;
-            int vs = h - 1 - e;
-            int ve = h - 1 - s;
-            if (vs < 0)  vs = 0;
-            if (ve >= h) ve = h - 1;
-            if (vs < y_end && ve >= y_start) {
-                has_obstacle[col] = 1;
-                break;
-            }
-        }
-    }
-
-    // Priority order: center outward → 3, 2, 4, 1, 5, 0, 6
-    static const int priority[7] = {3, 2, 4, 1, 5, 0, 6};
-    for (int i = 0; i < 7; i++) {
-        int col = priority[i];
-        if (!has_obstacle[col]) return col;
-    }
-    return -1; // all blocked
-}
-
-// ── 4. SAFE DIRECTION BAR ────────────────────────────────────────────────────
+// ── 3. SAFE DIRECTION BAR ────────────────────────────────────────────────────
 void draw_safe_direction_bar(struct image_t *img, int w, int h,
-                             uint8_t no, struct obstacle_region_t oo[])
+                             uint8_t no, struct obstacle_region_t oo[],
+                             uint8_t np, struct obstacle_region_t po[],
+                             const float gb[])
 {
     uint8_t *src = (uint8_t *)img->buf;
-    int col_width = h / 7;
-    int best = get_safest_column(h, no, oo);
 
-    for (int col = 0; col < 7; col++) {
-        int y_start = col * col_width;
-        int y_end   = (col == 6) ? h : y_start + col_width;
+    /* Use motion_logic_normalised to find the safest column */
+    int safe_col = motion_logic_normalised(oo, no, po, np, gb, w, h,
+                                           DEFAULT_OBS_BIAS_FRAC,
+                                           DEFAULT_PLANT_BIAS_FRAC);
 
-        int has_obstacle = 0;
-        for (int i = 0; i < no; i++) {
-            int s  = (int)oo[i].start;
-            int e  = s + (int)oo[i].width - 1;
-            int vs = h - 1 - e;
-            int ve = h - 1 - s;
-            if (vs < 0)  vs = 0;
-            if (ve >= h) ve = h - 1;
-            if (vs < y_end && ve >= y_start) {
-                has_obstacle = 1;
-                break;
-            }
-        }
+    int safe_y = safe_col;
+    if (safe_y < 0)       safe_y = 0;
+    if (safe_y >= img->h) safe_y = img->h - 1;
 
-        for (int y = y_start; y < y_end; y++) {
-            for (int x = w - 2; x < w; x += 2) {
-                uint8_t *p = &src[y * 2 * w + 2 * x];
-                if (col == best) {
-                    p[0] = 44;  p[1] = 150; p[2] = 21;  p[3] = 150; // green
-                } else {
-                    p[0] = 128; p[1] = 0;   p[2] = 128; p[3] = 0;   // black
-                }
+    /* Draw a visually vertical blue line */
+    for (int x = 0; x < img->w; x += 2) {
+        uint8_t *p = &src[safe_y * 2 * img->w + x * 2];
+        p[0] = 255;  /* U → blue */
+        p[1] = 128;  /* Y0       */
+        p[2] = 0;    /* V        */
+        p[3] = 128;  /* Y1       */
+    }
+}
+
+void draw_region_boundaries(struct image_t *img, int w, int h,
+                             uint8_t n, struct obstacle_region_t oo[],
+                             region_type_t type)
+{
+    uint8_t *src = (uint8_t *)img->buf;
+
+    // UYVY colour definitions: {U, Y, V, Y}
+    const uint8_t red[4]    = {85,  76,  255, 76 };
+    const uint8_t orange[4] = {44,  150, 212, 150};
+    const uint8_t green[4]  = {86,  150, 54,  150};
+    const uint8_t yellow[4] = {0,   210, 146, 210};
+
+    const uint8_t *inner = (type == REGION_OBSTACLE) ? red    : green;
+    const uint8_t *outer = (type == REGION_OBSTACLE) ? orange : yellow;
+    float          frac  = (type == REGION_OBSTACLE) ? DEFAULT_OBS_BIAS_FRAC : DEFAULT_PLANT_BIAS_FRAC;
+
+    for (int i = 0; i < n; i++) {
+        int bias            = normalised_bias(&oo[i], frac);
+        int col_left_outer  = (int)oo[i].start - bias;
+        int col_left_inner  = (int)oo[i].start;
+        int col_right_inner = (int)oo[i].start + (int)oo[i].width;
+        int col_right_outer = (int)oo[i].start + (int)oo[i].width + bias;
+
+        int            cols[4]   = {col_left_outer, col_left_inner,
+                                    col_right_inner, col_right_outer};
+        const uint8_t *colors[4] = {outer, inner, inner, outer};
+
+        for (int ci = 0; ci < 4; ci++) {
+            int y = cols[ci];   // era x, ora è y
+            if (y < 0 || y >= h) continue;
+
+            for (int x = 0; x < w; x += 2) {
+                uint8_t *p = &src[y * 2 * w + x * 2];
+                p[0] = colors[ci][0];
+                p[1] = colors[ci][1];
+                p[2] = colors[ci][2];
+                p[3] = colors[ci][3];
             }
         }
     }

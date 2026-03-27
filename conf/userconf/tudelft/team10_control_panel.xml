@@ -28,7 +28,7 @@
       <program name="Joystick">
         <arg flag="-ac" constant="@AIRCRAFT"/>
         <arg flag="sm600.xml"/>
-        <arg flag="-d 0"/>
+        <arg flag="-id 0"/>
       </program>
       <program name="RtpViewer">
         <arg flag="-s" constant="1"/>
@@ -49,7 +49,7 @@
     </session>
     <session name="Simulation - Gazebo">
       <program name="Simulator">
-        <arg flag="-a" constant="test"/> <!-- aircraft name: "test" -->
+        <arg flag="-a" constant="@AIRCRAFT"/> <!-- constant="aircraft name" -->
         <arg flag="-t" constant="nps"/>
       </program>
       <program name="Data Link">
@@ -63,9 +63,9 @@
         <arg flag="--speech"/>
       </program>
       <program name="Joystick">
-        <arg flag="-ac" constant="test"/> <!-- aircraft name: "test" -->
+        <arg flag="-ac" constant="@AIRCRAFT"/> <!-- constant="aircraft name" -->
         <arg flag="sm600.xml"/>
-        <arg flag="-d 0"/>
+        <arg flag="-id 0"/>
       </program>
       <program name="Gazebo"/>
       <program name="RtpViewer">

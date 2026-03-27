@@ -225,6 +225,7 @@ def is_ground(Y, U, V):
                     return 0
 
 
+<<<<<<< HEAD
 def is_ground_sim(Y, U, V):
     if U <= 96.50:
         if Y <= 102.50:
@@ -262,6 +263,8 @@ def is_ground_sim(Y, U, V):
                     return 0
 
 
+=======
+>>>>>>> origin/Vito_Fantastic_RTPs
 # def is_ground(Y, U, V):
 #     if U <= 96.50:
 #         if Y <= 102.50:

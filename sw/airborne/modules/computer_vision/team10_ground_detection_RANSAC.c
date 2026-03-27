@@ -1,5 +1,7 @@
 /*
- * @file team10_c_test_pipeline.c — 
+ * team10_ground_detection.c — master module (obstacles + plants)
+ * Callback structure unchanged. get_obstacle_info now includes
+ * is_smooth_blob filtering and plant detection.
  */
 
  // own header
@@ -13,18 +15,18 @@
 #include "team10_rtp_utilities.h"
 #include "team10_get_obstacle_info.h"
 #include "modules/computer_vision/lib/vision/image.h"
-// #include "modules/computer_vision/cv.h"
+#include "modules/computer_vision/cv.h"
 
-// #include "modules/core/abi.h"
+#include "modules/core/abi.h"
 
 #include "std.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <math.h>
-// #include "pthread.h"
+#include "pthread.h"
 
-// static pthread_mutex_t mutex;
+static pthread_mutex_t mutex;
 
 #ifndef COLOR_OBJECT_DETECTOR_FPS1
 #define COLOR_OBJECT_DETECTOR_FPS1 0
@@ -44,7 +46,7 @@ struct column_bucket_t buckets[NUMBER_VERTICAL_BUCKETS] = {0};
 // ground detection variables
 static bool obstacles_updated = false;
 uint8_t ground_mask[MAX_PIXELS];
-uint8_t edge_mask[MAX_PIXELS] = {0};
+uint8_t edge_mask[MAX_PIXELS];
 float   edge_coords[MAX_PIXELS][2];
 int     parabola_boundary[MAX_IMAGE_HEIGHT];
 
@@ -71,27 +73,31 @@ yuv_color_e bucket_color   = BLUE;
 yuv_color_e safe_color     = GREEN;
 
 // exponential smoothing parameter -> higher, less smoothing
-float alpha_parabola = 0.8;
-float alpha_safety   = 1;
+float alpha_parabola = 0.7;
+float alpha_safety   = 0.2;
 /*
   FUNCTION: get_obstacles_ransac
 
   Hses RANSAC algorithm to detect obstacles.
   Main pipeline of this obstacle detection logic.
 */
-struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id __attribute__((unused))) 
+static struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id __attribute__((unused))) 
 {
 
   // just so we don't modify the contended globals all the time.
   local_safest_bucket = safest_bucket; // persists between calls
   local_max_safety = max_safety;
-  memset(edge_mask, 0, sizeof(edge_mask));
 
   int w = img->w;
   int h = img->h;
 
   /* ── 1. GET GROUND BLOB ──────────────────────────────────────────────────
-
+    * detect_green_ground_ml  → raw binary mask in work_mask
+    * isolate_ground_blob     → removes non-ground blobs in-place
+    * Both functions live in team10_get_obstacle_info.c
+    * work_mask is a static buffer declared there, so we need a local copy
+    * we can own. We use edge_out (declared below) as scratch first, then
+    * we allocate a local mask on the stack (or static).
   */
 
   float green_frac = 0.0f;
@@ -103,29 +109,48 @@ struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id __at
   isolate_ground_blob(ground_mask, w, h, area_threshold);
 
   /* ── 2. FILL HOLES IN GROUND BLOB ───────────────────────────────────────
-
+    * fill_holes_mask modifies the mask in-place using BFS from the border.
+    * Any black region not reachable from the border gets filled white.
   */
-  flip_mask_horizontal(ground_mask, w, h);
   fill_holes_mask(ground_mask, w, h);
-  flip_mask_horizontal(ground_mask, w, h);
 
-  
+  // DRAW GROUND MASK ON img
+  if (draw_ground_mask) draw_mask_printer(img, ground_mask, w, h);
 
   /* ── 3. GET EDGE ─────────────────────────────────────────────────────────
-
+    * get_blob_edge_mask reads the mask and writes a
+    * binary edge map into edge_out (1 = edge pixel, 0 = not).
+    * Returns the total count of edge pixels found.
   */
   total_edge_pixel_count = get_blob_edge_mask(ground_mask, w, h, edge_mask);
 
   if (total_edge_pixel_count == 0) return img;  // no edge found, nothing to fit
 
   /* ── 4. GET EDGE PIXEL COORDINATES ──────────────────────────────────────
-
+    * get_edge_pixel_coordinates walks the edge_mask and fills a [N][2]
+    * array with (x, y) of every edge pixel.
+    * We need to allocate for the worst case (all pixels are edges).
   */
   get_edge_pixel_coordinates(w, h, edge_mask, edge_coords);
-  // DRAW MASK ON img
-  if (draw_ground_mask) draw_mask_printer(img, edge_mask, w, h);
 
   /* ── 5. USE RANSAC, GET PARABOLA COEFFS ──────────────────────────────────
+    * We want to fit:  y = a*x^2 + b*x + c
+    * i.e. target = y,  sample = [x]  with degree=2 and use_bias=true
+    *
+    * RANSAC_linear_model signature:
+    *   RANSAC_linear_model(n_samples, n_iterations, error_threshold,
+    *                       targets, D, samples, count,
+    *                       use_bias, degree, params, fit_error)
+    *
+    * With D=1, degree=2:
+    *   expanded_dim = 1 + 1*(1+1)/2 = 2  → features are [x, x^2]
+    *   params size  = 2 + 1 (bias) = 3   → [w_x, w_x2, bias]
+    *   prediction   = w_x*x + w_x2*x^2 + bias
+    *                = w_x2*x^2 + w_x*x + bias
+    *   so coeffs for eval_parabola(coeffs, x) = a*x^2 + b*x + c are:
+    *     coeffs[0] = params[1]   (x^2 term)
+    *     coeffs[1] = params[0]   (x   term)
+    *     coeffs[2] = params[2]   (bias / constant)
   */
 
   // Build targets (y values) and samples (x values) from edge_coords
@@ -141,7 +166,7 @@ struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id __at
   float fit_error = 0.0f;
 
   RANSAC_linear_model(
-      03,               // n_samples per iteration
+      10,               // n_samples per iteration
       100,              // n_iterations
       5.0f,             // error_threshold in pixels
       targets,          // y values
@@ -165,7 +190,7 @@ struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id __at
     * compute the fitted column position y = a*r^2 + b*r + c.
     * Output is a vector of length h (number of rows).
   */
-  // pthread_mutex_lock(&mutex);
+  pthread_mutex_lock(&mutex);
   // RESET RETURN VALUE; if not, pixels will accumulate forever
   memset(buckets, 0, sizeof(buckets));
 
@@ -247,7 +272,7 @@ struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id __at
   safest_bucket     = local_safest_bucket;
   max_safety        = local_max_safety;
   obstacles_updated = true;
-  // pthread_mutex_unlock(&mutex);
+  pthread_mutex_unlock(&mutex);
 
   return img;
 }
@@ -287,13 +312,32 @@ float compute_bucket_confidence(struct column_bucket_t *bucket) {
     return fmaxf(score, 0.0f); 
 }
 
+void ground_detection_init(void)
+{
+  // maybe set memory to stuff
+  pthread_mutex_init(&mutex, NULL);
+  cv_add_to_device(&COLOR_OBJECT_DETECTOR_CAMERA1, get_obstacles_RANSAC, COLOR_OBJECT_DETECTOR_FPS1, 0);
+}
 
-void flip_mask_horizontal(uint8_t *mask, int w, int h) {
-    for (int row = 0; row < h; row++) {
-        for (int col = 0; col < w / 2; col++) {
-            uint8_t tmp = mask[row * w + col];
-            mask[row * w + col] = mask[row * w + (w - 1 - col)];
-            mask[row * w + (w - 1 - col)] = tmp;
-        }
-    }
+void ground_detection_periodic(void)
+{
+  float local_safety[NUMBER_VERTICAL_BUCKETS];
+  struct column_bucket_t local_img_cols[NUMBER_VERTICAL_BUCKETS];
+  float local_max_safety;
+  float local_safest_bucket;
+
+  pthread_mutex_lock(&mutex);
+  if (!obstacles_updated) { 
+    pthread_mutex_unlock(&mutex); return; 
+  }
+
+  memcpy(local_safety, smoothed_safety, NUMBER_VERTICAL_BUCKETS * sizeof(float));
+  memcpy(local_img_cols, buckets, NUMBER_VERTICAL_BUCKETS * sizeof(struct column_bucket_t));
+  local_max_safety    = max_safety;
+  local_safest_bucket = safest_bucket;
+  obstacles_updated   = false;
+  pthread_mutex_unlock(&mutex);
+
+  // remember to change this function isnside mr. ABI stuff
+  AbiSendMsgTEAM10_RANSAC_DETECTION(TEAM10_RANSAC_DETECTION_ID, local_max_safety, local_safest_bucket, local_img_cols, local_safety);
 }

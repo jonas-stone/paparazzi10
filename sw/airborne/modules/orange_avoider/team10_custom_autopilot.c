@@ -18,8 +18,9 @@
  */
 
  // Team 10 inclusions
-#include "modules/orange_avoider/team10_autopilot.h"
+#include "modules/orange_avoider/team10_custom_autopilot.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
+#include "modules/computer_vision/team10_logic.h"
 
 // Other inclusions
 #include "modules/orange_avoider/orange_avoider.h"
@@ -48,7 +49,8 @@ static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeter
 static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
 static uint8_t increase_nav_heading(float incrementDegrees);
 static uint8_t chooseRandomIncrementAvoidance(void);
-float speed_multiplier = 1.0f;
+static uint8_t chooseWiseIncrementAvoidance(int safe_col);
+float speed_multiplier = 0.5;
 
 enum navigation_state_t {
   SAFE,
@@ -118,7 +120,13 @@ static void ground_detection_callback(
  */
 void ground_obstacle_avoidance_init(void) {
   srand(time(NULL));
-  chooseRandomIncrementAvoidance();
+  int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                                   plants, plant_count,
+                                                   boundary_rows_f,
+                                                   boundary_len, MAX_IMAGE_HEIGHT,
+                                                   DEFAULT_OBS_BIAS_FRAC,
+                                                   DEFAULT_PLANT_BIAS_FRAC);
+  chooseWiseIncrementAvoidance(safe_col);
   AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, &ground_detection_ev, ground_detection_callback);
 }
 
@@ -168,8 +176,14 @@ void ground_obstacle_avoidance_periodic(void)
       waypoint_move_here_2d(WP_GOAL);
       waypoint_move_here_2d(WP_TRAJECTORY);
 
-      // randomly select new search direction
-      chooseRandomIncrementAvoidance();
+      // logically select new search direction
+      int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                                   plants, plant_count,
+                                                   boundary_rows_f,
+                                                   boundary_len, MAX_IMAGE_HEIGHT,
+                                                   DEFAULT_OBS_BIAS_FRAC,
+                                                   DEFAULT_PLANT_BIAS_FRAC);
+      chooseWiseIncrementAvoidance(safe_col);
 
       navigation_state = SEARCH_FOR_SAFE_HEADING;
 
@@ -268,6 +282,19 @@ uint8_t chooseRandomIncrementAvoidance(void)
     heading_increment = 5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
   } else {
+    heading_increment = -5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  }
+  return false;
+}
+
+uint8_t chooseWiseIncrementAvoidance(int safe_direction)
+{
+  
+  if (safe_direction > MAX_IMAGE_WIDTH / 2) {
+    heading_increment = 5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  } else if(safe_direction < MAX_IMAGE_WIDTH / 2){
     heading_increment = -5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
   }

@@ -34,6 +34,8 @@
 #define MAX_CC_LABELS 512
 #endif
 
+
+
 /* ── detection type flags ──────────────────────────────────────────────────── */
 #define DET_OBSTACLE  0
 #define DET_PLANT     1
@@ -75,11 +77,18 @@
 #define LAX_GREEN_V_MAX  141
 
 /* ── region descriptor ─────────────────────────────────────────────────────── */
+/* ── region descriptor ─────────────────────────────────────────────────────── */
 struct obstacle_region_t {
     uint16_t start;
     uint16_t width;
     uint16_t baseline_height;
 };
+
+typedef struct {
+    float    gf;
+    int      ground;
+    uint8_t *mask;
+} obstacle_info_result_t;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  PUBLIC API
@@ -98,7 +107,8 @@ uint8_t get_obstacle_info(
         uint8_t                   *plant_count_out,
         int                        boundary_rows_out[],
         int                       *ground_found_out,
-        float                     *green_frac_out
+        float                     *green_frac_out,
+        obstacle_info_result_t    *result_out
 );
 
 /* ── exposed helpers for testing ───────────────────────────────────────────── */

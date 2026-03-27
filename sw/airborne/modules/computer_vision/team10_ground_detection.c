@@ -19,7 +19,9 @@
  */
 #include "modules/computer_vision/team10_ground_detection.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
+#include "modules/computer_vision/team10_rtp_utilities.h"
 #include "modules/computer_vision/lib/vision/image.h"
+#include <team10_rtp_utilities.h>
 #include "modules/computer_vision/cv.h"
 #include "modules/core/abi.h"
 #include "std.h"
@@ -40,7 +42,7 @@ static pthread_mutex_t mutex;
 /* ── Downscale settings ───────────────────────────────────────────────────── */
 /* Scale factor as fraction: 4/5 = 0.8×                                      */
 /* Bebop2 camera: 240×520 → scaled: 192×416                                  */
-#define SCALE_NUM  5
+#define SCALE_NUM  4
 #define SCALE_DEN  5
 
 #define MAX_SCALED_W  ((MAX_IMAGE_WIDTH  * SCALE_NUM / SCALE_DEN) + 2)
@@ -58,6 +60,8 @@ static uint8_t  global_obstacle_count = 0;
 static uint8_t  global_plant_count    = 0;
 struct obstacle_region_t global_obstacles[MAX_OBSTACLE_REGIONS];
 struct obstacle_region_t global_plants[MAX_PLANT_REGIONS];
+static int16_t  global_boundary[MAX_IMAGE_HEIGHT];
+static uint16_t global_boundary_len = 0;
 
 /* ══════════════════════════════════════════════════════════════════════════════
  *  YUV422 NEAREST-NEIGHBOUR DOWNSAMPLE
@@ -127,7 +131,8 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     struct obstacle_region_t local_obstacles[MAX_OBSTACLE_REGIONS];
     struct obstacle_region_t local_plants[MAX_PLANT_REGIONS];
     uint8_t                  plant_count = 0;
-    
+
+    obstacle_info_result_t result;
     uint8_t obstacle_count = get_obstacle_info(
             &scaled_img,
             ground_baseline,
@@ -140,7 +145,8 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
             &plant_count,
             boundary_rows,
             NULL,
-            NULL
+            NULL,
+            &result
     );
 
     /* ── Scale coordinates back to native resolution ──────────────────────── */
@@ -160,23 +166,45 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     int gate_result[2];   /* [0] = detected flag, [1] = centre x pixel     */
     detect_gate(img, gate_result);
 
+    /* ── Copy to globals ──────────────────────────────────────────────────── */
+    uint16_t br_len = (uint16_t)dst_h;
     pthread_mutex_lock(&mutex);
     memcpy(global_obstacles, local_obstacles, MAX_OBSTACLE_REGIONS * sizeof(struct obstacle_region_t));
     memcpy(global_plants, local_plants, MAX_PLANT_REGIONS * sizeof(struct obstacle_region_t));
     global_obstacle_count = obstacle_count;
     global_plant_count    = plant_count;
+    // copy boundary rows
+    global_boundary_len = br_len;
+    for (uint16_t i = 0; i < br_len; i++) {
+        global_boundary[i] = (int16_t)((boundary_rows[i] * SCALE_DEN) / SCALE_NUM);
+    }
+    obstacles_updated = true;
+
     gate_detected         = (uint8_t)gate_result[0];
     gate_center_x         = gate_result[1];
     obstacles_updated     = true;
-    for (int i = 0; i < obstacle_count; i++)
-        printf("Obstacle %d: left=%d width=%d\n", i, global_obstacles[i].start, global_obstacles[i].width);
-    for (int i = 0; i < plant_count; i++)
-        printf("Plant    %d: start=%d width=%d\n", i, global_plants[i].start, global_plants[i].width);
-    if (gate_detected)
-        printf("Gate: detected  centre_x=%d px\n", gate_center_x);
-    else
-        printf("Gate: not detected\n");
+    // for (int i = 0; i < obstacle_count; i++)
+    //     printf("Obstacle %d: left=%d width=%d\n", i, global_obstacles[i].start, global_obstacles[i].width);
+    // for (int i = 0; i < plant_count; i++)
+    //     printf("Plant    %d: start=%d width=%d\n", i, global_plants[i].start, global_plants[i].width);
+    // if (gate_detected)
+    //     printf("Gate: detected  centre_x=%d px\n", gate_center_x);
+    // else
+    //     printf("Gate: not detected\n");
     pthread_mutex_unlock(&mutex);
+
+    // RTP VISUALIZATION
+    
+    //draw_mask_printer(img, result.mask, scaled_img.w, scaled_img.h);
+    draw_toolbar_vertical(img, img->w, img->h, result.gf, obstacle_count, local_obstacles);
+    draw_safe_direction_bar(img, img->w, img->h,
+                        obstacle_count, local_obstacles,
+                        plant_count, local_plants,
+                        ground_baseline);
+    draw_region_boundaries(img, img->w, img->h, obstacle_count, local_obstacles, REGION_OBSTACLE);
+    //draw_region_boundaries(img, img->w, img->h, plant_count,    local_plants,    REGION_PLANT);
+    //draw_obstacle_detection_bar(img, img->w, img->h, obstacle_count, local_obstacles);
+
     return img;
 }
 
@@ -195,20 +223,36 @@ void ground_detection_init(void)
 void ground_detection_periodic(void)
 {
     struct obstacle_region_t lo[MAX_OBSTACLE_REGIONS], lp[MAX_PLANT_REGIONS];
+    int16_t  br[MAX_IMAGE_HEIGHT];
     uint8_t oc, pc, gd;
+    uint16_t bl;
     int gx;
+
     pthread_mutex_lock(&mutex);
-    if (!obstacles_updated) { pthread_mutex_unlock(&mutex); return; }
-    oc = global_obstacle_count; pc = global_plant_count;
+    if (!obstacles_updated) {
+        pthread_mutex_unlock(&mutex);
+        return;
+    }
+    oc = global_obstacle_count;
+    pc = global_plant_count;
+    bl = global_boundary_len;
     gd = gate_detected;
     gx = gate_center_x;
+
     memcpy(lo, global_obstacles, sizeof(lo));
-    memcpy(lp, global_plants, sizeof(lp));
+    memcpy(lp, global_plants,    sizeof(lp));
+    memcpy(br, global_boundary,  bl * sizeof(int16_t));
     obstacles_updated = false;
     pthread_mutex_unlock(&mutex);
 
-    /* All coordinates in native camera resolution (240×520 row-index space). */
-    AbiSendMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, lo, oc);
+    // NOW send everything: obstacles, plants, and boundary
+    AbiSendMsgTEAM10_GROUND_DETECTION(
+        TEAM10_GROUND_DETECTION_ID,
+        lo, oc,
+        lp, pc,
+        br, bl
+    );
     AbiSendMsgTEAM10_GATE_DETECTION(TEAM10_GATE_DETECTION_ID, gd, gx);
     (void)pc; (void)lp;
 }
+

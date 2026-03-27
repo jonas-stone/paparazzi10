@@ -12,8 +12,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
-#include "team10_rtp_utilities.h"
-
+#include <team10_rtp_utilities.h>
 /* ══════════════════════════════════════════════════════════════════════════════
  *  STATIC WORK BUFFERS
  * ══════════════════════════════════════════════════════════════════════════════ */
@@ -648,7 +647,7 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
                           float oacf, int mk, int mw,
                           struct obstacle_region_t oo[],
                           struct obstacle_region_t po[], uint8_t *pco,
-                          int bro[], int *gfo, float *gfro)
+                          int bro[], int *gfo, float *gfro, obstacle_info_result_t *result_out)
 {
     int w = img->w, h = img->h;
     if (w > MAX_IMAGE_WIDTH) w = MAX_IMAGE_WIDTH;
@@ -688,8 +687,12 @@ uint8_t get_obstacle_info(struct image_t *img, float gb[], int *bi,
         if (pco) *pco = np;
     } else { if (pco) *pco = 0; }
 
+    if (result_out) {
+        result_out->gf     = gf;
+        result_out->ground = ground;
+        result_out->mask   = work_mask;
+    }
 
-    
     return no;
 }
 
@@ -792,7 +795,7 @@ static void gate_make_blue_mask(const struct image_t *img, uint8_t *out_mask)
        reuse gate_eroded as scratch.  We implement erode/dilate as a
        simple box majority-vote (threshold = kernel_area, i.e. ALL pixels
        must be set for erode, ANY pixel for dilate). */
-    int k = 5, half = 2;
+    int k = 3, half = 2;
 
     /* erode: all 5×5 neighbours must be set */
     memset(gate_eroded, 0, total);

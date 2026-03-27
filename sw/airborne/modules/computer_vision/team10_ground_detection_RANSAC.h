@@ -10,7 +10,7 @@
 #include "team10_RANSAC_adaptation.h"
  
 #ifndef NUMBER_VERTICAL_BUCKETS
-#define NUMBER_VERTICAL_BUCKETS  7
+#define NUMBER_VERTICAL_BUCKETS  13
 #endif
 
 #ifndef MAX_EDGE_PIXELS
@@ -26,11 +26,6 @@ extern float score_multiplier;
 // color picker variables
 extern yuv_color_e parabola_color;
 extern yuv_color_e bucket_color;
-extern float safest_bucket;
-extern float max_safety;
-
-// nice happy function
-extern struct image_t *get_obstacles_RANSAC(struct image_t *img, uint8_t camera_id);
 
 // ABI messaging functions
 extern void ground_detection_init(void);
