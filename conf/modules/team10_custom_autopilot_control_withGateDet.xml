@@ -68,7 +68,7 @@ Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
   </settings>
 
   <dep>
-    <depends>team10_cv_detect_ground</depends>
+    <depends>team10_cv_detect_ground_withGateDet</depends>
   </dep>
 
   <header>
