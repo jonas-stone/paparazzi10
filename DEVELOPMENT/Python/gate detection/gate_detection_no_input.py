@@ -1,18 +1,19 @@
 """
 gate_detection.py
 =================
-Detect a gate by finding two parallel, similar blue blobs and placing
+Detect a gate by finding two parallel blue blobs with similar geometric characteristics and placing
 a midpoint between them.
+
+The gate we're looking for consists of two vertical blue poles. Because the camera is mounted
+sideways (rotated 90° CW), those poles appear as two horizontally-oriented blobs stacked
+vertically in the image. The whole pipeline is built around that assumption.
 
 Pipeline
 --------
-1. Blue mask via YUV thresholding
-2. Extract connected components, keep significant blobs
-3. For every pair of blobs check:
-     - similar aspect ratio
-     - similar size (area)
-     - centroids aligned perpendicular to their long axis (parallel bars)
-4. Best valid pair → midpoint computed and drawn
+1. Blue mask      — isolate blue pixels using YUV colour space thresholding
+2. Blob extraction — find connected regions, discard noise
+3. Pair matching   — check every blob pair for the geometric signature of two gate posts
+4. Midpoint        — average the two centroids to get the gate centre
 
 Usage
 -----
@@ -30,51 +31,61 @@ from glob import glob
 from dataclasses import dataclass
 from typing import Optional
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Configuration
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Config:
-    # ── YUV blue thresholds ───────────────────────────────────────────────────
+    # YUV blue thresholds
+    # These were tuned for TU Delft blue specifically. The YUV colour space
+    # separates brightness (Y) from colour (U, V), which makes the thresholds
+    # much more stable across different lighting conditions than raw BGR would be.
+    # The parameters were chosen by trial and error using images obtained usign the drone 
+    # at the CyberZoo
     blue_y_min: int   = 0
-    blue_y_max: int   = 220
-    blue_u_min: int   = 122     # blue drives Cb above 128
+    blue_y_max: int   = 220       
+    blue_u_min: int   = 122       
     blue_u_max: int   = 255
     blue_v_min: int   = 0
-    blue_v_max: int   = 123     # blue keeps Cr below 128
-    blue_morph_k: int = 5
+    blue_v_max: int   = 123       
+    blue_morph_k: int = 3        
 
     # ── Blob filtering ────────────────────────────────────────────────────────
-    # Minimum blob area as fraction of total image area
+    # Blobs smaller than this fraction of the total image are almost certainly
+    # noise 
     blob_min_area_ratio: float = 0.003
 
     # ── Parallelism criteria ──────────────────────────────────────────────────
-    # Max relative difference in aspect ratio (w/h) between the two blobs
+    # These three thresholds define what "looks like a gate" geometrically.
+    # They're intentionally fairly loose 
+
+    # The two posts should have a similar aspect ratio (width/height).
+    # A difference of 0.5 means one can be up to 50% more elongated than the other.
     max_aspect_diff: float = 0.5
-    # Max relative difference in area between the two blobs
+
+    # The two posts should cover a similar number of pixels. A difference of 0.6
+    # gives some room for one post being partially cut off at the image edge.
     max_area_diff: float = 0.6
-    # The vector joining the two centroids should be perpendicular to the
-    # blobs' long axis. This is the max allowed angular deviation from 90°.
+
+    # The line connecting the two centroids should be roughly perpendicular to
+    # whichever direction the posts point. If the posts are horizontal bars, the
+    # centroids should be separated vertically, and vice versa. This catches
+    # false positives where two unrelated blue blobs happen to pass the size tests.
     max_skew_deg: float = 10
 
-    # ── Display ───────────────────────────────────────────────────────────────
+    # Display
     display_scale: float = 1.5
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Step 1 — Blue mask
-# ─────────────────────────────────────────────────────────────────────────────
 
 def blue_mask(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:
     """
-    Binary mask of blue pixels via YUV decomposition.
+    Produce a binary mask that is white wherever the image is blue.
 
-    BGR→YUV separates luma (Y) from chroma (U=Cb, V=Cr).
-    TU Delft blue: U well above 128, V well below 128.
-    Thresholding on U and V isolates the blue reliably regardless of
-    brightness, making it robust to different viewing angles and lighting.
+    After thresholding we run a morphological open (removes isolated specks) followed
+    by a close (fills small holes inside a blob). The kernel size blue_morph_k trades
+    off smoothness against detail — 5 pixels works well for gate posts that cover
+    at least a few percent of the image. A smaller kernel introduces more artefacts in 
+    the resulting mask but is more computationally efficient.
     """
     yuv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YUV)
     Y, U, V = cv2.split(yuv)
@@ -91,20 +102,24 @@ def blue_mask(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Step 2 — Blob extraction
-# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_blobs(mask: np.ndarray, image_shape: tuple, cfg: Config) -> list[dict]:
     """
-    Find connected components in the blue mask and return significant blobs.
+    Label connected regions in the mask and return the ones large enough to matter.
+
+    connectedComponentsWithStats assigns every white pixel to a region and returns 
+    bounding boxes, centroids, and pixel counts. 
+
+    The minimum area filter (blob_min_area_ratio × image pixels) is the first line
+    of defence against noise. Anything smaller than ~0.3% of the image is ignored.
+    What survives gets packed into a plain dict.
 
     Each blob dict contains:
-        x_min, y_min, x_max, y_max  — bounding box
-        cx, cy                       — centroid
-        area                         — pixel count
-        aspect                       — width / height
+        x_min, y_min, x_max, y_max  — bounding box corners
+        cx, cy                       — centroid (float coords rounded to int)
+        area                         — number of white pixels in this region
+        aspect                       — bounding box width / height
     """
     H, W     = image_shape[:2]
     min_area = int(H * W * cfg.blob_min_area_ratio)
@@ -132,39 +147,47 @@ def extract_blobs(mask: np.ndarray, image_shape: tuple, cfg: Config) -> list[dic
         })
     return blobs
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Step 3 — Parallel pair detection
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _are_parallel(b1: dict, b2: dict, cfg: Config) -> bool:
     """
-    Return True if two blobs look like the two bars of a gate.
+    Decide whether two blobs are plausibly the left and right posts of a gate.
 
-    Three conditions must all hold:
+    The camera is mounted rotated 90° CW, so the world's vertical axis maps to
+    the image's horizontal axis. Two real-world side-by-side pillars therefore
+    appear stacked one above the other in the image (separated along image-Y).
+    That's the first thing we check, if the blobs are separated mostly
+    horizontally in the image, they can't be the two posts.
 
-    1. Similar aspect ratio  — both bars have roughly the same shape (w/h).
-       Rejects pairs where one is a tall thin pole and the other a wide bar.
+    Beyond that, we apply three further checks:
 
-    2. Similar area          — bars at the same depth appear the same size.
-       Rejects pairs of very different-sized blobs.
+    Check 1 — Aspect ratio similarity
+        Both posts are the same physical object, so their bounding boxes should
+        have roughly the same shape. A large aspect difference means they are
+        unlikely to be the same kind of object.
 
-    3. Centroid join ⊥ long axis — the line connecting the two bar centres
-       must run roughly perpendicular to the direction the bars point.
-       A real gate has both bars pointing the same way (parallel) and the
-       gap between them in the perpendicular direction.
+    Check 2 — Area similarity
+        At the same depth both posts should cover a similar number of pixels.
+        A big area difference usually means one blob is partial 
+        (edge of frame, occlusion) or is something else entirely.
+
+    Check 3 — Centroid join perpendicular to long axis
+        For two parallel bars the line connecting their centres should run at 90°
+        to the direction the bars themselves point. We estimate the average
+        orientation from the mean bounding-box dimensions: wider than tall →
+        horizontal bar; taller than wide → vertical bar. Then we measure how far
+        the centroid-join vector deviates from the ideal 90°. More than
+        max_skew_deg and we reject the pair.
+
     """
-    # 0. The image is rotated 90° CW (floor on the left).
-    #    Two real-world vertical pillars appear as blobs separated along
-    #    the image Y-axis (one near top of image, one near bottom).
-    #    Require |dy| > |dx| so we only match blobs stacked vertically
-    #    in the image, which corresponds to side-by-side pillars in reality.
+    # Pre-check: in the (rotated) image the two post blobs should be separated
+    # more in Y than in X. If they're side by side horizontally they're not the posts.
     dx0 = b2["cx"] - b1["cx"]
     dy0 = b2["cy"] - b1["cy"]
     if abs(dy0) <= abs(dx0):
         return False
 
-    # 1. Aspect ratio
+    # Check 1 — aspect ratio
     ar1, ar2  = b1["aspect"], b2["aspect"]
     larger    = max(ar1, ar2)
     if larger == 0:
@@ -172,39 +195,37 @@ def _are_parallel(b1: dict, b2: dict, cfg: Config) -> bool:
     if (larger - min(ar1, ar2)) / larger > cfg.max_aspect_diff:
         return False
 
-    # 2. Area
+    # Check 2 — area
     a1, a2   = b1["area"], b2["area"]
     larger_a = max(a1, a2)
     if (larger_a - min(a1, a2)) / larger_a > cfg.max_area_diff:
         return False
 
-    # 3. Centroid join perpendicular to long axis
+    # Check 3 — centroid join should be perpendicular to the bars' long axis
     dx = b2["cx"] - b1["cx"]
     dy = b2["cy"] - b1["cy"]
     if dx == 0 and dy == 0:
         return False
 
-    # Average long-axis direction across both blobs
+    # Average bounding box size across both blobs gives us the dominant orientation
     avg_w = (b1["x_max"] - b1["x_min"] + b2["x_max"] - b2["x_min"]) / 2
     avg_h = (b1["y_max"] - b1["y_min"] + b2["y_max"] - b2["y_min"]) / 2
-    # Long axis unit vector: horizontal if wider, vertical if taller
     long_ax = np.array([1.0, 0.0]) if avg_w >= avg_h else np.array([0.0, 1.0])
 
     join    = np.array([dx, dy], dtype=float)
     join   /= np.linalg.norm(join)
     dot     = float(np.clip(np.dot(join, long_ax), -1.0, 1.0))
-    angle   = np.degrees(np.arccos(abs(dot)))   # 0° = parallel, 90° = perpendicular
-    skew    = abs(90.0 - angle)                 # how far from perfectly perpendicular
+    angle   = np.degrees(np.arccos(abs(dot)))  
+    skew    = abs(90.0 - angle)                 # deviation from the ideal perpendicular arrangement
 
     return skew <= cfg.max_skew_deg
 
 
 def find_gate_pair(blobs: list[dict], cfg: Config) -> Optional[tuple[dict, dict]]:
     """
-    Find the best pair of parallel, similar blobs.
+    Search every blob pair and return the best gate candidate.
 
-    'Best' = largest combined area (most prominent pair in the image).
-    Returns (blob1, blob2) or None.
+    Returns (blob1, blob2) or None if no valid pair is found.
     """
     best      = None
     best_area = 0
@@ -221,24 +242,24 @@ def find_gate_pair(blobs: list[dict], cfg: Config) -> Optional[tuple[dict, dict]
 
     return best
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Step 4 — Midpoint
-# ─────────────────────────────────────────────────────────────────────────────
 
 def gate_midpoint(b1: dict, b2: dict) -> tuple[int, int]:
-    """Centre point between the two blob centroids."""
+    """
+    Compute the centre of the gate as the midpoint between the two post centroids.
+
+    This is intentionally simple. The plain average hsould be good enough for a heading
+    target.
+    """
     return (
         (b1["cx"] + b2["cx"]) // 2,
         (b1["cy"] + b2["cy"]) // 2,
     )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Display
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _rot(img: np.ndarray) -> np.ndarray:
+    # Undo the camera's 90° CW rotation so the visualisation looks natural.
     return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
@@ -251,28 +272,35 @@ def build_display(
     cfg:       Config,
 ) -> np.ndarray:
     """
-    Two panels side by side, rotated 90° CCW, upscaled:
-      [ blue mask ]  |  [ annotated ]
+    Build a side-by-side debug view: blue mask on the left, annotated image on the right.
+
+    The annotated panel shows:
+      - a semi-transparent blue tint over all masked pixels 
+      - thin grey boxes around every blob that passed the area filter
+      - boxes around whichever two blobs were chosen as the gate pair
+      - a green crosshair and circle at the computed midpoint, with its coordinates
+    If no gate was found, a small "no gate" label is drawn instead.
     """
     anno = image_bgr.copy()
 
-    # Semi-transparent blue overlay
+    # Semi-transparent blue overlay so you can see where the mask fires
+    # without completely obscuring the underlying image texture.
     overlay = anno.copy()
     overlay[mask > 0] = [200, 100, 0]
     cv2.addWeighted(overlay, 0.35, anno, 0.65, 0, anno)
 
-    # All blobs (thin grey box)
+    # All candidate blobs 
     for b in blobs:
         cv2.rectangle(anno, (b["x_min"], b["y_min"]),
                       (b["x_max"], b["y_max"]), (120, 120, 120), 1)
 
-    # Gate pair (bright orange boxes)
+    # The matched gate pair 
     if pair is not None:
         for b in pair:
             cv2.rectangle(anno, (b["x_min"], b["y_min"]),
                           (b["x_max"], b["y_max"]), (0, 165, 255), 2)
 
-    # Midpoint
+    # Midpoint marker 
     if mid is not None:
         cv2.drawMarker(anno, mid, (0, 255, 0),
                        cv2.MARKER_CROSS, 26, 2, cv2.LINE_AA)
@@ -284,10 +312,10 @@ def build_display(
         cv2.putText(anno, "no gate", (8, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
 
-    # Blue mask as BGR
+    # Convert the single-channel mask to BGR so it can sit next to the colour image
     mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
-    # Rotate CCW → landscape
+    # Rotate both panels into landscape orientation
     p_mask = _rot(mask_bgr)
     p_anno = _rot(anno)
 
@@ -298,6 +326,7 @@ def build_display(
 
     combined = np.hstack([p_mask, p_anno])
 
+    # Scale up for readability on high-DPI screens or small native resolutions
     s = cfg.display_scale
     if s != 1.0:
         combined = cv2.resize(combined,
@@ -313,8 +342,12 @@ def build_display(
 
 def process_sequence(image_folder: str, cfg: Optional[Config] = None):
     """
-    Process every image in image_folder sequentially.
-    Displays result live. Press 'q' to quit.
+    Load every image in image_folder in order, run the full detection
+    pipeline on each one, and show the result in a live window.
+
+    Images in the folder need to be in alphabetical order.
+
+    Press 'q' at any point to quit early.
     """
     if cfg is None:
         cfg = Config()
@@ -335,27 +368,20 @@ def process_sequence(image_folder: str, cfg: Optional[Config] = None):
         if image_bgr is None:
             print(f"  [skip] {path}")
             continue
-        
-        # Step 1 — blue mask
-        mask = blue_mask(image_bgr, cfg)
 
-        # Step 2 — blobs
+        # Run the pipeline stages
+        mask  = blue_mask(image_bgr, cfg)
         blobs = extract_blobs(mask, image_bgr.shape, cfg)
+        pair  = find_gate_pair(blobs, cfg)
+        mid   = gate_midpoint(*pair) if pair is not None else None
 
-        # Step 3 — find parallel pair
-        pair = find_gate_pair(blobs, cfg)
 
-        # Step 4 — midpoint
-        mid = gate_midpoint(*pair) if pair is not None else None
-
-        # Console
         fname = os.path.basename(path)
         if mid is not None:
             print(f"  [{idx:04d}] {fname}  GATE  midpoint={mid}")
         else:
             print(f"  [{idx:04d}] {fname}  no gate  (blobs={len(blobs)})")
 
-        # Display
         vis = build_display(image_bgr, mask, blobs, pair, mid, cfg)
         cv2.imshow(WIN, vis)
         cv2.resizeWindow(WIN, vis.shape[1], vis.shape[0])
@@ -364,15 +390,9 @@ def process_sequence(image_folder: str, cfg: Optional[Config] = None):
 
     cv2.destroyAllWindows()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
 
-    # ── Set your image folder here ────────────────────────────────────────────
+    # Set your image folder here
     IMAGE_FOLDER = "../paparazzi10/DEVELOPMENT/downloads from drone/20260306-095826"
-    # ─────────────────────────────────────────────────────────────────────────
 
     process_sequence(IMAGE_FOLDER)
