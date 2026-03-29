@@ -1,30 +1,32 @@
-/**
+/*
+ * team10_custom_autopilot.c
+ *
  * Autopilot state machine for ground-baseline obstacle avoidance (Team 10).
  *
- * This module receives obstacle regions, plant regions, and ground boundary
- * data from the ground detection module (team10_ground_detection.c) via ABI
- * messaging, and uses it to steer the drone away from obstacles.
+ * This is an improved version of team10_autopilot.c. The key difference is
+ * that when an obstacle is found, the drone uses the corridor logic
+ * (motion_logic_normalised) to work out which side of the image has the most
+ * visible ground and rotates toward that side — instead of picking a random
+ * direction. This is called "wise" avoidance.
  *
- * The detection pipeline measures the total width of obstacle regions found in
- * the current frame. If that combined width exceeds a fraction of the image
- * width (obstacle_width_threshold), the path is considered blocked and the
- * drone stops and rotates to find a clearer heading.
- *
- * The drone operates in one of four states:
+ * The module receives obstacle regions, plant regions, and the ground boundary
+ * array from team10_ground_detection.c via ABI messaging, and drives a
+ * four-state navigation state machine:
  *   SAFE                  — path looks clear; move the waypoints forward.
- *   OBSTACLE_FOUND        — something is blocking the way; stop and rotate.
- *   SEARCH_FOR_SAFE_HEADING — rotating until obstacles shrink below threshold.
+ *   OBSTACLE_FOUND        — something is blocking the way; stop and rotate
+ *                           toward the corridor identified by the logic module.
+ *   SEARCH_FOR_SAFE_HEADING — rotating until confidence recovers.
  *   OUT_OF_BOUNDS         — target waypoint left the allowed flight zone;
  *                           rotate back inward.
  *
  * Forward speed scales with obstacle_free_confidence so the drone moves slowly
- * when it has only just found a clear heading and faster once it has had
- * several consecutive clean frames.
+ * after finding a new heading and builds up speed over consecutive clear frames.
  */
 
- // Team 10 inclusions
-#include "modules/orange_avoider/team10_autopilot.h"
+// Team 10 inclusions
+#include "modules/orange_avoider/team10_custom_autopilot.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
+#include "modules/computer_vision/team10_logic.h"
 
 // Other inclusions
 #include "modules/orange_avoider/orange_avoider.h"
@@ -54,62 +56,61 @@ static uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeter
 static uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor);
 static uint8_t increase_nav_heading(float incrementDegrees);
 static uint8_t chooseRandomIncrementAvoidance(void);
-float speed_multiplier = 1.0f;  // reserved for future speed scaling, currently unused
+static uint8_t chooseWiseIncrementAvoidance(int safe_col);
+float speed_multiplier = 0.5;  /* overall speed multiplier applied on top of confidence scaling */
 
 /* ── Navigation state machine ─────────────────────────────────────────────── */
 enum navigation_state_t {
   SAFE,                    /* path is clear — move the waypoints forward       */
-  OBSTACLE_FOUND,          /* something is blocking us — stop and rotate       */
-  SEARCH_FOR_SAFE_HEADING, /* rotating until the scene looks clear             */
+  OBSTACLE_FOUND,          /* something is blocking — stop and rotate wisely   */
+  SEARCH_FOR_SAFE_HEADING, /* rotating until the scene clears                  */
   OUT_OF_BOUNDS            /* waypoint left the allowed flight zone            */
 };
 
 // define and initialise global variables
 enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
-int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
-float heading_increment = 5.f;          // heading angle increment [deg]
+int16_t obstacle_free_confidence = 0;   // accumulated evidence that the path is clear (+1 per clean frame, -2 per blocked frame)
+float heading_increment = 5.f;          // heading angle increment [deg], set by chooseWiseIncrementAvoidance
 float maxDistance = 2.25;               // max waypoint displacement [m]
 
 /* ── Module-level state updated by the ABI callback each frame ────────────── */
-static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];  // detected obstacle regions this frame
-static struct obstacle_region_t plants[MAX_PLANT_REGIONS];        // detected plant regions this frame
+static struct obstacle_region_t obstacles[MAX_OBSTACLE_REGIONS];  // obstacle regions from ground detection
+static struct obstacle_region_t plants[MAX_PLANT_REGIONS];        // plant regions from ground detection
 static int16_t                  boundary_rows[MAX_IMAGE_HEIGHT];  // ground boundary column per row (integer)
-static float boundary_rows_f[MAX_IMAGE_HEIGHT];                   // same boundary as floats for logic functions
-static uint8_t                  obstacle_count = 0;               // number of obstacles detected
-static uint8_t                  plant_count    = 0;               // number of plants detected
-static uint16_t                 boundary_len   = 0;               // number of valid entries in boundary_rows
-uint16_t  total_obstacle_width  = 0;                              // sum of all obstacle widths in pixels this frame
+static float                    boundary_rows_f[MAX_IMAGE_HEIGHT]; // same boundary as floats for logic functions
+static uint8_t                  obstacle_count = 0;               // number of obstacles this frame
+static uint8_t                  plant_count    = 0;               // number of plants this frame
+static uint16_t                 boundary_len   = 0;               // number of valid boundary entries
+uint16_t  total_obstacle_width  = 0;                              // sum of all obstacle widths in pixels
 
-// Fraction of image width that obstacle columns must exceed before we react.
-// Lower values make the drone more cautious (reacts to smaller obstacles).
+// Fraction of image width that obstacles must cover before the drone reacts.
+// Lower = more cautious (reacts to smaller obstacles sooner).
 float obstacle_width_threshold = 0.2f;
 
-// Number of consecutive clean frames required before we are confident the path is clear
+// Number of consecutive clean frames needed before the path is declared safe
 const int16_t max_trajectory_confidence = 5;
 
 /*
- * This next section defines an ABI messaging event (http://wiki.paparazziuav.org/wiki/ABI), necessary
- * any time data calculated in another module needs to be accessed. Including the file where this external
- * data is defined is not enough, since modules are executed parallel to each other, at different frequencies,
- * in different threads. The ABI event is triggered every time new data is sent out, and as such the function
- * defined in this file does not need to be explicitly called, only bound in the init function
+ * ABI messaging: the ground detection module runs in a separate camera thread
+ * and publishes results via ABI messages. We register a callback here so that
+ * every time new detection data is available, our local buffers are updated
+ * automatically without directly sharing memory with the camera thread.
  */
 #ifndef TEAM10_GROUND_DETECTION_ID
 #define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
 #endif
 
-// ABI event declaration (used to bind to callback function)
+// ABI event handle used to track the registered callback
 static abi_event ground_detection_ev;
 
-/* Called automatically by Paparazzi whenever the ground detection module sends
-   new data. Copies all incoming obstacle, plant, and boundary information into
-   our local arrays so the periodic function can read them safely without
-   accessing the detection thread's memory directly. */
+/* Called automatically each time the ground detection module publishes new data.
+   Copies obstacle regions, plant regions, and the ground boundary into our
+   local arrays so the periodic function can safely read them. */
 static void ground_detection_callback(
     uint8_t __attribute__((unused)) sender_id,
-    struct obstacle_region_t *in_obs,   uint8_t  in_oc,
+    struct obstacle_region_t *in_obs,    uint8_t  in_oc,
     struct obstacle_region_t *in_plants, uint8_t  in_pc,
-    int16_t                  *in_br,    uint16_t in_bl)
+    int16_t                  *in_br,     uint16_t in_bl)
 {
     obstacle_count = in_oc;
     memcpy(obstacles, in_obs, in_oc * sizeof(struct obstacle_region_t));
@@ -117,36 +118,44 @@ static void ground_detection_callback(
     plant_count = in_pc;
     memcpy(plants, in_plants, in_pc * sizeof(struct obstacle_region_t));
 
-    // Cap boundary length to the maximum buffer size to prevent overflow
+    // Cap boundary length to avoid overflowing the fixed-size buffer
     boundary_len = in_bl;
     if (boundary_len > MAX_IMAGE_HEIGHT) boundary_len = MAX_IMAGE_HEIGHT;
     memcpy(boundary_rows, in_br, boundary_len * sizeof(int16_t));
 
-    // Also store the boundary as floats so logic functions can use them directly
+    // Convert to float so the logic functions can use them without casting
     for (uint16_t i = 0; i < boundary_len; i++)
     boundary_rows_f[i] = (float)in_br[i];
 }
 
 /*
- * Initialisation function, random seed and heading_increment.
- * Seeds the random number generator so turn directions differ each flight,
- * picks an initial random turn direction, and registers the ABI callback
- * so we start receiving detection data.
+ * Module initialisation — called once at startup.
+ * Runs the corridor logic once with empty data to set an initial turn direction,
+ * then registers the ABI callback so detection data starts flowing in.
  */
 void ground_obstacle_avoidance_init(void) {
   srand(time(NULL));
-  chooseRandomIncrementAvoidance();
+  // Run the logic once at startup so heading_increment is set to a sensible
+  // value before the first obstacle is encountered. All arrays are empty here
+  // so this will almost always return -1, in which case the heading increment
+  // stays at its default of +5 degrees.
+  int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                                   plants, plant_count,
+                                                   boundary_rows_f,
+                                                   boundary_len, MAX_IMAGE_HEIGHT,
+                                                   DEFAULT_OBS_BIAS_FRAC,
+                                                   DEFAULT_PLANT_BIAS_FRAC);
+  chooseWiseIncrementAvoidance(safe_col);
   AbiBindMsgTEAM10_GROUND_DETECTION(TEAM10_GROUND_DETECTION_ID, &ground_detection_ev, ground_detection_callback);
 }
 
 /*
- * Function that checks it is safe to move forwards, and then moves a waypoint forward or changes the heading.
- * Called at 10 Hz while the drone is in flight.
+ * Module periodic function — called at 10 Hz while the drone is in flight.
  *
  * Each cycle:
- *   1. Print the current obstacle width fraction and threshold for debugging.
- *   2. Increment confidence if obstacles are small enough, otherwise decay it.
- *   3. Scale forward step size by confidence — move slowly until we are sure.
+ *   1. Print debug info about current obstacle width and threshold.
+ *   2. Update obstacle_free_confidence (+1 if clear, -2 if blocked).
+ *   3. Scale forward distance by confidence.
  *   4. Execute the current state machine state.
  */
 void ground_obstacle_avoidance_periodic(void)
@@ -162,8 +171,8 @@ void ground_obstacle_avoidance_periodic(void)
        obstacle_width_threshold,
        obstacle_width_threshold * MAX_IMAGE_WIDTH);
 
-  // Increment confidence when obstacles are narrow enough, decay faster when they are not.
-  // Decaying by 2 means a single bad frame cancels two good ones, keeping the drone cautious.
+  // +1 each clean frame, -2 each blocked frame — asymmetry means one bad
+  // frame undoes two good ones so the drone reacts quickly to new obstacles
   if (total_obstacle_width < obstacle_width_threshold * MAX_IMAGE_WIDTH) {
     obstacle_free_confidence++;
   } else {
@@ -173,34 +182,41 @@ void ground_obstacle_avoidance_periodic(void)
   // bound obstacle_free_confidence
   Bound(obstacle_free_confidence, 0, max_trajectory_confidence);
 
-  // Scale forward distance by confidence — start slow, build up as we accumulate clean frames
+  // Scale move distance by confidence so the drone starts slow after finding
+  // a clear heading and speeds up as it accumulates clean frames
   float moveDistance = fminf(maxDistance, 0.2f * obstacle_free_confidence);
 
   switch (navigation_state){
     case SAFE:
-      // Push TRAJECTORY further ahead than GOAL so the flight controller has
-      // time to react before the drone reaches the target
+      // Push TRAJECTORY ahead as a lookahead probe for the bounds check;
+      // only advance GOAL (the target the flight controller chases) when clear
       moveWaypointForward(WP_TRAJECTORY, 1.5f * moveDistance);
       if (!InsideObstacleZone(WaypointX(WP_TRAJECTORY),WaypointY(WP_TRAJECTORY))){
-        // TRAJECTORY left the allowed zone — need to turn back inward
+        // TRAJECTORY left the allowed zone — turn back inward
         navigation_state = OUT_OF_BOUNDS;
       } else if (obstacle_free_confidence == 0){
-        // Confidence dropped to zero — something is blocking the path
+        // Confidence exhausted — something is blocking the path
         navigation_state = OBSTACLE_FOUND;
       } else {
-        // Path still looks clear — advance the GOAL waypoint too
+        // Path still looks clear — advance the actual goal waypoint too
         moveWaypointForward(WP_GOAL, moveDistance);
       }
 
       break;
     case OBSTACLE_FOUND:
-      // Pull both waypoints back to the current position to stop in place,
-      // pick a new random search direction, and start rotating
+      // Stop in place, run the corridor logic to find which side is clearest,
+      // set heading_increment toward that side, then start rotating
       waypoint_move_here_2d(WP_GOAL);
       waypoint_move_here_2d(WP_TRAJECTORY);
 
-      // randomly select new search direction
-      chooseRandomIncrementAvoidance();
+      // logically select new search direction
+      int safe_col = motion_logic_normalised(obstacles, obstacle_count,
+                                                   plants, plant_count,
+                                                   boundary_rows_f,
+                                                   boundary_len, MAX_IMAGE_HEIGHT,
+                                                   DEFAULT_OBS_BIAS_FRAC,
+                                                   DEFAULT_PLANT_BIAS_FRAC);
+      chooseWiseIncrementAvoidance(safe_col);
 
       navigation_state = SEARCH_FOR_SAFE_HEADING;
 
@@ -215,7 +231,7 @@ void ground_obstacle_avoidance_periodic(void)
       break;
     case OUT_OF_BOUNDS:
       // Rotate and probe with TRAJECTORY until it lands back inside the zone,
-      // then search for a safe heading before moving forward again
+      // then transition to SEARCH so the heading is verified before moving
       increase_nav_heading(heading_increment);
       moveWaypointForward(WP_TRAJECTORY, 1.5f);
 
@@ -237,10 +253,9 @@ void ground_obstacle_avoidance_periodic(void)
 }
 
 /*
- * Increases the NAV heading. Assumes heading is an INT32_ANGLE. It is bound in this function.
- * Converts degrees to radians, adds to the current psi angle, normalises to
- * [-pi, pi] so the flight controller never sees a discontinuity, then sets it.
- * Positive increment = clockwise, negative = counter-clockwise.
+ * Rotate the drone's heading by incrementDegrees.
+ * Converts to radians, normalises to [-π, π], and sets nav.heading.
+ * Positive = clockwise, negative = counter-clockwise.
  */
 uint8_t increase_nav_heading(float incrementDegrees)
 {
@@ -257,8 +272,8 @@ uint8_t increase_nav_heading(float incrementDegrees)
 }
 
 /*
- * Calculates coordinates of distance forward and sets waypoint 'waypoint' to those coordinates.
- * Convenience wrapper: computes the target ENU position then calls moveWaypoint().
+ * Move a waypoint to a point distanceMeters ahead of the current position.
+ * Convenience wrapper around calculateForwards() and moveWaypoint().
  */
 uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
 {
@@ -269,9 +284,9 @@ uint8_t moveWaypointForward(uint8_t waypoint, float distanceMeters)
 }
 
 /*
- * Calculates coordinates of a distance of 'distanceMeters' forward w.r.t. current position and heading.
- * Uses the current heading (psi) to decompose the displacement into East (x)
- * and North (y) components in Paparazzi's fixed-point ENU format.
+ * Compute ENU coordinates for a point distanceMeters ahead along the current heading.
+ * Uses sin/cos of the psi (yaw) Euler angle to decompose the displacement into
+ * East (x) and North (y) components in Paparazzi's fixed-point format.
  */
 uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
 {
@@ -287,7 +302,7 @@ uint8_t calculateForwards(struct EnuCoor_i *new_coor, float distanceMeters)
 }
 
 /*
- * Sets waypoint 'waypoint' to the coordinates of 'new_coor'.
+ * Move a named waypoint to the given ENU coordinates.
  * Thin wrapper around Paparazzi's waypoint_move_xy_i().
  */
 uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
@@ -299,9 +314,9 @@ uint8_t moveWaypoint(uint8_t waypoint, struct EnuCoor_i *new_coor)
 }
 
 /*
- * Sets the variable 'heading_increment' randomly positive/negative.
- * Randomly picking CW or CCW prevents the drone from always circling the same
- * way, which could cause it to spin indefinitely in a tight corner.
+ * Fallback: pick a random clockwise or counter-clockwise rotation direction.
+ * Not used in normal operation — the drone uses chooseWiseIncrementAvoidance
+ * instead — but kept for situations where no corridor information is available.
  */
 uint8_t chooseRandomIncrementAvoidance(void)
 {
@@ -310,6 +325,31 @@ uint8_t chooseRandomIncrementAvoidance(void)
     heading_increment = 5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
   } else {
+    heading_increment = -5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  }
+  return false;
+}
+
+/*
+ * Set heading_increment based on which side of the image the safest corridor is.
+ *
+ * After the 90° CCW rotation applied by the camera pipeline:
+ *   column 0        = drone's physical RIGHT
+ *   column W-1      = drone's physical LEFT
+ *   column W/2      = straight ahead
+ *
+ * If safe_direction > W/2 the open space is to the right → rotate clockwise (+5°).
+ * If safe_direction < W/2 the open space is to the left  → rotate counter-clockwise (-5°).
+ * If safe_direction == W/2 or -1 (no corridor) the increment is left unchanged.
+ */
+uint8_t chooseWiseIncrementAvoidance(int safe_direction)
+{
+  
+  if (safe_direction > MAX_IMAGE_WIDTH / 2) {
+    heading_increment = 5.f;
+    VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
+  } else if(safe_direction < MAX_IMAGE_WIDTH / 2){
     heading_increment = -5.f;
     VERBOSE_PRINT("Set avoidance increment to: %f\n", heading_increment);
   }
