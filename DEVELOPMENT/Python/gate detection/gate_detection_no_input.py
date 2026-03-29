@@ -10,10 +10,12 @@ vertically in the image. The whole pipeline is built around that assumption.
 
 Pipeline
 --------
-1. Blue mask      — isolate blue pixels using YUV colour space thresholding
-2. Blob extraction — find connected regions, discard noise
-3. Pair matching   — check every blob pair for the geometric signature of two gate posts
-4. Midpoint        — average the two centroids to get the gate centre
+1. Downscale      — resize the image to 80% of its original size for speed
+2. Blue mask      — isolate blue pixels using YUV colour space thresholding
+3. Blob extraction — find connected regions, discard noise
+4. Pair matching   — check every blob pair for the geometric signature of two gate posts
+5. Midpoint        — average the two centroids to get the gate centre, scaled back to
+                     native resolution
 
 Usage
 -----
@@ -35,11 +37,19 @@ from typing import Optional
 
 @dataclass
 class Config:
+    # Downscale factor applied to the image before any processing.
+    # 0.8 means the pipeline works on 80% of the original width and height,
+    # which reduces the number of pixels processed by 36% and makes every
+    # subsequent step proportionally cheaper. The detected midpoint is scaled
+    # back to native resolution before being returned so the output coordinates
+    # are always in the original image's pixel space.
+    downscale: float = 0.8
+
     # YUV blue thresholds
     # These were tuned for TU Delft blue specifically. The YUV colour space
     # separates brightness (Y) from colour (U, V), which makes the thresholds
     # much more stable across different lighting conditions than raw BGR would be.
-    # The parameters were chosen by trial and error using images obtained usign the drone 
+    # The parameters were chosen by trial and error using images obtained using the drone 
     # at the CyberZoo
     blue_y_min: int   = 0
     blue_y_max: int   = 220       
@@ -49,12 +59,12 @@ class Config:
     blue_v_max: int   = 123       
     blue_morph_k: int = 3        
 
-    # ── Blob filtering ────────────────────────────────────────────────────────
+    # Blob filtering
     # Blobs smaller than this fraction of the total image are almost certainly
     # noise 
     blob_min_area_ratio: float = 0.003
 
-    # ── Parallelism criteria ──────────────────────────────────────────────────
+    # Parallelism criteria
     # These three thresholds define what "looks like a gate" geometrically.
     # They're intentionally fairly loose 
 
@@ -75,7 +85,23 @@ class Config:
     # Display
     display_scale: float = 1.5
 
-# Step 1 — Blue mask
+# Step 1 — Downscale
+
+def downscale_image(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:
+    """
+    Resize the image to cfg.downscale × its original dimensions.
+
+    All subsequent pipeline stages (masking, blob extraction, pair matching)
+    run on this smaller image, which reduces their cost proportionally to the
+    square of the scale factor. The returned array is a new image — the original
+    is never modified.
+    """
+    h, w = image_bgr.shape[:2]
+    new_w = int(w * cfg.downscale)
+    new_h = int(h * cfg.downscale)
+    return cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+# Step 2 — Blue mask
 
 def blue_mask(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:
     """
@@ -102,7 +128,7 @@ def blue_mask(image_bgr: np.ndarray, cfg: Config) -> np.ndarray:
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
 
-# Step 2 — Blob extraction
+# Step 3 — Blob extraction
 
 def extract_blobs(mask: np.ndarray, image_shape: tuple, cfg: Config) -> list[dict]:
     """
@@ -116,8 +142,8 @@ def extract_blobs(mask: np.ndarray, image_shape: tuple, cfg: Config) -> list[dic
     What survives gets packed into a plain dict.
 
     Each blob dict contains:
-        x_min, y_min, x_max, y_max  — bounding box corners
-        cx, cy                       — centroid (float coords rounded to int)
+        x_min, y_min, x_max, y_max  — bounding box corners (in downscaled pixels)
+        cx, cy                       — centroid (in downscaled pixels)
         area                         — number of white pixels in this region
         aspect                       — bounding box width / height
     """
@@ -147,7 +173,7 @@ def extract_blobs(mask: np.ndarray, image_shape: tuple, cfg: Config) -> list[dic
         })
     return blobs
 
-# Step 3 — Parallel pair detection
+# Step 4 — Parallel pair detection
 
 def _are_parallel(b1: dict, b2: dict, cfg: Config) -> bool:
     """
@@ -242,19 +268,24 @@ def find_gate_pair(blobs: list[dict], cfg: Config) -> Optional[tuple[dict, dict]
 
     return best
 
-# Step 4 — Midpoint
+# Step 5 — Midpoint
 
-def gate_midpoint(b1: dict, b2: dict) -> tuple[int, int]:
+def gate_midpoint(b1: dict, b2: dict, cfg: Config) -> tuple[int, int]:
     """
-    Compute the centre of the gate as the midpoint between the two post centroids.
+    Compute the centre of the gate as the midpoint between the two post centroids,
+    then scale back to native (full-resolution) pixel coordinates.
 
-    This is intentionally simple. The plain average hsould be good enough for a heading
-    target.
+    All blob coordinates are in downscaled-image space because the pipeline ran
+    on the resized frame. Dividing by cfg.downscale converts them back to the
+    coordinate system of the original image so callers always receive native
+    pixel positions regardless of what downscale factor was used.
     """
-    return (
-        (b1["cx"] + b2["cx"]) // 2,
-        (b1["cy"] + b2["cy"]) // 2,
-    )
+    cx = (b1["cx"] + b2["cx"]) // 2
+    cy = (b1["cy"] + b2["cy"]) // 2
+    # Scale back to native resolution
+    native_cx = int(round(cx / cfg.downscale))
+    native_cy = int(round(cy / cfg.downscale))
+    return (native_cx, native_cy)
 
 # Display
 
@@ -274,6 +305,10 @@ def build_display(
     """
     Build a side-by-side debug view: blue mask on the left, annotated image on the right.
 
+    All annotations (blob boxes, midpoint marker) are drawn on the ORIGINAL full-resolution
+    image, with blob coordinates scaled back from downscaled space so they line up correctly.
+    The midpoint is already in native coordinates (gate_midpoint() handles the conversion).
+
     The annotated panel shows:
       - a semi-transparent blue tint over all masked pixels 
       - thin grey boxes around every blob that passed the area filter
@@ -282,25 +317,33 @@ def build_display(
     If no gate was found, a small "no gate" label is drawn instead.
     """
     anno = image_bgr.copy()
+    inv  = 1.0 / cfg.downscale   # factor to convert downscaled coords → native coords
+
+    # The mask was produced on the downscaled image so it needs to be upscaled
+    # to match the full-resolution annotation canvas before blending
+    h, w = image_bgr.shape[:2]
+    mask_full = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
     # Semi-transparent blue overlay so you can see where the mask fires
     # without completely obscuring the underlying image texture.
     overlay = anno.copy()
-    overlay[mask > 0] = [200, 100, 0]
+    overlay[mask_full > 0] = [200, 100, 0]
     cv2.addWeighted(overlay, 0.35, anno, 0.65, 0, anno)
 
-    # All candidate blobs 
+    # All candidate blobs — scale bounding boxes back to native resolution
     for b in blobs:
-        cv2.rectangle(anno, (b["x_min"], b["y_min"]),
-                      (b["x_max"], b["y_max"]), (120, 120, 120), 1)
+        pt1 = (int(b["x_min"] * inv), int(b["y_min"] * inv))
+        pt2 = (int(b["x_max"] * inv), int(b["y_max"] * inv))
+        cv2.rectangle(anno, pt1, pt2, (120, 120, 120), 1)
 
-    # The matched gate pair 
+    # The matched gate pair
     if pair is not None:
         for b in pair:
-            cv2.rectangle(anno, (b["x_min"], b["y_min"]),
-                          (b["x_max"], b["y_max"]), (0, 165, 255), 2)
+            pt1 = (int(b["x_min"] * inv), int(b["y_min"] * inv))
+            pt2 = (int(b["x_max"] * inv), int(b["y_max"] * inv))
+            cv2.rectangle(anno, pt1, pt2, (0, 165, 255), 2)
 
-    # Midpoint marker 
+    # Midpoint marker — already in native coordinates
     if mid is not None:
         cv2.drawMarker(anno, mid, (0, 255, 0),
                        cv2.MARKER_CROSS, 26, 2, cv2.LINE_AA)
@@ -312,8 +355,8 @@ def build_display(
         cv2.putText(anno, "no gate", (8, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1, cv2.LINE_AA)
 
-    # Convert the single-channel mask to BGR so it can sit next to the colour image
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    # Convert the single-channel mask to BGR and upscale it for the left panel
+    mask_bgr = cv2.cvtColor(mask_full, cv2.COLOR_GRAY2BGR)
 
     # Rotate both panels into landscape orientation
     p_mask = _rot(mask_bgr)
@@ -336,9 +379,7 @@ def build_display(
     return combined
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Main sequence runner
-# ─────────────────────────────────────────────────────────────────────────────
 
 def process_sequence(image_folder: str, cfg: Optional[Config] = None):
     """
@@ -369,12 +410,16 @@ def process_sequence(image_folder: str, cfg: Optional[Config] = None):
             print(f"  [skip] {path}")
             continue
 
-        # Run the pipeline stages
-        mask  = blue_mask(image_bgr, cfg)
-        blobs = extract_blobs(mask, image_bgr.shape, cfg)
-        pair  = find_gate_pair(blobs, cfg)
-        mid   = gate_midpoint(*pair) if pair is not None else None
+        # Step 1 — downscale before any processing
+        small = downscale_image(image_bgr, cfg)
 
+        # Steps 2-4 — run entirely on the downscaled image
+        mask  = blue_mask(small, cfg)
+        blobs = extract_blobs(mask, small.shape, cfg)
+        pair  = find_gate_pair(blobs, cfg)
+
+        # Step 5 — midpoint is converted back to native resolution inside gate_midpoint()
+        mid = gate_midpoint(*pair, cfg) if pair is not None else None
 
         fname = os.path.basename(path)
         if mid is not None:
@@ -382,6 +427,8 @@ def process_sequence(image_folder: str, cfg: Optional[Config] = None):
         else:
             print(f"  [{idx:04d}] {fname}  no gate  (blobs={len(blobs)})")
 
+        # Display is built on the original full-resolution image; build_display
+        # handles the coordinate conversion for blob boxes internally
         vis = build_display(image_bgr, mask, blobs, pair, mid, cfg)
         cv2.imshow(WIN, vis)
         cv2.resizeWindow(WIN, vis.shape[1], vis.shape[0])
