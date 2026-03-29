@@ -62,7 +62,7 @@
     <file name="team10_ground_detection.c"/>
     <file name="team10_get_obstacle_info.c"/>
     <file name="team10_rtp_utilities.c"/>
-    <file name="team10_logic.c"/>
+    <file name="team10_logic_withGateDet.c"/>
   </makefile>
 </module>
 

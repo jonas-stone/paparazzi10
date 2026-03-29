@@ -1,10 +1,8 @@
 /*
  * team10_custom_autopilot_withGateDet.c
  *
- * Gate-aware obstacle avoidance autopilot for the Bebop2 (Team 10).
- *
  * Overview:
- *   The camera thread runs ground detection at up to 20 Hz and publishes
+ *   The camera thread runs ground detection at up to 10 Hz and publishes
  *   obstacle regions, plant regions, a ground boundary array, and a gate
  *   detection result over the ABI message bus.  This module runs at 10 Hz,
  *   reads those results via ABI callbacks, and drives a five-state navigation
@@ -18,7 +16,7 @@
 
 #include "modules/orange_avoider/team10_custom_autopilot_withGateDet.h"
 #include "modules/computer_vision/team10_get_obstacle_info.h"
-#include "modules/computer_vision/team10_logic.h"
+#include "modules/computer_vision/team10_logic_withGateDet.h"
 
 #include "modules/orange_avoider/orange_avoider.h"
 #include "firmwares/rotorcraft/navigation.h"

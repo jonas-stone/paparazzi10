@@ -1,31 +1,18 @@
-/*
- * Copyright (C) 2018 Guido de Croon
- *
- * This file is part of paparazzi.
- *
- * paparazzi is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
- *
- * paparazzi is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with paparazzi; see the file COPYING.  If not, see
- * <http://www.gnu.org/licenses/>.
- */
-
 /**
  * @file RANSAC.c
  * @brief Perform Random Sample Consensus (RANSAC), a robust fitting method.
  *
- * Supports linear (degree=1) and quadratic (degree=2) fits.
- * For degree=2, the feature vector is expanded to include all quadratic terms
- * x_i^2 and cross terms x_i*x_j (i <= j), giving an expanded dimension of
- * D + D*(D+1)/2 features (plus optional bias).
+ * RANSAC fits a curve to a noisy dataset by repeatedly trying random small
+ * subsets of the data, fitting a model to each subset, and keeping whichever
+ * model explains the most data points within a tolerable error.
+ *
+ * This version supports fitting a straight line (degree=1) or a parabola
+ * (degree=2). We use it to fit a parabola to the edge of the ground blob
+ * so we know where the floor is in each image column.
+ *
+ * For degree=2, the raw feature vector [x] is expanded to [x, x^2].
+ * With a bias term this gives three parameters: a (x^2 coeff), b (x coeff),
+ * and c (constant), matching the standard parabola y = a*x^2 + b*x + c.
  *
  * The `params` output array must be allocated by the caller with size:
  *   degree=1: D   + (use_bias ? 1 : 0)
@@ -51,14 +38,20 @@
 #include "stdio.h"
 
 /**
- * @brief Compute the number of features after polynomial expansion.
+ * @brief How many features does a sample have after polynomial expansion?
  *
- * degree=1: D features (just the original)
- * degree=2: D + D*(D+1)/2 features (original + all squared/cross terms)
+ * degree=1 (linear fit): the feature vector stays the same size as the
+ *   raw input — just [x_0, x_1, ..., x_{D-1}].
  *
- * @param D    Original feature dimensionality
+ * degree=2 (quadratic fit): we add all squared and cross terms on top of
+ *   the original features, giving D + D*(D+1)/2 total features.
+ *   For D=1 (our case): 1 + 1 = 2 features → [x, x^2].
+ *
+ * The bias term (constant c) is NOT counted here — it is appended separately.
+ *
+ * @param D       Number of raw input features (1 in our pipeline — just x)
  * @param degree  Polynomial degree (1 or 2)
- * @return Number of expanded features (NOT counting the bias term)
+ * @return        Number of features BEFORE adding the bias term
  */
 static int expanded_dim(int D, int degree)
 {
@@ -69,26 +62,28 @@ static int expanded_dim(int D, int degree)
 }
 
 /**
- * @brief Expand a sample vector into polynomial features in-place into `out`.
+ * @brief Expand a raw sample vector into its full polynomial feature vector.
  *
- * For degree=1: out = [x_0, x_1, ..., x_{D-1}]
- * For degree=2: out = [x_0, ..., x_{D-1},
- *                      x_0*x_0, x_0*x_1, ..., x_0*x_{D-1},
- *                               x_1*x_1, ..., x_1*x_{D-1},
- *                                        ...  x_{D-1}*x_{D-1}]
+ * For a linear fit (degree=1) nothing changes: out = [x_0, ..., x_{D-1}].
+ * For a quadratic fit (degree=2) the squared and cross terms are appended:
+ *   out = [x_0, ..., x_{D-1},  x_0^2, x_0*x_1, ..., x_{D-1}^2]
  *
- * @param sample  Input sample of size D
- * @param out     Output buffer of size expanded_dim(D, degree)
- * @param D       Original feature dimensionality
+ * For our 1-D ground edge case (D=1, degree=2):
+ *   out = [x, x^2]  — two features total.
+ *
+ * @param sample  Raw input sample of size D
+ * @param out     Output buffer of size expanded_dim(D, degree) — caller allocates
+ * @param D       Number of raw features
  * @param degree  Polynomial degree (1 or 2)
  */
 static void expand_features(const float *sample, float *out, int D, int degree)
 {
-  // Copy linear terms
+  // Copy the original features first
   for (int i = 0; i < D; i++) {
     out[i] = sample[i];
   }
 
+  // Append squared and cross terms for quadratic fitting
   if (degree == 2) {
     int idx = D;
     for (int i = 0; i < D; i++) {
@@ -100,17 +95,18 @@ static void expand_features(const float *sample, float *out, int D, int degree)
 }
 
 /**
- * @brief Predict the value of a sample with learned weights.
+ * @brief Predict the output value for a sample using previously learned weights.
  *
- * Internally expands the sample to the correct polynomial degree before
- * computing the dot product with the weights.
+ * Expands the raw sample to the full polynomial feature vector, then computes
+ * the dot product with the weight vector. If a bias term was used during
+ * training, it is added as the last weight.
  *
- * @param sample   The raw sample vector of size D
- * @param weights  The weight vector of size expanded_dim(D, degree) + (use_bias ? 1 : 0)
- * @param D        The dimension of the raw sample
- * @param degree   Polynomial degree used during fitting (1 or 2)
- * @param use_bias Whether a bias term was included during fitting
- * @return The predicted value
+ * @param sample   Raw input sample of size D
+ * @param weights  Learned weights of size expanded_dim(D,degree) + (use_bias?1:0)
+ * @param D        Number of raw input features
+ * @param degree   Polynomial degree (must match what was used to fit)
+ * @param use_bias Whether a bias (constant) term is included in weights
+ * @return         Predicted output value
  */
 float predict_value(float *sample, float *weights, int D, int degree, bool use_bias)
 {
@@ -130,53 +126,64 @@ float predict_value(float *sample, float *weights, int D, int degree, bool use_b
 }
 
 /**
- * @brief Perform RANSAC to fit a polynomial model (degree 1 or 2).
+ * @brief Fit a polynomial model to noisy data using RANSAC.
  *
- * @param n_samples        Number of samples used per RANSAC iteration
- * @param n_iterations     Number of RANSAC iterations
- * @param error_threshold  Per-sample error cap for robust fitting
- * @param targets          Target values, size [count]
- * @param D                Dimensionality of raw samples
- * @param samples          Sample matrix, size [count][D]
- * @param count            Total number of samples
- * @param use_bias         Whether to include a bias (intercept) term
- * @param degree           Polynomial degree: 1 (linear) or 2 (quadratic)
- * @param params           Output parameters, caller must allocate:
- *                           degree=1: D   + (use_bias ? 1 : 0)
- *                           degree=2: D + D*(D+1)/2 + (use_bias ? 1 : 0)
- * @param fit_error        Unused (kept for API compatibility)
+ * The core idea: instead of fitting to all data at once (which noise and
+ * outliers would corrupt), we repeatedly pick a tiny random subset, fit the
+ * model to just that subset, then score it against the full dataset. After
+ * many iterations we keep the model that scored best (lowest total error).
+ *
+ * Each sample is first expanded into polynomial features (linear or quadratic)
+ * before being passed to the underlying least-squares solver.
+ *
+ * Error is capped at error_threshold per point so that extreme outliers don't
+ * dominate the scoring. This is the key difference from plain least squares.
+ *
+ * @param n_samples        How many data points to draw per RANSAC trial
+ * @param n_iterations     How many random trials to run
+ * @param error_threshold  Per-point error above this is capped (not penalised more)
+ * @param targets          The y-values we are trying to predict, length [count]
+ * @param D                Number of input features per sample (1 in our pipeline)
+ * @param samples          The x-values, a [count][D] matrix
+ * @param count            Total number of data points
+ * @param use_bias         If true, a constant intercept term is added
+ * @param degree           1 = straight line, 2 = parabola
+ * @param params           OUTPUT: best-fit parameters — caller must allocate
+ * @param fit_error        Unused, kept for API compatibility
  */
 void RANSAC_linear_model(int n_samples, int n_iterations, float error_threshold, float *targets, int D,
                          float (*samples)[1], uint16_t count, bool use_bias, int degree, float *params,
                          float *fit_error __attribute__((unused)))
 {
   int exp_D = expanded_dim(D, degree);
-  int D_1 = use_bias ? exp_D + 1 : exp_D;
+  int D_1 = use_bias ? exp_D + 1 : exp_D;  // total number of parameters to solve for
 
   float err;
-  float errors[n_iterations];
-  int indices_subset[n_samples];
-  float subset_targets[n_samples];
+  float errors[n_iterations];          // total (capped) error for each trial
+  int indices_subset[n_samples];       // which data points were chosen this trial
+  float subset_targets[n_samples];     // their y-values
 
-  // Expanded feature matrix for the subset
+  // Expanded feature matrix for the randomly chosen subset
   float subset_samples_exp[n_samples][exp_D];
 
-  // One set of params per iteration
+  // Store the fitted parameters from every trial so we can compare them at the end
   float subset_params[n_iterations][D_1];
 
-  // Clamp n_samples to valid range
+  // Make sure we draw at least as many points as we have parameters to solve
+  // (otherwise the system is under-determined and has no unique solution)
   n_samples = (n_samples < D_1)    ? D_1    : n_samples;
   n_samples = (n_samples < (int)count) ? n_samples : (int)count;
 
-  // Expanded features for the full dataset, used for error evaluation
+  // Pre-expand all data points so we don't repeat this work inside the loop
   float all_expanded[count][exp_D];
   for (int i = 0; i < (int)count; i++) {
     expand_features(samples[i], all_expanded[i], D, degree);
   }
 
+  // ── Main RANSAC loop ─────────────────────────────────────────────────────
   for (int i = 0; i < n_iterations; i++) {
 
-    // Pick a random subset of indices without replacement
+    // Pick a random subset (no repeated indices)
     get_indices_without_replacement(indices_subset, n_samples, count);
 
     // Build the subset using expanded features
@@ -187,12 +194,14 @@ void RANSAC_linear_model(int n_samples, int n_iterations, float error_threshold,
       }
     }
 
-    // Fit a linear model on the expanded feature subset
-    // (fit_linear_model works on any dimensionality, so passing exp_D is correct)
+    // Fit a linear model on the expanded subset
+    // (This is a standard least-squares solve; passing exp_D is correct because
+    //  the quadratic features are already baked into the expanded matrix.)
     fit_linear_model(subset_targets, exp_D, subset_samples_exp, n_samples, use_bias,
                      subset_params[i], &err);
 
-    // Evaluate fit on the full dataset with capped errors
+    // Score this model on ALL data points (not just the subset)
+    // Errors beyond error_threshold are capped so outliers don't ruin good models
     float err_sum = 0.0f;
     for (int j = 0; j < (int)count; j++) {
       float prediction = 0.0f;
@@ -203,13 +212,13 @@ void RANSAC_linear_model(int n_samples, int n_iterations, float error_threshold,
         prediction += subset_params[i][exp_D];
       }
       err = fabsf(prediction - targets[j]);
-      err = (err > error_threshold) ? error_threshold : err;
+      err = (err > error_threshold) ? error_threshold : err;  // cap the error
       err_sum += err;
     }
     errors[i] = err_sum;
   }
 
-  // Find the iteration with the lowest total error
+  // Find which trial gave the lowest total error
   float min_err = errors[0];
   int min_ind = 0;
   for (int i = 1; i < n_iterations; i++) {
@@ -219,18 +228,22 @@ void RANSAC_linear_model(int n_samples, int n_iterations, float error_threshold,
     }
   }
 
-  // Copy best parameters to output
+  // Copy the winning parameters to the output array
   for (int d = 0; d < D_1; d++) {
     params[d] = subset_params[min_ind][d];
   }
 }
 
 /**
- * @brief Get indices without replacement.
+ * @brief Draw n_samples unique random indices from the range [0, count).
  *
- * @param indices_subset  Output: filled with n_samples unique indices in [0, count)
- * @param n_samples       Number of indices to sample
- * @param count           Range of indices to sample from
+ * "Without replacement" means the same index cannot appear twice in the same
+ * draw. This is important for RANSAC because if we accidentally picked the
+ * same point twice, we would effectively have one fewer data point to fit.
+ *
+ * @param indices_subset  OUTPUT: array of n_samples unique random indices
+ * @param n_samples       How many unique indices to draw
+ * @param count           The upper bound (exclusive) for valid indices
  */
 void get_indices_without_replacement(int *indices_subset, int n_samples, int count)
 {
@@ -240,6 +253,7 @@ void get_indices_without_replacement(int *indices_subset, int n_samples, int cou
     bool picked_number = false;
     while (!picked_number) {
       index = rand() % count;
+      // Reject this index if we already picked it in this round
       bool new_val = true;
       for (int k = 0; k < j; k++) {
         if (indices_subset[k] == index) {
@@ -256,85 +270,135 @@ void get_indices_without_replacement(int *indices_subset, int n_samples, int cou
 }
 
 
+/**
+ * @brief Find the first left-to-right transition in each row of a binary mask.
+ *
+ * This is used to locate the edge of the ground blob — the column where the
+ * ground mask switches from background (0) to ground (255) or vice versa.
+ * We record only the FIRST such transition per row (via the `break` statement),
+ * giving one edge point per image row.
+ *
+ * The image is rotated 90° CW by the camera, so "rows" here correspond to
+ * vertical slices in the drone's actual field of view.
+ *
+ * Internally a Python version of this algorithm was:
+ *   edge = (padded_img[:,1:] != padded_img[:,:-1])
+ * This is the C equivalent, column by column.
+ *
+ * @param binary_mask  Input binary mask (0 or 255), size [h × w]
+ * @param w            Image width in pixels
+ * @param h            Image height in pixels
+ * @param edge_out     OUTPUT: edge mask (0 or 1), same size as binary_mask.
+ *                     Caller must zero-initialise this before calling.
+ * @return             Total number of edge pixels found
+ */
 int get_blob_edge_mask(uint8_t *binary_mask, int w, int h, uint8_t *edge_out) {
 
-  // do NOT pad image (only wastes computational resources)
-  // and edge_out can be passed as a zero array of equal size as img->buf so doesnt need to be padded anyway
-
-  /* ============================ PYTHON FUNCTION ==============================
-    edge1 = (padded_binary_img[:,1:] != padded_binary_img[:,:-1])
-    edge1 = np.hstack([edge1, np.zeros((edge1.shape[0], 1), dtype=edge1.dtype)])
-    
-    return edge1
-    ============================= PYTHON FUNCTION =========================== */
+  // We do NOT pad the image — edge_out is already the same size as the mask
+  // and the caller passes it pre-zeroed, so unset pixels stay 0.
 
   int edge_pixel_count = 0;
 
   for (int row = 0; row < h; row++) {
     for (int col = 0; col < w-1; col++) {
 
-      // flipped: read from right to left
+      // These flipped indices were kept from a previous version that scanned
+      // right-to-left; they are computed but the standard left/right neighbours
+      // below are used for the actual comparison.
       int flipped_col      = w - 1 - col;
       int flipped_col_next = w - 1 - (col + 1) - 1;
 
-      // horizontal edge: differs from right neighbour
-      uint8_t current  = binary_mask[row * w + col]; 
+      uint8_t current  = binary_mask[row * w + col];
       uint8_t next     = binary_mask[row * w + col + 1];
 
       if (current != next) {
+        // This pixel is where the mask changes value — it is an edge pixel
         edge_out[row * w + col] = 1;
         edge_pixel_count++;
-        break;
+        break;  // Only record the FIRST transition in each row
       } else {
         edge_out[row * w + col] = 0;
       }
     }
-    // // add padding zeros to last column (no right neighbour)
-    // edge_out[row * width + (width - 1)] = 0;
   }
 
   return edge_pixel_count;
 }
 
 
+/**
+ * @brief Collect the (row, col) coordinates of every edge pixel into an array.
+ *
+ * After get_blob_edge_mask() marks which pixels are on the edge, this function
+ * walks the edge mask and records each marked pixel's position. The resulting
+ * array is what we pass into RANSAC_linear_model() as the sample data.
+ *
+ * In our pipeline the image is rotated, so:
+ *   edge_coordinates[i][0] = row  (acts as x in the parabola equation)
+ *   edge_coordinates[i][1] = col  (acts as y — what the parabola predicts)
+ *
+ * @param w                 Image width
+ * @param h                 Image height
+ * @param edge_mask         Binary edge mask from get_blob_edge_mask() (0 or 1)
+ * @param edge_coordinates  OUTPUT: [N][2] array of (row, col) for each edge pixel
+ */
 void get_edge_pixel_coordinates(int w, int h, uint8_t *edge_mask, float (*edge_coordinates)[2]) {
 
-  
-  // used for iterating through edge_coordinates
-  int i = 0;
+  int i = 0;  // index into edge_coordinates
 
   for (int row = 0; row < h; row++) {
     for (int col = 0; col < w; col++) {
-      
       if (edge_mask[row * w + col] == 1) {
-        edge_coordinates[i][0] = row;
-        edge_coordinates[i][1] = col;
+        edge_coordinates[i][0] = row;   // x for the parabola
+        edge_coordinates[i][1] = col;   // y for the parabola
         i++;
-      } 
+      }
     }
   }
 }
 
 
+/**
+ * @brief Evaluate the fitted parabola at a given x position.
+ *
+ * Given coefficients [a, b, c] (a for x^2, b for x, c for constant), returns
+ * the integer column position y = a*x^2 + b*x + c.
+ *
+ * This is called once per image row to get the estimated ground boundary
+ * column for that row.
+ *
+ * @param coeffs  [a, b, c] — coefficients of the parabola
+ * @param x       The row (x position) to evaluate at
+ * @return        Predicted column position (integer), i.e. where the ground boundary is
+ */
 int eval_parabola(float *coeffs, float x) {
   return (int)(coeffs[0] * x*x + coeffs[1] * x + coeffs[2]);
 }
 
 
-// ======================== PLACEHOLDER LOCATION =========================
+// ======================== PIXEL DRAWING UTILITIES =========================
 
 /**
- * @brief Draw a single neon green pixel at (row, col) on a YUV422 image buffer.
+ * @brief Paint a single neon-green pixel directly into a YUV422 image buffer.
  *
- * @param img  Pointer to the image
- * @param row  Row index
- * @param col  Column index
+ * YUV422 (UYVY format) stores two pixels in every 4 bytes:
+ *   [U, Y0, V, Y1]
+ * where U and V are shared between both pixels, and Y0/Y1 are individual
+ * luma values. To write a colour we must align to the even-numbered column
+ * of the pixel pair (col & ~1) and overwrite all four bytes.
+ *
+ * The values below produce a visually bright neon green in YUV:
+ *   U=44, Y=150, V=21
+ *
+ * @param img  Pointer to the YUV422 image to draw into
+ * @param row  Row index of the target pixel
+ * @param col  Column index of the target pixel (snapped to even pair)
  */
 void draw_neon_green_pixel(struct image_t *img, int row, int col)
 {
   int even_col = col & ~1;
   if (even_col < 0 || even_col >= img->w - 1 || row < 0 || row >= img->h) {
-    return;
+    return;  // Ignore out-of-bounds requests silently
   }
 
   uint8_t *buf = (uint8_t*)img->buf;
@@ -347,17 +411,23 @@ void draw_neon_green_pixel(struct image_t *img, int row, int col)
 }
 
 /**
- * @brief Draw a single colored pixel at (row, col) on a YUV422 image buffer.
+ * @brief Paint a single pixel with a chosen colour into a YUV422 image buffer.
  *
- * @param img  Pointer to the image
- * @param row  Row index
- * @param col  Column index
+ * Works the same way as draw_neon_green_pixel() but looks up the YUV values
+ * from the yuv_colors[] table using the yuv_color_e enum. This lets the caller
+ * pick green, red, blue, white, or black with a readable name rather than raw
+ * YUV byte values.
+ *
+ * @param img    Pointer to the YUV422 image to draw into
+ * @param row    Row index of the target pixel
+ * @param col    Column index (snapped to even pair)
+ * @param color  One of: GREEN, RED, BLUE, WHITE, BLACK
  */
 void draw_colored_pixel(struct image_t *img, int row, int col, yuv_color_e color)
 {
   int even_col = col & ~1;
   if (even_col < 0 || even_col >= img->w - 1 || row < 0 || row >= img->h) {
-    return;
+    return;  // Ignore out-of-bounds requests silently
   }
 
   uint8_t *buf = (uint8_t*)img->buf;
@@ -369,135 +439,3 @@ void draw_colored_pixel(struct image_t *img, int row, int col, yuv_color_e color
   buf[idx + 2] = c.V;
   buf[idx + 3] = c.Y;
 }
-
-/*
-  FUNCTION: get_obstacles_ransac
-
-  Hses RANSAC algorithm to detect obstacles.
-  Main pipeline of this obstacle detection logic.
-
-*/
-// void get_obstacles_RANSAC(struct image_t *img, struct image_column *buckets) {
-
-//   int w = img->w;
-//   int h = img->h;
-
-//   /* ── 1. GET GROUND BLOB ──────────────────────────────────────────────────
-//     * detect_green_ground_ml  → raw binary mask in work_mask
-//     * isolate_ground_blob     → removes non-ground blobs in-place
-//     * Both functions live in team10_get_obstacle_info.c
-//     * work_mask is a static buffer declared there, so we need a local copy
-//     * we can own. We use edge_out (declared below) as scratch first, then
-//     * we allocate a local mask on the stack (or static).
-//   */
-//   static uint8_t ground_mask[MAX_PIXELS];  // our local copy of the mask
-
-//   float green_frac = 0.0f;
-//   detect_green_ground_ml(img, ground_mask, 5, &green_frac);
-
-//   // if barely any green, nothing to do
-//   if (green_frac < 0.05f) return;
-
-//   isolate_ground_blob(ground_mask, w, h, DEFAULT_BLOB_AREA_THRESH);
-
-//   /* ── 2. FILL HOLES IN GROUND BLOB ───────────────────────────────────────
-//     * fill_holes_mask modifies the mask in-place using BFS from the border.
-//     * Any black region not reachable from the border gets filled white.
-//   */
-//   fill_holes_mask(ground_mask, w, h);
-
-//   /* ── 3. GET EDGE ─────────────────────────────────────────────────────────
-//     * get_blob_edge_mask reads the image buffer (Y channel) and writes a
-//     * binary edge map into edge_out (1 = edge pixel, 0 = not).
-//     * Returns the total count of edge pixels found.
-//     *
-//     * NOTE: fix the bug in get_blob_edge_mask before using:
-//     *   'cur' must be renamed to 'current' to match the declaration above it.
-//   */
-//   static uint8_t edge_mask[MAX_PIXELS];
-//   int n_edge_pixels = get_blob_edge_mask(img, edge_mask);
-
-//   if (n_edge_pixels == 0) return;  // no edge found, nothing to fit
-
-//   /* ── 4. GET EDGE PIXEL COORDINATES ──────────────────────────────────────
-//     * get_edge_pixel_coordinates walks the edge_mask and fills a [N][2]
-//     * array with (x, y) of every edge pixel.
-//     * We need to allocate for the worst case (all pixels are edges).
-//   */
-//   static float edge_coords[MAX_PIXELS][2];
-//   get_edge_pixel_coordinates(img, edge_mask, edge_coords);
-
-//   /* ── 5. USE RANSAC, GET PARABOLA COEFFS ──────────────────────────────────
-//     * We want to fit:  y = a*x^2 + b*x + c
-//     * i.e. target = y,  sample = [x]  with degree=2 and use_bias=true
-//     *
-//     * RANSAC_linear_model signature:
-//     *   RANSAC_linear_model(n_samples, n_iterations, error_threshold,
-//     *                       targets, D, samples, count,
-//     *                       use_bias, degree, params, fit_error)
-//     *
-//     * With D=1, degree=2:
-//     *   expanded_dim = 1 + 1*(1+1)/2 = 2  → features are [x, x^2]
-//     *   params size  = 2 + 1 (bias) = 3   → [w_x, w_x2, bias]
-//     *   prediction   = w_x*x + w_x2*x^2 + bias
-//     *                = w_x2*x^2 + w_x*x + bias
-//     *   so coeffs for eval_parabola(coeffs, x) = a*x^2 + b*x + c are:
-//     *     coeffs[0] = params[1]   (x^2 term)
-//     *     coeffs[1] = params[0]   (x   term)
-//     *     coeffs[2] = params[2]   (bias / constant)
-//   */
-
-//   // Build targets (y values) and samples (x values) from edge_coords
-//   static float targets[MAX_PIXELS];
-//   static float samples[MAX_PIXELS][1];  // D=1: only x
-
-//   for (int i = 0; i < n_edge_pixels; i++) {
-//       samples[i][0] = edge_coords[i][0];  // x
-//       targets[i]    = edge_coords[i][1];  // y
-//   }
-
-//   float params[3];  // [w_x, w_x2, bias]  (size = expanded_dim(1,2) + 1 = 3)
-//   float fit_error = 0.0f;
-
-//   RANSAC_linear_model(
-//       10,               // n_samples per iteration
-//       100,              // n_iterations
-//       5.0f,             // error_threshold in pixels
-//       targets,          // y values
-//       1,                // D = 1 (only x as input feature)
-//       samples,          // x values
-//       (uint16_t)n_edge_pixels,
-//       true,             // use_bias → adds constant term c
-//       2,                // degree=2 → quadratic fit
-//       params,
-//       &fit_error
-//   );
-
-//   // remap params to standard parabola convention for eval_parabola()
-//   float coeffs[3];
-//   coeffs[0] = params[1];  // a: coefficient of x^2
-//   coeffs[1] = params[0];  // b: coefficient of x
-//   coeffs[2] = params[2];  // c: bias / constant
-
-//   /* ── 6. EVAL PARABOLA ON IMAGE ───────────────────────────────────────────
-//     * For each row r (= x in parabola space, since image is rotated),
-//     * compute the fitted column position y = a*r^2 + b*r + c.
-//     * Output is a vector of length h (number of rows).
-//   */
-//   static int parabola_boundary[MAX_IMAGE_HEIGHT];
-
-//   for (int r = 0; r < h; r++) {
-//       parabola_boundary[r] = eval_parabola(coeffs, (float)r); 
-//   }
-
-//   // NOW: create 7 image columns.
-//   uint8_t number_of_image_columns = 7;
-//   struct image_column img_columns[number_of_image_columns]
-//   for (int c = 0; c < 7; c++) {
-//     img_columns[c].width = MAX_IMAGE_HEIGHT / number_of_image_columns;
-//   }
-
-//   // update them with their respective counters
-
-//   // initialize their confidence level to 0
-// }

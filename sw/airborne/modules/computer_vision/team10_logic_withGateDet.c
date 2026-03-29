@@ -1,102 +1,110 @@
+/*
+ * team10_logic_withGateDet.c
+ *
+ * Waypoint selection logic for the obstacle avoidance autopilot.
+ *
+ * Takes the ground baseline array (one float per image column representing
+ * how high the ground boundary is in that column), plus lists of detected
+ * obstacle and plant regions, and returns a single target column for the
+ * drone to steer toward.
+ *
+ * The two runtime globals clear_frac and min_corridor_width_px control what
+ * counts as a "passable" column and how wide a gap must be before the drone
+ * will commit to flying through it. Both can be adjusted via Paparazzi GCS
+ * sliders without recompiling.
+ */
+
 #include "team10_logic.h"
 #include <string.h>
-#include <stdlib.h>   /* abs() */
+#include <stdlib.h>
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  RUNTIME-TUNABLE CORRIDOR PARAMETERS
- *
- *  Exposed as non-static globals so Paparazzi <dl_setting> sliders in the GCS
- *  can adjust them in flight without recompiling.
- *
- *  clear_frac            — fraction of image height a column's baseline must be
- *                          below to count as "clear".  Range [0.5, 1.0].
- *                          Higher = stricter (drone demands deeper green).
- *
- *  min_corridor_width_px — minimum contiguous clear-column run (pixels) that
- *                          qualifies as a usable corridor.  Runs shorter than
- *                          this are silently discarded so the drone never tries
- *                          to thread a gap too narrow for its body.
- *                          Range [10, 200].
- * ══════════════════════════════════════════════════════════════════════════════ */
-float clear_frac             = 0.90f;
-int   min_corridor_width_px  = 60;
+/* ── Runtime-tunable corridor parameters ──────────────────────────────────── */
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  WIDEST CORRIDOR CENTRE  [replaces greenest_pixel as the final picker]
+/* A column is considered "clear" if its baseline value is below this fraction
+   of the image height. 0.90 means the ground boundary must be visible in the
+   top 90% of the image for that column to qualify as usable. */
+float clear_frac = 0.90f;
+
+/* Any clear column run shorter than this number of pixels is discarded.
+   Should be at least the drone's body width in pixels at a typical flying
+   distance so we never steer toward a gap the drone cannot fit through. */
+int min_corridor_width_px = 60;
+
+/**
+ * @brief Find the centre column of the widest contiguous run of clear columns.
  *
- *  Scans gb[] for contiguous runs of columns whose value is < CLEAR_FRAC*h
- *  ("clear" columns).  Returns the centre column of the widest such run.
+ * Scans gb[] left to right, tracking runs of columns whose value is below
+ * clear_frac * h ("clear"). The widest run that is also at least
+ * min_corridor_width_px columns wide has its centre returned.
  *
- *  Runs shorter than MIN_CORRIDOR_WIDTH_PX are rejected outright — the drone
- *  would not physically fit through them regardless of the baseline depth.
+ * If no run meets the minimum width, -1 is returned so the caller knows
+ * there is no usable corridor and the drone should keep rotating.
  *
- *  Tie-break: if two runs share the same width the first (leftmost) one wins —
- *  but because we scan the whole array the returned column is always the true
- *  centre, never the edge of a plateau (fixes improvement #6).
- *
- *  Fallback: if no run passes both the threshold and the width guard we fall
- *  back to the centre of the minimum-value plateau so the drone still picks a
- *  direction to rotate toward.
- * ══════════════════════════════════════════════════════════════════════════════ */
+ * @param gb  Ground baseline array (one float per column, length w)
+ * @param w   Number of columns
+ * @param h   Image height (used to compute the clear threshold)
+ * @return    Centre column of the widest clear corridor, or -1 if none found
+ */
 int widest_corridor_centre(const float gb[], int w, int h)
 {
     if (!gb || w <= 0) return 0;
 
     float threshold = clear_frac * (float)h;
 
-    int best_centre  = -1;
-    int best_width   = 0;
-    int run_start    = -1;
+    int best_centre = -1;
+    int best_width  = 0;
+    int run_start   = -1;
 
+    /* Iterate one past the end so the last run gets closed by the loop itself
+       rather than needing a duplicate check after the loop. */
     for (int i = 0; i <= w; i++) {
         int clear = (i < w) && (gb[i] < threshold);
 
         if (clear && run_start < 0) {
-            run_start = i;                              /* start new run      */
+            run_start = i;   /* start of a new clear run */
         } else if (!clear && run_start >= 0) {
+            /* The run that started at run_start just ended at column i-1 */
             int run_w = i - run_start;
-            /* Reject runs narrower than the minimum passable corridor width  */
+            /* Only accept this run if it is wide enough to be physically passable */
             if (run_w >= min_corridor_width_px && run_w > best_width) {
                 best_width  = run_w;
-                best_centre = run_start + run_w / 2;   /* true centre        */
+                best_centre = run_start + run_w / 2;   /* centre of the run */
             }
             run_start = -1;
         }
     }
 
-    if (best_centre >= 0)
-        return best_centre;
-
-    /* ── No qualifying corridor found ────────────────────────────────────────
-     * Return -1 so the autopilot knows to keep rotating rather than committing
-     * to a direction that doesn't actually have a passable gap.
-     * Previously this fell back to the minimum-value plateau centre, which
-     * looked like a valid waypoint to the autopilot and caused it to drive
-     * toward a gap that was too narrow or not truly clear.                   */
-    return -1;
+    /* -1 signals "no usable corridor found" — caller should keep rotating */
+    return best_centre;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  GREENEST PIXEL  [kept for API compatibility — now delegates to corridor picker]
+/**
+ * @brief Return the column index with the most visible ground.
  *
- *  Previously this returned the first column with the minimum baseline value,
- *  which had a left-bias tie-breaking problem (improvement #6) and ignored
- *  corridor width (improvement #1).
+ * Delegates to widest_corridor_centre() using the full image height.
+ * Kept so existing call sites do not need to be updated.
  *
- *  It now delegates to widest_corridor_centre so all callers get the improved
- *  behaviour without needing their signatures changed.
- * ══════════════════════════════════════════════════════════════════════════════ */
+ * @param gb  Ground baseline array
+ * @param w   Number of columns
+ * @return    Widest corridor centre column, or -1 if no corridor qualifies
+ */
 int greenest_pixel(const float gb[], int w)
 {
-    /* Propagates -1 when no qualifying corridor exists so callers can detect
-     * the "keep rotating" condition.  Callers that previously assumed a valid
-     * column index must check for -1 before using the return value.          */
     return widest_corridor_centre(gb, w, MAX_IMAGE_HEIGHT);
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  GREENEST SECTION -- Column version  [unchanged]
- * ══════════════════════════════════════════════════════════════════════════════ */
+/**
+ * @brief Find which of ns equal sections of the baseline has the lowest average.
+ *
+ * Divides the baseline into ns equal-width sections and returns the 1-based
+ * index of the section whose average baseline value is smallest — meaning the
+ * most ground is visible in that section.
+ *
+ * @param gb  Ground baseline array (one float per column, length w)
+ * @param w   Number of columns
+ * @param ns  Number of sections to split into
+ * @return    1-based index of the greenest section
+ */
 int greenest_section_column(const float gb[], int w, int ns)
 {
     int best_sec = 0;
@@ -116,16 +124,28 @@ int greenest_section_column(const float gb[], int w, int ns)
         float avg = sum / (float)(end - start);
         if (avg < best_avg) {
             best_avg = avg;
-            best_sec = s + 1;
+            best_sec = s + 1;   /* 1-based */
         }
     }
 
     return best_sec;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  OBSTACLE TOUCHES THE IMAGE BOTTOM  [unchanged]
- * ══════════════════════════════════════════════════════════════════════════════ */
+/**
+ * @brief Check whether each obstacle has no detectable ground beneath it.
+ *
+ * An obstacle whose baseline_height >= h had no ground boundary found inside
+ * its column range — meaning it blocks the full floor width and the drone
+ * cannot fly under or beside it. These obstacles must be avoided; ones that
+ * do not touch the bottom may be small enough to ignore.
+ *
+ * @param oo          Array of detected obstacle regions
+ * @param no          Number of obstacles
+ * @param h           Image height
+ * @param touches_out OUTPUT: [i] = 1 if obstacle i touches the bottom, else 0
+ * @param touch       OUTPUT: 1 if any obstacle touches, 0 if none do
+ * @return            Same value as *touch
+ */
 uint8_t obstacle_touches_ground(const struct obstacle_region_t oo[], uint8_t no,
                                 int h, uint8_t touches_out[], uint8_t *touch)
 {
@@ -137,9 +157,16 @@ uint8_t obstacle_touches_ground(const struct obstacle_region_t oo[], uint8_t no,
     return *touch;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  NORMALISED BIAS  [unchanged]
- * ══════════════════════════════════════════════════════════════════════════════ */
+/**
+ * @brief Compute a pixel safety margin proportional to a region's width.
+ *
+ * Returns frac * region_width, with a minimum of 1 pixel so we never return
+ * zero even for very narrow regions.
+ *
+ * @param o    Pointer to the obstacle or plant region
+ * @param frac Fraction of the width to use as a margin (e.g. 0.5 = 50%)
+ * @return     Margin in pixels, minimum 1
+ */
 int normalised_bias(const struct obstacle_region_t *o, float frac)
 {
     int bias = (int)(o->width * frac);
@@ -147,9 +174,28 @@ int normalised_bias(const struct obstacle_region_t *o, float frac)
     return bias;
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  BIAS LOGIC  [improvement #1: final pick uses widest_corridor_centre]
- * ══════════════════════════════════════════════════════════════════════════════ */
+/**
+ * @brief Mark dangerous columns as impassable and return the centre of the
+ *        widest remaining clear corridor.
+ *
+ * Works on a local copy of gb[] so the caller's array is never modified.
+ * Columns occupied by ground-touching obstacles (plus obs_bias padding on
+ * each side) and all plant columns (plus plant_bias padding) are set to h,
+ * making them look like the worst possible ground. The corridor finder then
+ * naturally avoids them.
+ *
+ * @param oo          Obstacle region array
+ * @param no          Number of obstacles
+ * @param po          Plant region array
+ * @param np          Number of plants
+ * @param gb          Original baseline array (not modified)
+ * @param w           Number of columns
+ * @param h           Image height (used as the "blocked" sentinel value)
+ * @param touches_out Which obstacles touch the bottom (from obstacle_touches_ground)
+ * @param obs_bias    Fixed pixel padding around each obstacle
+ * @param plant_bias  Fixed pixel padding around each plant
+ * @return            Centre column of the widest remaining clear corridor
+ */
 int bias_logic(const struct obstacle_region_t oo[], uint8_t no,
                const struct obstacle_region_t po[], uint8_t np,
                const float gb[], int w, int h,
@@ -159,8 +205,9 @@ int bias_logic(const struct obstacle_region_t oo[], uint8_t no,
     static float gb_lg[MAX_IMAGE_WIDTH];
     memcpy(gb_lg, gb, w * sizeof(float));
 
+    /* Erase columns belonging to ground-touching obstacles */
     for (int i = 0; i < no; i++) {
-        if (!touches_out[i]) continue;
+        if (!touches_out[i]) continue;   /* obstacle does not reach the floor — skip */
         int low_bound  = (int)oo[i].start - obs_bias;
         int high_bound = (int)oo[i].start + (int)oo[i].width - 1 + obs_bias;
         if (low_bound  < 0) low_bound  = 0;
@@ -169,6 +216,7 @@ int bias_logic(const struct obstacle_region_t oo[], uint8_t no,
             gb_lg[c] = (float)h;
     }
 
+    /* Erase columns belonging to plants */
     for (int i = 0; i < np; i++) {
         int low_bound  = (int)po[i].start - plant_bias;
         int high_bound = (int)po[i].start + (int)po[i].width - 1 + plant_bias;
@@ -178,13 +226,26 @@ int bias_logic(const struct obstacle_region_t oo[], uint8_t no,
             gb_lg[c] = (float)h;
     }
 
-    /* IMPROVEMENT #1: widest clear corridor instead of single deepest pixel */
     return widest_corridor_centre(gb_lg, w, h);
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  MOTION LOGIC  [unchanged logic, improvement #1 inherited via bias_logic]
- * ══════════════════════════════════════════════════════════════════════════════ */
+/**
+ * @brief Choose a target column using fixed pixel bias values.
+ *
+ * Short-circuits to the corridor finder directly if there is nothing to avoid.
+ * Otherwise delegates to bias_logic() to erase dangerous columns first.
+ *
+ * @param oo          Obstacle region array
+ * @param no          Number of obstacles
+ * @param po          Plant region array
+ * @param np          Number of plants
+ * @param gb          Ground baseline array
+ * @param w           Number of columns
+ * @param h           Image height
+ * @param obs_bias    Fixed pixel margin around obstacles
+ * @param plant_bias  Fixed pixel margin around plants
+ * @return            Target column index, or -1 if no passable corridor exists
+ */
 int motion_logic(const struct obstacle_region_t oo[], uint8_t no,
                  const struct obstacle_region_t po[], uint8_t np,
                  const float gb[], int w, int h,
@@ -194,24 +255,35 @@ int motion_logic(const struct obstacle_region_t oo[], uint8_t no,
     uint8_t touch = 0;
     obstacle_touches_ground(oo, no, h, touches_out, &touch);
 
+    /* Nothing to avoid — find the widest open corridor directly */
     if (!no && !np)
-        return widest_corridor_centre(gb, w, h);   /* #1 */
+        return widest_corridor_centre(gb, w, h);
 
+    /* Obstacles present but none reach the floor, and no plants — still clear */
     if (!np && !touch)
-        return widest_corridor_centre(gb, w, h);   /* #1 */
+        return widest_corridor_centre(gb, w, h);
 
     return bias_logic(oo, no, po, np, gb, w, h, touches_out, obs_bias, plant_bias);
 }
 
-/* ══════════════════════════════════════════════════════════════════════════════
- *  MOTION LOGIC NORMALISED
+/**
+ * @brief Choose a target column using width-proportional bias values.
  *
- *  IMPROVEMENT #1  — final pick via widest_corridor_centre.
- *  IMPROVEMENT #5  — plants use their own bias fraction (plant_bias_frac),
- *                    which should be set larger than obs_bias_frac in the
- *                    caller (e.g. 0.75 vs 0.5) because plant pots are narrow
- *                    and require proportionally more clearance.
- * ══════════════════════════════════════════════════════════════════════════════ */
+ * Same decision tree as motion_logic() but each obstacle and plant gets its
+ * own margin scaled to its width rather than a single fixed pixel value.
+ * plant_bias_frac can be set higher than obs_bias_frac independently.
+ *
+ * @param oo              Obstacle region array
+ * @param no              Number of obstacles
+ * @param po              Plant region array
+ * @param np              Number of plants
+ * @param gb              Ground baseline array
+ * @param w               Number of columns
+ * @param h               Image height
+ * @param obs_bias_frac   Fraction of each obstacle's width to use as its margin
+ * @param plant_bias_frac Fraction of each plant's width to use as its margin
+ * @return                Target column index, or -1 if no passable corridor exists
+ */
 int motion_logic_normalised(const struct obstacle_region_t oo[], uint8_t no,
                             const struct obstacle_region_t po[], uint8_t np,
                             const float gb[], int w, int h,
@@ -222,14 +294,15 @@ int motion_logic_normalised(const struct obstacle_region_t oo[], uint8_t no,
     obstacle_touches_ground(oo, no, h, touches_out, &touch);
 
     if (!no && !np)
-        return widest_corridor_centre(gb, w, h);   /* #1 */
+        return widest_corridor_centre(gb, w, h);
 
     if (!np && !touch)
-        return widest_corridor_centre(gb, w, h);   /* #1 */
+        return widest_corridor_centre(gb, w, h);
 
     static float gb_lg[MAX_IMAGE_WIDTH];
     memcpy(gb_lg, gb, w * sizeof(float));
 
+    /* Erase each obstacle column range with its own proportional margin */
     for (int i = 0; i < no; i++) {
         if (!touches_out[i]) continue;
         int bias       = normalised_bias(&oo[i], obs_bias_frac);
@@ -241,8 +314,7 @@ int motion_logic_normalised(const struct obstacle_region_t oo[], uint8_t no,
             gb_lg[c] = (float)h;
     }
 
-    /* IMPROVEMENT #5: plant_bias_frac is intentionally a separate parameter
-     * so the caller can set it higher than obs_bias_frac.                   */
+    /* Erase each plant column range with its own proportional margin */
     for (int i = 0; i < np; i++) {
         int bias       = normalised_bias(&po[i], plant_bias_frac);
         int low_bound  = (int)po[i].start - bias;
@@ -253,6 +325,5 @@ int motion_logic_normalised(const struct obstacle_region_t oo[], uint8_t no,
             gb_lg[c] = (float)h;
     }
 
-    /* IMPROVEMENT #1 */
     return widest_corridor_centre(gb_lg, w, h);
 }
