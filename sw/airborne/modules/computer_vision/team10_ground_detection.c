@@ -39,17 +39,6 @@ static pthread_mutex_t mutex;
 #define COLOR_OBJECT_DETECTOR_FPS2 0
 #endif
 
-/* ABI sender IDs — overridden by the airframe file via #define so that the
-   autopilot can subscribe to exactly this sender and ignore all others.
-   Default to ABI_BROADCAST so the module compiles and runs without any
-   airframe override. */
-#ifndef TEAM10_GROUND_DETECTION_ID
-#define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
-#endif
-#ifndef TEAM10_GATE_DETECTION_ID
-#define TEAM10_GATE_DETECTION_ID ABI_BROADCAST
-#endif
-
 /* ── Downscale settings ───────────────────────────────────────────────────── */
 /* Scale factor as fraction: 4/5 = 0.8×                                      */
 /* Bebop2 camera: 240×520 → scaled: 192×416                                  */
@@ -174,8 +163,21 @@ static struct image_t *detect_obstacles_from_ground(struct image_t *img,
     }
             
     /* ── Gate detection ────────────────────────────────────────────────── */
-    int gate_result[2];   /* [0] = detected flag, [1] = centre x pixel     */
-    detect_gate(img, gate_result);
+    /* Only run when at least one obstacle is present — gate detection is only
+       needed to distinguish a solid wall from a flyable gate, so there is no
+       point paying its cost on frames where nothing is blocking the path.
+       The scaled image is used (same 0.8x frame as obstacle detection) to
+       avoid processing the full-resolution buffer a second time.
+       The detected centre column is scaled back to native resolution so the
+       output coordinate is consistent with everything else the autopilot reads. */
+    int gate_result[2] = {0, 0};   /* [0] = detected flag, [1] = centre x pixel */
+    if (obstacle_count > 0) {
+        detect_gate(&scaled_img, gate_result);
+        /* Scale centre x back from scaled-image pixels to native-image pixels */
+        if (gate_result[0]) {
+            gate_result[1] = (gate_result[1] * SCALE_DEN) / SCALE_NUM;
+        }
+    }
 
     /* ── Copy to globals ──────────────────────────────────────────────────── */
     uint16_t br_len = (uint16_t)dst_h;
