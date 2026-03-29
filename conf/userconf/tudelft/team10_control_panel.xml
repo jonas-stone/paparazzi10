@@ -18,7 +18,7 @@
         <arg flag="--coordinate_system" constant="enu"/>
         <arg flag="--coordinate_north" constant="far"/>
         <arg flag="--craft_noses" constant="right"/>
-        <arg flag="--streaming_ids" constant="1"/>
+        <arg flag="--streaming_ids" constant="10"/>
         <arg flag="--ac_id" constant="@AC_ID"/>
       </program>
       <program name="Server"/>

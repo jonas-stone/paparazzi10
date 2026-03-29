@@ -1,52 +1,26 @@
 <!DOCTYPE module SYSTEM "module.dtd">
 
-<module name="team10_cv_detect_ground" dir="computer_vision">
+<!--
+  Module name must match the <depends> tag in
+  team10_custom_autopilot_control_withGateDet.xml exactly.
+  The TEAM10_GROUND_DETECTION_ID and TEAM10_GATE_DETECTION_ID defines set the
+  ABI sender ID used when this module publishes detection results. The same
+  value must be defined in the autopilot module so it subscribes to the correct
+  sender. Both are set in the airframe file to keep them in one place.
+-->
+<module name="team10_cv_detect_ground_withGateDet" dir="computer_vision">
   <doc>
-    <description>Ground Object Detector
-    Detects the ground from a Parrot Bebop image.
-    
+    <description>Ground Object Detector (with gate detection)
+    Detects ground, obstacles, plants, and the TU Delft gate from a Bebop image.
+    Publishes results via TEAM10_GROUND_DETECTION and TEAM10_GATE_DETECTION ABI
+    messages with sender ID TEAM10_GROUND_DETECTION_ID / TEAM10_GATE_DETECTION_ID.
     </description>
     <define name="COLOR_OBJECT_DETECTOR_CAMERA1" value="front_camera|bottom_camera" description="Video device to use"/>
     <define name="COLOR_OBJECT_DETECTOR_FPS1" value="0" description="Desired FPS (0: camera rate)"/>
-    <define name="COLOR_OBJECT_DETECTOR_LUM_MIN1" value="0" description="Filter 1 min luminance"/>
-    <define name="COLOR_OBJECT_DETECTOR_LUM_MAX1" value="0" description="Filter 1 max luminance"/>
-    <define name="COLOR_OBJECT_DETECTOR_CB_MIN1" value="0" description="Filter 1 min blue chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_CB_MAX1" value="0" description="Filter 1 max blue chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_CR_MIN1" value="0" description="Filter 1 min red chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_CR_MAX1" value="0" description="Filter 1 max red chroma"/>
     <define name="COLOR_OBJECT_DETECTOR_DRAW1" value="FALSE|TRUE" description="Whether or not to draw on image"/>
-
-    <define name="COLOR_OBJECT_DETECTOR_CAMERA2" value="front_camera|bottom_camera" description="Video device to use"/>
-    <define name="COLOR_OBJECT_DETECTOR_FPS2" value="0" description="Desired FPS (0: camera rate)"/>
-    <define name="COLOR_OBJECT_DETECTOR_LUM_MIN2" value="0" description="Filter 1 min luminance"/>
-    <define name="COLOR_OBJECT_DETECTOR_LUM_MAX2" value="0" description="Filter 2 max luminance"/>
-    <define name="COLOR_OBJECT_DETECTOR_CB_MIN2" value="0" description="Filter 2 min blue chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_CB_MAX2" value="0" description="Filter 2 max blue chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_CR_MIN2" value="0" description="Filter 2 min red chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_CR_MAX2" value="0" description="Filter 2 max red chroma"/>
-    <define name="COLOR_OBJECT_DETECTOR_DRAW2" value="FALSE|TRUE" description="Whether or not to draw on image"/>
+    <define name="TEAM10_GROUND_DETECTION_ID" value="ABI_BROADCAST" description="ABI sender ID for ground/obstacle/plant messages"/>
+    <define name="TEAM10_GATE_DETECTION_ID"   value="ABI_BROADCAST" description="ABI sender ID for gate detection messages"/>
   </doc>
-
-  <!-- <settings>
-    <dl_settings>
-      <dl_settings name="ColorObjectDetector">
-         <dl_setting var="cod_lum_min1" min="0" step="1" max="255" shortname="y_min1"/>
-         <dl_setting var="cod_lum_max1" min="0" step="1" max="255" shortname="y_max1"/>
-         <dl_setting var="cod_cb_min1"   min="0" step="1" max="255" shortname="u_min1"/>
-         <dl_setting var="cod_cb_max1"   min="0" step="1" max="255" shortname="u_max1"/>
-         <dl_setting var="cod_cr_min1"   min="0" step="1" max="255" shortname="v_min1"/>
-         <dl_setting var="cod_cr_max1"   min="0" step="1" max="255" shortname="v_max1"/>
-         <dl_setting var="cod_draw1"  min="0" step="1" max="1" values="False|True" shortname="draw 1" />
-         <dl_setting var="cod_lum_min2" min="0" step="1" max="255" shortname="y_min2"/>
-         <dl_setting var="cod_lum_max2" min="0" step="1" max="255" shortname="y_max2"/>
-         <dl_setting var="cod_cb_min2"   min="0" step="1" max="255" shortname="u_min2"/>
-         <dl_setting var="cod_cb_max2"   min="0" step="1" max="255" shortname="u_max2"/>
-         <dl_setting var="cod_cr_min2"   min="0" step="1" max="255" shortname="v_min2"/>
-         <dl_setting var="cod_cr_max2"   min="0" step="1" max="255" shortname="v_max2"/>
-         <dl_setting var="cod_draw2"  min="0" step="1" max="1" values="False|True" shortname="draw 2" />
-      </dl_settings>
-    </dl_settings>
-  </settings> -->
 
   <dep>
     <depends>video_thread</depends>
@@ -65,4 +39,3 @@
     <file name="team10_logic_withGateDet.c"/>
   </makefile>
 </module>
-

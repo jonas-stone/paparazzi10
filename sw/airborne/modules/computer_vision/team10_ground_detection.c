@@ -39,6 +39,17 @@ static pthread_mutex_t mutex;
 #define COLOR_OBJECT_DETECTOR_FPS2 0
 #endif
 
+/* ABI sender IDs — overridden by the airframe file via #define so that the
+   autopilot can subscribe to exactly this sender and ignore all others.
+   Default to ABI_BROADCAST so the module compiles and runs without any
+   airframe override. */
+#ifndef TEAM10_GROUND_DETECTION_ID
+#define TEAM10_GROUND_DETECTION_ID ABI_BROADCAST
+#endif
+#ifndef TEAM10_GATE_DETECTION_ID
+#define TEAM10_GATE_DETECTION_ID ABI_BROADCAST
+#endif
+
 /* ── Downscale settings ───────────────────────────────────────────────────── */
 /* Scale factor as fraction: 4/5 = 0.8×                                      */
 /* Bebop2 camera: 240×520 → scaled: 192×416                                  */
@@ -255,4 +266,3 @@ void ground_detection_periodic(void)
     AbiSendMsgTEAM10_GATE_DETECTION(TEAM10_GATE_DETECTION_ID, gd, gx);
     (void)pc; (void)lp;
 }
-

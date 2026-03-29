@@ -7,10 +7,14 @@ Gate-aware obstacle avoidance for the Bebop2 (Team 10).
 Uses ground baseline detection to find clear corridors and avoid obstacles
 and plants. When a gate is detected in front of an obstacle, the drone aligns
 with it and flies through instead of turning away.
-Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
+Depends on team10_cv_detect_ground_withGateDet for obstacle/plant/gate data via ABI.
     </description>
-    <define name="ORANGE_AVOIDER_VISUAL_DETECTION_ID" value="ABI_BROADCAST"
-            description="Which VISUAL_DETECTION message to receive."/>
+    <define name="TEAM10_GROUND_DETECTION_ID" value="ABI_BROADCAST"
+            description="ABI sender ID to subscribe to for ground detection messages.
+                         Must match the value defined in team10_cv_detect_ground_withGateDet."/>
+    <define name="TEAM10_GATE_DETECTION_ID" value="ABI_BROADCAST"
+            description="ABI sender ID to subscribe to for gate detection messages.
+                         Must match the value defined in team10_cv_detect_ground_withGateDet."/>
   </doc>
 
   <settings>
@@ -33,15 +37,20 @@ Depends on team10_cv_detect_ground for obstacle/plant/gate data via ABI.
       </dl_settings>
 
       <!-- ── Corridor picker ─────────────────────────────────────────────── -->
+      <!--
+        clear_frac and min_corridor_width_px are defined in team10_logic_withGateDet.c,
+        not in the autopilot file. The module path below points to that file so
+        the GCS slider writes to the correct variable.
+      -->
       <dl_settings name="Corridor">
         <dl_setting
           var="clear_frac" min="0.50" step="0.01" max="1.00"
           shortname="clear_frac"
-          module="modules/orange_avoider/team10_custom_autopilot_withGateDet"/>
+          module="modules/computer_vision/team10_logic_withGateDet"/>
         <dl_setting
           var="min_corridor_width_px" min="10" step="5" max="200"
           shortname="min_corr_w"
-          module="modules/orange_avoider/team10_custom_autopilot_withGateDet"/>
+          module="modules/computer_vision/team10_logic_withGateDet"/>
       </dl_settings>
 
       <!-- ── Waypoint / speed ────────────────────────────────────────────── -->

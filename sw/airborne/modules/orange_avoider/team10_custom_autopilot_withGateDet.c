@@ -168,16 +168,6 @@ float plant_bias_frac = 1.5f;
  * waypoint before the next one is set.                                        */
 int wp_update_period_ticks = 2;
 
-/* Fraction of image height that a column's baseline value must be below for
- * that column to count as clear.  Higher = stricter — the drone demands a
- * deeper view of open ground before treating a column as passable.            */
-float clear_frac = 0.90f;
-
-/* Minimum width in pixels that a contiguous run of clear columns must have to
- * qualify as a usable corridor.  Narrower runs are discarded so the drone
- * never tries to pass through a gap too narrow for its body.                  */
-int min_corridor_width_px = 60;
-
 /* ── Gate detection state ──────────────────────────────────────────────────── */
 
 /* Whether the gate is currently detected and where its centre column is.      */

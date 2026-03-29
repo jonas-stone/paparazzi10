@@ -74,16 +74,28 @@
       <define name="VIDEO_CAPTURE_CAMERA" value="front_camera"/>
       <define name="VIDEO_CAPTURE_FPS" value="10"/>
     </module>
-    <module name="team10_cv_detect_ground">
+    <!--
+      Ground + gate detection module.
+      Publishes TEAM10_GROUND_DETECTION and TEAM10_GATE_DETECTION ABI messages
+      with sender ID 10. Using an explicit ID means the autopilot below only
+      processes data from this specific sender and ignores anything else on the bus.
+    -->
+    <module name="team10_cv_detect_ground_withGateDet">
       <define name="COLOR_OBJECT_DETECTOR_CAMERA1" value="front_camera"/>
       <define name="COLOR_OBJECT_DETECTOR_FPS1" value="0"/>
       <define name="COLOR_OBJECT_DETECTOR_DRAW1" value="1"/>
+      <define name="TEAM10_GROUND_DETECTION_ID" value="10"/>
+      <define name="TEAM10_GATE_DETECTION_ID"   value="10"/>
     </module>
 
-    <!-- FIX: duplicate entry removed — was listed twice, which caused double
-         ABI callback registration and double periodic execution.              -->
+    <!--
+      Gate-aware autopilot module.
+      Subscribes to TEAM10_GROUND_DETECTION and TEAM10_GATE_DETECTION with
+      sender ID 10, matching the detection module above.
+    -->
     <module name="team10_custom_autopilot_control_withGateDet">
-      <define name="ORANGE_AVOIDER_VISUAL_DETECTION_ID" value="COLOR_OBJECT_DETECTION1_ID"/>
+      <define name="TEAM10_GROUND_DETECTION_ID" value="10"/>
+      <define name="TEAM10_GATE_DETECTION_ID"   value="10"/>
     </module>
 
     <module name="video_rtp_stream">
