@@ -1108,7 +1108,7 @@ static void gate_make_blue_mask(const struct image_t *img, uint8_t *out_mask)
     /* Step 2: morphological OPEN = erode then dilate.
        Erode: a pixel stays set only if ALL pixels within the 5×5 neighbourhood
        are set. This removes isolated specks. */
-    int k = 3, half = 2;
+    int k = 3, half = 1;   /* half=1 → 3×3 neighbourhood (was 2 → 5×5) */
 
     memset(gate_eroded, 0, total);
     for (int y = 0; y < h; y++) {
