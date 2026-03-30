@@ -13,8 +13,10 @@
 #ifndef ORANGE_AVOIDER_H
 #define ORANGE_AVOIDER_H
 
-// settings
+// settings, found in conf/modules/orange_avoider.xml
 extern float oa_color_count_frac;
+extern float speed_multiplier;
+extern float maxDistance;
 
 // functions
 extern void orange_avoider_init(void);

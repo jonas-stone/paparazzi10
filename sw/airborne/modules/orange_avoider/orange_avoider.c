@@ -50,14 +50,15 @@ enum navigation_state_t {
 };
 
 // define settings
-float oa_color_count_frac = 0.18f;
+float oa_color_count_frac = 0.18f;      // orange pixel threshold, fraction of the total pixels.
+float speed_multiplier    = 1.0f;       // multiplies the drone speed inside MoveWaypointForward.
+float maxDistance         = 2.25f;      // maximum distance [m] that waypoints can be moved by.
 
 // define and initialise global variables
 enum navigation_state_t navigation_state = SEARCH_FOR_SAFE_HEADING;
 int32_t color_count = 0;                // orange color count from color filter for obstacle detection
 int16_t obstacle_free_confidence = 0;   // a measure of how certain we are that the way ahead is safe.
 float heading_increment = 5.f;          // heading angle increment [deg]
-float maxDistance = 2.25;               // max waypoint displacement [m]
 
 const int16_t max_trajectory_confidence = 5; // number of consecutive negative object detections to be sure we are obstacle free
 
