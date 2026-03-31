@@ -1,0 +1,27 @@
+Training Report
+==================================================
+
+Mode           : 3strip
+Labels JSON    : C:\Users\neytc\Documents\TU_Delft\lecture_notes\mav\MAV_CW\DEVELOPMENT\Python\neural_network\labels_3strip.json
+Architecture   : 9216 -> 64 (ReLU) -> 4
+Parameters     : 590,148
+
+Split (70% train): 4047 / 289 / 290
+
+Class distribution:
+  LEFT: 417
+  CENTRE: 777
+  RIGHT: 249
+  TURN: 485
+
+Train : 96.7%
+Val   : 76.8%
+TEST  : 84.8%
+
+Confusion matrix (TEST):
+              LEFT  CENTRE   RIGHT    TURN
+          --------------------------------
+     LEFT |      47       9       3       2
+   CENTRE |       4      98       5       1
+    RIGHT |       3       2      34       1
+     TURN |       3       6       5      67
