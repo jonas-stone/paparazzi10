@@ -5,3 +5,6 @@ the correct names. those are:
 - tree_detector.pkl
 - ground_detector.pkl
 - pole_detector.pkl
+
+
+Also please make sure to unzip the mask folder so you can use it
