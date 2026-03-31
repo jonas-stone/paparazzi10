@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
 #include "generated/flight_plan.h"
 

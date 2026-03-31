@@ -1,5 +1,6 @@
 #ifndef TEAM10_CUSTOM_AUTOPILOT_WITHGATEDET_H
 #define TEAM10_CUSTOM_AUTOPILOT_WITHGATEDET_H
+#include <stdint.h>
 
 /* ── Tunable parameters (exposed as GCS sliders via module XML) ───────────── */
 /* These are non-static globals defined in team10_custom_autopilot_withGateDet.c.

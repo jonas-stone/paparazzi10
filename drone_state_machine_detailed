@@ -1,0 +1,54 @@
+digraph {
+	rankdir=TB size="8,10"
+	START [label="Tick (10 Hz)"]
+	CONF [label="Update confidence
++1 / -2
+Clamp"]
+	MOVE [label="Compute moveDistance"]
+	SAFE [label="SAFE
+Move forward"]
+	OBSTACLE [label="OBSTACLE_FOUND
+Stop"]
+	SEARCH [label="SEARCH_FOR_SAFE_HEADING
+Rotate"]
+	GATE [label="GATE_APPROACH
+Align to gate"]
+	OOB [label="OUT_OF_BOUNDS
+Recover"]
+	corridor [label="Safe corridor?" shape=diamond]
+	confidence0 [label="Confidence == 0?" shape=diamond]
+	in_bounds [label="Inside bounds?" shape=diamond]
+	gate_seen [label="Gate detected
+(3 frames)?" shape=diamond]
+	aligned [label="Aligned with gate?" shape=diamond]
+	confidence2 [label="Confidence ≥ 2?" shape=diamond]
+	START -> CONF
+	CONF -> MOVE
+	MOVE -> SAFE
+	SAFE -> corridor
+	corridor -> SAFE [label="Yes
+Move forward"]
+	corridor -> OBSTACLE [label="No
+Hard stop"]
+	SAFE -> in_bounds
+	in_bounds -> OOB [label=No]
+	in_bounds -> confidence0 [label=Yes]
+	confidence0 -> OBSTACLE [label=Yes]
+	confidence0 -> SAFE [label=No]
+	OBSTACLE -> gate_seen
+	gate_seen -> GATE [label=Yes]
+	gate_seen -> SEARCH [label=No]
+	SEARCH -> corridor
+	corridor -> confidence2 [label=Found]
+	confidence2 -> SAFE [label=Yes]
+	confidence2 -> SEARCH [label="No
+Keep rotating"]
+	corridor -> SEARCH [label="Not found"]
+	GATE -> aligned
+	aligned -> SAFE [label="Yes
+Move through gate"]
+	aligned -> GATE [label="No
+Adjust heading"]
+	GATE -> OBSTACLE [label="Gate lost"]
+	OOB -> SEARCH [label="Back in bounds"]
+}
